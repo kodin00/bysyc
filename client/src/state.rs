@@ -79,6 +79,37 @@ pub enum Selection {
 }
 
 // ---------------------------------------------------------------------------
+// Attachments (C4)
+// ---------------------------------------------------------------------------
+
+/// Progress of one attachment upload, shown above the composer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UploadPhase {
+    /// Native file picker is open (worker thread).
+    Picking,
+    /// Reading + AES-GCM encrypting the bytes (worker thread).
+    Encrypting,
+    /// `POST /attachments` + presigned `PUT` of the ciphertext.
+    Uploading,
+    /// Megolm session share (if needed) + message POST.
+    Sending,
+    /// Fully sent; the status row disappears on the next frame.
+    Done,
+    /// Terminal failure (message shown, dismissible).
+    Failed(String),
+}
+
+/// One row of the upload strip above the composer.
+#[derive(Clone, Debug)]
+pub struct UploadStatus {
+    /// Monotonic id; background tasks update their row by id.
+    pub id: u64,
+    /// File name (filled in once picked).
+    pub name: String,
+    pub phase: UploadPhase,
+}
+
+// ---------------------------------------------------------------------------
 // World
 // ---------------------------------------------------------------------------
 
@@ -141,6 +172,20 @@ pub struct MainState {
     /// Latest guild invite code to show/copy: (guild name, code). Transient
     /// UI state that outlives the REST task, like [`MainState::notice`].
     pub invite: Option<(String, String)>,
+    // -- Attachments (C4) -------------------------------------------------------
+    /// Decoded [`Envelope::File`] payloads keyed by MESSAGE id: the
+    /// attachment's content key/nonce exist only inside the E2EE envelope,
+    /// so this map is what lets the UI fetch, decrypt and render files
+    /// (see [`crate::views::attachments`]). Not persisted; rows fall back
+    /// to their stored "[file: …]" plaintext after a restart.
+    pub file_meta: HashMap<i64, Envelope>,
+    /// Live attachment uploads for the composer strip.
+    pub uploads: Vec<UploadStatus>,
+    /// Attachment ids with an image fetch/decode in flight (spawn guard).
+    pub img_inflight: HashSet<i64>,
+    /// Attachment ids whose fetch or decode failed terminally (render an
+    /// "unavailable" note instead of retrying every frame).
+    pub img_failed: HashSet<i64>,
 }
 
 impl MainState {
@@ -187,6 +232,10 @@ impl MainState {
             pending_newcomers: Vec::new(),
             outbox_acks: Vec::new(),
             invite: None,
+            file_meta: HashMap::new(),
+            uploads: Vec::new(),
+            img_inflight: HashSet::new(),
+            img_failed: HashSet::new(),
         }
     }
 
@@ -409,6 +458,14 @@ impl MainState {
             Decrypted::Text(text) => {
                 guard(store).set_plaintext(dto.id, &text).ok();
             }
+            Decrypted::File(fe) => {
+                // The attachment's key/nonce live only in this envelope:
+                // stash it (C4's UI renders from `file_meta`), then persist
+                // the placeholder text like any other row.
+                let line = file_row_text(&fe);
+                self.file_meta.insert(dto.id, fe);
+                guard(store).set_plaintext(dto.id, &line).ok();
+            }
             Decrypted::Deleted(target) => {
                 self.remove_message(dto.channel_id, target);
                 let s = guard(store);
@@ -484,8 +541,9 @@ impl MainState {
     /// (e.g. loaded before the session share arrived). Store writes happen
     /// strictly after the engine calls — never under the store lock — for
     /// the same lock-order reason as [`MainState::apply_chat_message`].
-    pub fn backfill_plaintexts(&self, store: &Arc<Mutex<Store>>, channel_id: i64) {
-        let Some(engine) = self.engine.as_ref() else {
+    /// File envelopes additionally land in [`MainState::file_meta`].
+    pub fn backfill_plaintexts(&mut self, store: &Arc<Mutex<Store>>, channel_id: i64) {
+        let Some(engine) = self.engine.clone() else {
             return;
         };
         let rows = guard(store).undecrypted(channel_id);
@@ -494,10 +552,14 @@ impl MainState {
             if sender == self.account.id {
                 continue; // own rows get their plaintext from the send task
             }
-            if let Decrypted::Text(text) =
-                decrypt_envelope_text(engine, channel_id, sender, &content)
-            {
-                decrypted.push((id, text));
+            match decrypt_envelope_text(&engine, channel_id, sender, &content) {
+                Decrypted::Text(text) => decrypted.push((id, text)),
+                Decrypted::File(fe) => {
+                    let line = file_row_text(&fe);
+                    self.file_meta.insert(id, fe);
+                    decrypted.push((id, line));
+                }
+                Decrypted::Deleted(_) | Decrypted::Failed => {}
             }
         }
         if decrypted.is_empty() {
@@ -513,6 +575,9 @@ impl MainState {
 /// Result of decrypting one message ciphertext into renderable text.
 enum Decrypted {
     Text(String),
+    /// A File envelope (C4): the caller stashes it into
+    /// [`MainState::file_meta`] and renders the "[file: …]" placeholder.
+    File(Envelope),
     /// A Delete envelope: hide `target` (and the carrier).
     Deleted(i64),
     /// Could not decrypt or parse.
@@ -520,17 +585,57 @@ enum Decrypted {
 }
 
 /// Megolm-decrypt `content` from `sender` in `channel` and map the envelope
-/// to renderable text. Sharing [`Envelope::File`] rendering duties with C4:
-/// v1 renders the "[file: name]" placeholder via plaintext.
+/// to its renderable form. File envelopes come back whole so the caller can
+/// keep their key/nonce; their display text is [`file_row_text`].
 fn decrypt_envelope_text(engine: &Engine, channel: i64, sender: i64, content: &str) -> Decrypted {
     let Ok(plaintext) = engine.megolm_decrypt(channel, sender, "", content) else {
         return Decrypted::Failed;
     };
     match serde_json::from_str::<Envelope>(&plaintext) {
         Ok(Envelope::Chat { text, .. }) => Decrypted::Text(text),
-        Ok(Envelope::File { name, .. }) => Decrypted::Text(format!("[file: {name}]")),
+        Ok(fe @ Envelope::File { .. }) => Decrypted::File(fe),
         Ok(Envelope::Delete { target }) => Decrypted::Deleted(target),
         Ok(Envelope::SessionShare { .. }) | Err(_) => Decrypted::Failed,
+    }
+}
+
+/// One-liner shown for a File envelope row (also stored as the message
+/// plaintext, so the row still reads sensibly after a restart).
+pub fn file_row_text(fe: &Envelope) -> String {
+    match fe {
+        Envelope::File { name, size, .. } => {
+            format!("[file: {name} ({})]", human_size(*size))
+        }
+        _ => "[file]".into(),
+    }
+}
+
+/// Human-readable byte size: "0 B", "512 B", "2.0 KiB", "48.0 MiB", …
+pub fn human_size(bytes: i64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let bytes = bytes.max(0); // negative sizes format as 0 B
+    let mut size = bytes as f64;
+    let mut unit = 0usize;
+    while size >= 1024.0 && unit + 1 < UNITS.len() {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{size:.1} {}", UNITS[unit])
+    }
+}
+
+/// Whether a file name looks like a directly renderable image, by extension
+/// (png/jpg/jpeg/gif/webp, case-insensitive).
+pub fn is_image_name(name: &str) -> bool {
+    match name.rsplit_once('.') {
+        Some((_, ext)) => matches!(
+            ext.to_ascii_lowercase().as_str(),
+            "png" | "jpg" | "jpeg" | "gif" | "webp"
+        ),
+        None => false,
     }
 }
 
@@ -651,6 +756,130 @@ mod tests {
         m.remove_message(200, 2);
         let ids: Vec<i64> = m.messages[&200].iter().map(|x| x.id).collect();
         assert_eq!(ids, vec![1, 3]);
+    }
+
+    #[test]
+    fn human_size_units() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(512), "512 B");
+        assert_eq!(human_size(1024), "1.0 KiB");
+        assert_eq!(human_size(2048), "2.0 KiB");
+        assert_eq!(human_size(12345), "12.1 KiB");
+        assert_eq!(human_size(48 * 1024 * 1024), "48.0 MiB");
+        assert_eq!(human_size(3 * 1024 * 1024 * 1024), "3.0 GiB");
+        assert_eq!(human_size(-5), "0 B");
+    }
+
+    #[test]
+    fn image_name_dispatch() {
+        for name in [
+            "cat.png",
+            "photo.JPG",
+            "photo.Jpeg",
+            "anim.gif",
+            "shot.webp",
+            "a.b.png",
+        ] {
+            assert!(is_image_name(name), "{name} should be an image");
+        }
+        for name in [
+            "notes.txt",
+            "archive.tar.gz",
+            "png",
+            ".png/",
+            "movie.mkv",
+            "noext",
+        ] {
+            assert!(!is_image_name(name), "{name} should not be an image");
+        }
+    }
+
+    /// Minimal in-memory [`crate::crypto::KeyStore`] so state tests can run
+    /// a real engine (the crypto crate's own `MemKeyStore` is test-gated).
+    #[derive(Default)]
+    struct TestKeys(std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>);
+
+    impl crate::crypto::KeyStore for TestKeys {
+        fn get(&self, scope: &str) -> Option<Vec<u8>> {
+            self.0.lock().unwrap().get(scope).cloned()
+        }
+        fn put(&self, scope: &str, blob: &[u8]) {
+            self.0.lock().unwrap().insert(scope.into(), blob.to_vec());
+        }
+        fn delete(&self, scope: &str) {
+            self.0.lock().unwrap().remove(scope);
+        }
+    }
+
+    /// The receive path end-to-end up to the network boundary: a File
+    /// envelope Megolm-encrypted into the channel decrypts during history
+    /// backfill, lands in `file_meta` keyed by MESSAGE id, and its stored
+    /// plaintext is the "[file: name (size)]" placeholder.
+    #[test]
+    fn file_envelope_backfill_stashes_meta_and_plaintext() {
+        use crate::crypto::Engine;
+        use bysyc_common::protocol::AttachmentMeta;
+
+        const CH: i64 = 101;
+        const MSG: i64 = 55;
+        const SENDER: i64 = 2;
+        const ATT: i64 = 300;
+
+        let engine = Engine::new(Arc::new(TestKeys::default()), "pass".into()).unwrap();
+        let fe = Envelope::File {
+            name: "cat.png".into(),
+            size: 12345,
+            nonce: "bm9uY2U=".into(),
+            key: "a2V5".into(),
+            attachment_id: ATT,
+        };
+        // "Send" it: encrypt, then hand ourselves the index-0 session key
+        // exactly the way a real receiver's mailbox share would.
+        let (_, ct) = engine.megolm_encrypt(CH, &fe.to_json().unwrap()).unwrap();
+        let share = engine.drain_pending_shares().pop().unwrap();
+        engine
+            .megolm_import(CH, SENDER, &share.session_id, &share.session_key)
+            .unwrap();
+
+        let store = Arc::new(Mutex::new(
+            Store::open(std::path::Path::new(":memory:")).expect("open store"),
+        ));
+        let dto = bysyc_common::protocol::MessageDto {
+            id: MSG,
+            channel_id: CH,
+            sender_id: SENDER,
+            kind: MessageKind::Chat,
+            content: ct,
+            reply_to: None,
+            attachment: Some(AttachmentMeta {
+                id: ATT,
+                name: "cat.png".into(),
+                size: 12361,
+                nonce: "bm9uY2U=".into(),
+            }),
+            created_at_ms: 1,
+        };
+        {
+            let s = guard(&store);
+            let _ = s.append_message(&dto);
+        }
+
+        let mut m = world();
+        m.engine = Some(Arc::new(engine));
+        assert!(m.file_meta.is_empty());
+        m.backfill_plaintexts(&store, CH);
+
+        let stashed = m
+            .file_meta
+            .get(&MSG)
+            .cloned()
+            .expect("file envelope stashed");
+        assert_eq!(stashed, fe, "stashed by message id, not attachment id");
+        assert!(m.file_meta.get(&ATT).is_none(), "keyed by message id");
+        assert_eq!(
+            guard(&store).plaintext(MSG).as_deref(),
+            Some("[file: cat.png (12.1 KiB)]")
+        );
     }
 }
 

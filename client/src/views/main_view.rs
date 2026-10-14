@@ -20,8 +20,7 @@ use eframe::egui;
 
 use bysyc_common::protocol::{
     ChannelKind, CreateChannelRequest, CreateGuildInviteRequest, CreateGuildRequest,
-    JoinGuildRequest, MessageDto, MessageKind, OpenDmRequest, SendMessageRequest, WsClientBody,
-    WsClientMsg,
+    JoinGuildRequest, MessageDto, MessageKind, OpenDmRequest, WsClientBody, WsClientMsg,
 };
 
 use crate::app::BysycApp;
@@ -29,6 +28,7 @@ use crate::crypto::Envelope;
 use crate::net::{self, NetHandle};
 use crate::state::{ClientState, ConnStatus, Selection, TYPING_TTL_SECS, guard, now_ms};
 use crate::store::Store;
+use crate::views::attachments;
 
 /// View-lifetime UI state (input buffers, throttles).
 pub struct MainView {
@@ -54,10 +54,19 @@ pub struct MainView {
     pub new_channel_voice: bool,
     /// "+ dm" friend picker open?
     pub dm_picker: bool,
+    /// Decoded-and-downscaled attachment images by attachment id. UI-thread
+    /// only (textures cannot be created elsewhere); never persisted.
+    pub image_cache: HashMap<i64, egui::TextureHandle>,
+    /// Worker threads hand finished image decodes to the UI thread here.
+    pub image_tx: std::sync::mpsc::Sender<attachments::DecodedImage>,
+    pub image_rx: std::sync::mpsc::Receiver<attachments::DecodedImage>,
+    /// Open image lightbox: (attachment id, name).
+    pub image_popup: Option<(i64, String)>,
 }
 
 impl MainView {
     pub fn new() -> Self {
+        let (image_tx, image_rx) = std::sync::mpsc::channel();
         MainView {
             composer: HashMap::new(),
             last_typing_sent: HashMap::new(),
@@ -71,6 +80,10 @@ impl MainView {
             new_channel_name: String::new(),
             new_channel_voice: false,
             dm_picker: false,
+            image_cache: HashMap::new(),
+            image_tx,
+            image_rx,
+            image_popup: None,
         }
     }
 }
@@ -801,6 +814,10 @@ fn chat(
     mv: &mut MainView,
     ctx: &egui::Context,
 ) {
+    // Bring finished background image decodes onto the UI thread as
+    // textures (no-op when nothing is pending).
+    attachments::drain_decoded(ctx, mv);
+
     // Status / notice banners.
     let (reconnecting, notice) = {
         let st = guard(state);
@@ -928,27 +945,53 @@ fn chat(
                     None => HashMap::new(),
                 }
             };
+            // File envelopes for the visible attachment rows, keyed by
+            // message id (stashed at decrypt time in `file_meta`).
+            let file_envs: HashMap<i64, Envelope> = {
+                let st = guard(state);
+                match st.main() {
+                    Some(m) => rows
+                        .iter()
+                        .filter(|(msg, _)| msg.attachment.is_some())
+                        .filter_map(|(msg, _)| {
+                            m.file_meta.get(&msg.id).cloned().map(|fe| (msg.id, fe))
+                        })
+                        .collect(),
+                    None => HashMap::new(),
+                }
+            };
             for (msg, sender) in &rows {
                 let time = fmt_time(msg.created_at_ms);
-                let body = if msg.id < 0 {
-                    format!("{} …", msg.content)
-                } else {
-                    plains
-                        .get(&msg.id)
-                        .cloned()
-                        .unwrap_or_else(|| "[encrypted]".into())
-                };
                 let prefix = msg
                     .reply_to
                     .and_then(|rid| reply_names.get(&rid))
                     .map(|n| format!("↪ [{n}] "))
                     .unwrap_or_default();
-                ui.horizontal(|ui| {
-                    ui.label(format!("{time}  {sender}:  {prefix}{body}"));
+                let header = format!("{time}  {sender}:  {prefix}");
+                // Attachment rows render from the stashed File envelope;
+                // everything else is the plain text line.
+                if let (Some(att), Some(fe)) = (msg.attachment.as_ref(), file_envs.get(&msg.id)) {
+                    ui.label(header);
+                    attachments::attachment_row(ui, state, rt, ctx, mv, att, fe);
                     if msg.id > 0 && ui.small_button("reply").clicked() {
                         mv.reply_to.insert(ch, msg.id);
                     }
-                });
+                } else {
+                    let body = if msg.id < 0 {
+                        format!("{} …", msg.content)
+                    } else {
+                        plains
+                            .get(&msg.id)
+                            .cloned()
+                            .unwrap_or_else(|| "[encrypted]".into())
+                    };
+                    ui.horizontal(|ui| {
+                        ui.label(format!("{header}{body}"));
+                        if msg.id > 0 && ui.small_button("reply").clicked() {
+                            mv.reply_to.insert(ch, msg.id);
+                        }
+                    });
+                }
             }
         });
 
@@ -1000,6 +1043,9 @@ fn chat(
         }
     }
 
+    // Attachment upload progress strip (above the composer).
+    attachments::uploads_ui(ui, state);
+
     // Composer.
     let response = {
         let buf = mv.composer.entry(ch).or_default();
@@ -1012,7 +1058,15 @@ fn chat(
     if response.changed() {
         maybe_send_typing(state, mv, ch);
     }
-    let mut send = ui.button("Send").clicked();
+    let mut send = false;
+    ui.horizontal(|ui| {
+        if ui.button("Send").clicked() {
+            send = true;
+        }
+        if ui.button("+ attach").clicked() {
+            attachments::begin_attach(state, store, rt, ctx, mv, ch);
+        }
+    });
     if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.ctrl) {
         send = true;
     }
@@ -1024,6 +1078,9 @@ fn chat(
             do_send(state, store, rt, ctx, mv, ch, text);
         }
     }
+
+    // Image lightbox for clicked thumbnails.
+    attachments::image_popup(state, rt, ctx, mv);
 }
 
 /// Fetch a page of history into the cache + store. `before == None` fetches
@@ -1070,8 +1127,8 @@ fn fetch_history(
                 // Rows that arrived before their Megolm session share get a
                 // second chance now that this page is cached.
                 {
-                    let st = guard(&state);
-                    if let Some(m) = st.main() {
+                    let mut st = guard(&state);
+                    if let Some(m) = st.main_mut() {
                         m.backfill_plaintexts(&store, ch);
                     }
                 }
@@ -1086,20 +1143,18 @@ fn fetch_history(
     });
 }
 
-/// The encrypted send path. Everything the crypto half needs is gathered
-/// under one state lock up front; the network work then runs on the runtime.
+/// The encrypted send path for chat text. Everything the crypto half needs
+/// is gathered under one state lock up front; the network work then runs on
+/// the runtime.
 ///
-/// 1. Wrap the text in [`Envelope::Chat`] and Megolm-encrypt it with our
-///    outbound session for the channel (the engine creates or rotates the
-///    session when needed and queues a share in that case).
-/// 2. Bootstrap rule — when this is the channel's first send (`outbound`
-///    does not contain it), or the session id changed since the last send
-///    (rotation), or the sid is simply unknown after a restart — claim each
-///    roster peer's keys and mailbox them the session key *before* the
-///    message goes out, so the very first message is already decryptable.
-/// 3. POST the ciphertext; on success store the plaintext for our own row
-///    (the engine deliberately holds no self-import) and reconcile the
-///    optimistic temp row.
+/// The encrypt → share-first → POST sequence itself lives in
+/// [`attachments::encrypt_share_and_send`], shared with the attachment
+/// send path (C4): Megolm-encrypt the [`Envelope::Chat`], and when this is
+/// the channel's first send, a rotation, or an unknown sid after restart,
+/// mailbox every roster peer the session key *before* the message POST so
+/// the very first message is already decryptable. On success the plaintext
+/// is stored for our own row (the engine deliberately holds no
+/// self-import) and the optimistic temp row is reconciled.
 ///
 /// No engine → no send: chat refuses to fall back to plaintext.
 #[allow(clippy::too_many_arguments)]
@@ -1118,17 +1173,9 @@ fn do_send(
 
     let gather = {
         let st = guard(state);
-        st.main().map(|m| {
-            (
-                m.account.id,
-                m.engine.clone(),
-                m.channel_peer_ids(ch),
-                !m.outbound.contains(&ch),
-                m.outbound_sid.get(&ch).cloned(),
-            )
-        })
+        st.main().map(|m| (m.account.id, m.engine.clone()))
     };
-    let Some((me, engine, peers, need_share, known_sid)) = gather else {
+    let Some((me, engine)) = gather else {
         return;
     };
     let Some(engine) = engine else {
@@ -1166,7 +1213,15 @@ fn do_send(
     let store = Arc::clone(store);
     let ctx = ctx.clone();
     rt.spawn(async move {
-        let fail = |e: String| {
+        let envelope = Envelope::Chat {
+            text: text.clone(),
+            reply_to,
+        };
+        if let Err(e) = attachments::encrypt_share_and_send(
+            &state, &store, &h.net, &engine, ch, &envelope, temp, None,
+        )
+        .await
+        {
             let mut st = guard(&state);
             if let Some(m) = st.main_mut() {
                 if let Some(v) = m.messages.get_mut(&ch) {
@@ -1174,59 +1229,6 @@ fn do_send(
                 }
                 m.notice = Some(format!("send failed: {e}"));
             }
-        };
-
-        // 1. Encrypt.
-        let envelope = Envelope::Chat {
-            text: text.clone(),
-            reply_to,
-        };
-        let plaintext = serde_json::to_string(&envelope).unwrap_or_default();
-        let (sid, ciphertext) = match engine.megolm_encrypt(ch, &plaintext) {
-            Ok(x) => x,
-            Err(e) => {
-                fail(format!("encrypt: {e}"));
-                ctx.request_repaint();
-                return;
-            }
-        };
-
-        // 2. Bootstrap / rotation share, strictly before the message POST.
-        let rotated = known_sid.as_deref() != Some(sid.as_str());
-        if need_share || rotated {
-            net::share_session_with_peers(&state, &engine, &h.net, ch, peers).await;
-            {
-                let mut st = guard(&state);
-                if let Some(m) = st.main_mut() {
-                    m.outbound.insert(ch);
-                    m.outbound_sid.insert(ch, sid.clone());
-                }
-            }
-            net::persist_outbound(&state, &store);
-        }
-
-        // 3. Send.
-        let req = SendMessageRequest {
-            kind: MessageKind::Chat,
-            content: ciphertext,
-            reply_to,
-            attachment_id: None,
-        };
-        match net::send_message(&h.net, ch, &req).await {
-            Ok(dto) => {
-                {
-                    let s = guard(&store);
-                    let _ = s.append_message(&dto);
-                    // Our own row: we cannot Megolm-decrypt our own message,
-                    // so store the outgoing plaintext directly.
-                    let _ = s.set_plaintext(dto.id, &text);
-                }
-                let mut st = guard(&state);
-                if let Some(m) = st.main_mut() {
-                    m.replace_temp(temp, dto);
-                }
-            }
-            Err(e) => fail(e),
         }
         ctx.request_repaint();
     });
@@ -1271,7 +1273,9 @@ fn maybe_send_typing(state: &Arc<Mutex<ClientState>>, mv: &mut MainView, ch: i64
 // Small helpers
 // ---------------------------------------------------------------------------
 
-fn net_handle(state: &Arc<Mutex<ClientState>>) -> Option<NetHandle> {
+/// Current net handle, or `None` while disconnected. Shared with the
+/// attachments view (C4).
+pub(crate) fn net_handle(state: &Arc<Mutex<ClientState>>) -> Option<NetHandle> {
     guard(state).main().and_then(|m| m.net.clone())
 }
 
