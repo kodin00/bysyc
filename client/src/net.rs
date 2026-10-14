@@ -25,8 +25,10 @@
 //! | `GET /auth/me` | [`AccountInfo`] (session validation) |
 //! | `GET /accounts/by-username/{username}` | username lookup → [`AccountBrief`] |
 //! | `GET /friends` | [`FriendList`] |
-//! | `POST /keys/otk` | [`UploadOtkRequest`] |
-//! | `POST /keys/claim` | `{"account_id":<i64>}` → [`ClaimedKeys`] |
+//! | `PUT /keys/identity` | `{"identity_key":<b64>}` → 204 (keep the published key fresh) |
+//! | `POST /keys/otk` | [`UploadOtkRequest`] → 204 |
+//! | `GET /keys/{account_id}` | atomically claim one OTK → [`ClaimedKeys`] |
+//! | `POST /mailbox` | `{"to":<i64>,"content":<b64>}` → 204 (directed Olm items) |
 //! | `GET /guilds` | `Vec<`[`GuildInfo`]`>` |
 //! | `POST /guilds` | [`CreateGuildRequest`] → [`GuildInfo`] |
 //! | `POST /guilds/{id}/channels` | [`CreateChannelRequest`] → [`ChannelInfo`] |
@@ -50,35 +52,20 @@ use std::time::Duration;
 
 use bysyc_common::PROTOCOL_VERSION;
 use bysyc_common::protocol::{
-    ApiError, ClaimedKeys, CreateAttachmentRequest, CreateAttachmentResponse, CreateChannelRequest,
-    CreateGuildInviteRequest, CreateGuildRequest, DmChannel, DownloadUrlResponse, ErrorCode,
-    FriendList, GuildInfo, GuildInviteDto, JoinGuildRequest, LoginRequest, MailboxItem, MessageDto,
-    MessagePage, OpenDmRequest, RegisterRequest, SendMessageRequest, TokenResponse,
-    UploadOtkRequest, WsClientBody, WsClientMsg, WsServerBody, WsServerMsg,
+    ApiError, ChannelKind, ClaimedKeys, CreateAttachmentRequest, CreateAttachmentResponse,
+    CreateChannelRequest, CreateGuildInviteRequest, CreateGuildRequest, DmChannel,
+    DownloadUrlResponse, ErrorCode, FriendList, GuildInfo, GuildInviteDto, JoinGuildRequest,
+    LoginRequest, MailboxItem, MessageDto, MessagePage, OpenDmRequest, RegisterRequest,
+    SendMessageRequest, TokenResponse, TurnInfo, UploadOtkRequest, WsClientBody, WsClientMsg,
+    WsServerBody, WsServerMsg,
 };
 use eframe::egui::Context;
 use futures_util::{SinkExt, StreamExt};
-use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
+use crate::crypto::Engine;
 use crate::state::{ClientState, Phase, apply_server_msg, guard};
 use crate::store::Store;
-
-/// Placeholder identity key uploaded at registration until C2 (crypto)
-/// replaces it with the real vodozemac identity — base64 of
-/// "placeholder-identity", non-empty so servers that validate presence pass.
-pub const PLACEHOLDER_IDENTITY_KEY: &str = "cGxhY2Vob2xkZXItaWRlbnRpdHk=";
-
-/// TURN relay info served by the Instance for C5's WebRTC calls. Client-side
-/// shape (belongs in `common` once S5 pins it).
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
-pub struct TurnInfo {
-    /// STUN/TURN URLs, e.g. `turn:host:3478`.
-    pub urls: Vec<String>,
-    /// TURN credentials when the relay requires them.
-    pub username: Option<String>,
-    pub credential: Option<String>,
-}
 
 static MSG_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -157,6 +144,21 @@ impl Net {
         serde_json::from_slice(&bytes).map_err(|e| format!("bad response: {e}"))
     }
 
+    /// [`Net::exec`] for endpoints that answer `204 No Content` (logout, key
+    /// uploads, mailbox posts): nothing is parsed from the empty body.
+    async fn exec_empty(&self, builder: reqwest::RequestBuilder) -> Result<(), String> {
+        let resp = builder.send().await.map_err(|e| format!("network: {e}"))?;
+        let status = resp.status();
+        let bytes = resp.bytes().await.map_err(|e| format!("network: {e}"))?;
+        if !status.is_success() {
+            if let Ok(api) = serde_json::from_slice::<ApiError>(&bytes) {
+                return Err(api.message);
+            }
+            return Err(format!("HTTP {}", status.as_u16()));
+        }
+        Ok(())
+    }
+
     // -- auth --------------------------------------------------------------
 
     pub async fn register(&self, req: &RegisterRequest) -> Result<TokenResponse, String> {
@@ -170,7 +172,7 @@ impl Net {
     }
 
     pub async fn logout(&self) -> Result<(), String> {
-        self.exec(self.authed(reqwest::Method::POST, "/auth/logout"))
+        self.exec_empty(self.authed(reqwest::Method::POST, "/auth/logout"))
             .await
     }
 
@@ -228,17 +230,39 @@ impl Net {
             .await
     }
 
-    // -- keys (Olm prekeys, C2) ---------------------------------------------
+    // -- keys (Olm prekeys, C2/C3) --------------------------------------------
+
+    /// Keep the Instance's copy of our identity key fresh (`PUT
+    /// /keys/identity`, 204). Done after every login/register alongside the
+    /// OTK upload; registration also carries the key in its body.
+    pub async fn put_identity(&self, identity_key: &str) -> Result<(), String> {
+        self.exec_empty(
+            self.authed(reqwest::Method::PUT, "/keys/identity")
+                .json(&serde_json::json!({ "identity_key": identity_key })),
+        )
+        .await
+    }
 
     pub async fn upload_otks(&self, req: &UploadOtkRequest) -> Result<(), String> {
-        self.exec(self.authed(reqwest::Method::POST, "/keys/otk").json(req))
+        self.exec_empty(self.authed(reqwest::Method::POST, "/keys/otk").json(req))
             .await
     }
 
+    /// Claim a peer's identity key plus one one-time prekey. Destructive on
+    /// the server: the OTK (if any) is handed out at most once.
     pub async fn claim_otk(&self, account_id: i64) -> Result<ClaimedKeys, String> {
-        self.exec(
-            self.authed(reqwest::Method::POST, "/keys/claim")
-                .json(&serde_json::json!({ "account_id": account_id })),
+        self.exec(self.authed(reqwest::Method::GET, &format!("/keys/{account_id}")))
+            .await
+    }
+
+    // -- mailbox (directed Olm items) -----------------------------------------
+
+    /// Queue one directed ciphertext item (a Megolm `SessionShare` in an Olm
+    /// envelope) for a peer, online or offline (`POST /mailbox`, 204).
+    pub async fn post_mailbox(&self, to: i64, content: &str) -> Result<(), String> {
+        self.exec_empty(
+            self.authed(reqwest::Method::POST, "/mailbox")
+                .json(&serde_json::json!({ "to": to, "content": content })),
         )
         .await
     }
@@ -379,6 +403,169 @@ pub async fn send_message(
     req: &SendMessageRequest,
 ) -> Result<MessageDto, String> {
     net.send_channel_message(channel_id, req).await
+}
+
+/// Publish the engine's identity key and a batch of one-time prekeys to the
+/// Instance. Called once per login (and per session restore); failures are
+/// logged, not fatal — peers can still reach us with previously uploaded keys.
+pub async fn publish_keys(net: &Net, engine: &Arc<Engine>) {
+    if let Err(e) = net.put_identity(&engine.identity_key()).await {
+        eprintln!("bysyc: identity key upload failed: {e}");
+    }
+    let otks = engine.uploadable_otks(10);
+    if !otks.is_empty() {
+        if let Err(e) = net
+            .upload_otks(&UploadOtkRequest {
+                one_time_keys: otks,
+            })
+            .await
+        {
+            eprintln!("bysyc: one-time key upload failed: {e}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Megolm session bootstrap (the C3 send path's network half)
+// ---------------------------------------------------------------------------
+
+/// Share the current outbound Megolm session of `channel_id` with `peer_ids`:
+/// claim each peer's identity key + one OTK, wrap the session key
+/// (`Engine::share_envelopes`), and mailbox each Olm envelope. Also refreshes
+/// [`crate::state::MainState::identities`] from the claim responses.
+///
+/// Order matters (see the engine docs): this runs *before*
+/// [`Engine::drain_pending_shares`], so a creation/rotation share still
+/// carries its index-0 key. Returns how many peers received the share.
+pub async fn share_session_with_peers(
+    state: &Arc<Mutex<ClientState>>,
+    engine: &Arc<Engine>,
+    net: &Net,
+    channel_id: i64,
+    peer_ids: Vec<i64>,
+) -> usize {
+    let mut with_keys: Vec<(i64, String, Option<(String, String)>)> = Vec::new();
+    for peer in &peer_ids {
+        match net.claim_otk(*peer).await {
+            Ok(claimed) => {
+                {
+                    let mut st = guard(state);
+                    if let Some(m) = st.main_mut() {
+                        m.identities.insert(*peer, claimed.identity_key.clone());
+                    }
+                }
+                let otk = claimed
+                    .one_time_key
+                    .as_deref()
+                    .and_then(|s| s.split_once(':'))
+                    .map(|(id, key)| (id.to_string(), key.to_string()));
+                with_keys.push((*peer, claimed.identity_key, otk));
+            }
+            Err(e) => eprintln!("bysyc: claiming keys for peer {peer} failed: {e}"),
+        }
+    }
+
+    let envelopes = engine.share_envelopes(channel_id, &with_keys);
+    let mut delivered = 0usize;
+    for (peer, ciphertext) in envelopes {
+        match net.post_mailbox(peer, &ciphertext).await {
+            Ok(()) => delivered += 1,
+            Err(e) => eprintln!("bysyc: mailing session share to peer {peer} failed: {e}"),
+        }
+    }
+
+    // Must be empty after a successful share loop; leftovers mean a share
+    // nobody received (the queue is persisted, so the next send retries it).
+    let leftover = engine.drain_pending_shares();
+    if !leftover.is_empty() {
+        eprintln!(
+            "bysyc: {} pending megolm share(s) undelivered for channel {channel_id} \
+             (will re-share on the next send)",
+            leftover.len()
+        );
+    }
+    delivered
+}
+
+/// Persist the outbound-Megolm channel set to the local store (drives
+/// newcomer sharing after a restart).
+pub fn persist_outbound(state: &Arc<Mutex<ClientState>>, store: &Arc<Mutex<Store>>) {
+    let set = {
+        let st = guard(state);
+        st.main().map(|m| m.outbound.clone()).unwrap_or_default()
+    };
+    let s = guard(store);
+    if let Err(e) = s.save_outbound_channels(&set) {
+        eprintln!("bysyc: persisting outbound channel set failed: {e}");
+    }
+}
+
+/// Share every guild text channel we hold an outbound session for with a
+/// member who just joined, so they can decrypt from their join point onward
+/// (ADR 0001). Spawned by [`drain_followups`] on `MemberJoined`.
+async fn share_to_newcomer(
+    state: Arc<Mutex<ClientState>>,
+    store: Arc<Mutex<Store>>,
+    net: Net,
+    guild_id: i64,
+    member: i64,
+) {
+    let (engine, channels) = {
+        let st = guard(&state);
+        let Some(m) = st.main() else { return };
+        let Some(engine) = m.engine.clone() else {
+            return;
+        };
+        let Some(g) = m.guilds.iter().find(|g| g.id == guild_id) else {
+            return;
+        };
+        let channels: Vec<i64> = g
+            .channels
+            .iter()
+            .filter(|c| c.kind == ChannelKind::Text && m.outbound.contains(&c.id))
+            .map(|c| c.id)
+            .collect();
+        (engine, channels)
+    };
+    for ch in channels {
+        share_session_with_peers(&state, &engine, &net, ch, vec![member]).await;
+        persist_outbound(&state, &store);
+    }
+}
+
+/// Act on follow-up work [`apply_server_msg`] queued: mailbox acks
+/// (`AckMailbox`), and session shares for guild newcomers. Runs after every
+/// applied server message inside the WS loop.
+pub fn drain_followups(
+    state: &Arc<Mutex<ClientState>>,
+    store: &Arc<Mutex<Store>>,
+    handle: &NetHandle,
+) {
+    let (acks, newcomers) = {
+        let mut st = guard(state);
+        match st.main_mut() {
+            Some(m) => (
+                std::mem::take(&mut m.outbox_acks),
+                std::mem::take(&mut m.pending_newcomers),
+            ),
+            None => (Vec::new(), Vec::new()),
+        }
+    };
+    if !acks.is_empty() {
+        let _ = handle.out.try_send(WsClientMsg {
+            id: next_msg_id(),
+            body: WsClientBody::AckMailbox { ids: acks },
+        });
+    }
+    for (guild_id, member) in newcomers {
+        tokio::spawn(share_to_newcomer(
+            Arc::clone(state),
+            Arc::clone(store),
+            handle.net.clone(),
+            guild_id,
+            member,
+        ));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -571,21 +758,25 @@ pub async fn run_ws(
                                                     return;
                                                 }
                                                 if matches!(msg.body, WsServerBody::Ready { .. }) {
-                                                    apply_server_msg(&state, &ctx, msg);
+                                                    apply_server_msg(&state, &store, &ctx, msg);
                                                     if let Some(m) = guard(&state).main_mut() {
                                                         m.net = Some(handle.clone());
                                                     }
+                                                    drain_followups(&state, &store, &handle);
                                                     if !first_connect {
                                                         resync(&net, &state).await;
                                                     }
                                                     first_connect = false;
                                                 } else {
                                                     if let WsServerBody::Message(ref dto) = msg.body {
-                                                        if let Ok(s) = store.lock() {
-                                                            let _ = s.append_message(dto);
+                                                        if dto.kind != bysyc_common::protocol::MessageKind::Control {
+                                                            if let Ok(s) = store.lock() {
+                                                                let _ = s.append_message(dto);
+                                                            }
                                                         }
                                                     }
-                                                    apply_server_msg(&state, &ctx, msg);
+                                                    apply_server_msg(&state, &store, &ctx, msg);
+                                                    drain_followups(&state, &store, &handle);
                                                 }
                                                 if !alive(&state, generation) {
                                                     return;

@@ -77,8 +77,43 @@ impl BysycApp {
         self.net_task = Some(self.rt.spawn(async move {
             let net = crate::net::Net::authenticated(&base, &token);
             match net.me().await {
-                Ok(_) => {
-                    crate::net::spawn_ws(&rt, state, store, ctx.clone(), base, token);
+                Ok(me) => {
+                    // The engine must exist before the first WS Ready lands
+                    // (the mailbox batch it carries holds our session shares).
+                    // A failed bootstrap is unrecoverable for E2EE — better a
+                    // clean login screen than a session that can only eavesdrop.
+                    match crate::store::bootstrap_engine(&store, &me.username) {
+                        Ok((engine, outbound)) => {
+                            {
+                                let mut st = state::guard(&state);
+                                st.pending_engine = Some(state::EngineBoot {
+                                    engine: engine.clone(),
+                                    outbound,
+                                });
+                            }
+                            // Session restore re-publishes keys too: the
+                            // instance may have been reset, and topped-up
+                            // OTKs keep prekey messages flowing.
+                            let pk_net = crate::net::Net::authenticated(&base, &token);
+                            let pk_engine = engine.clone();
+                            tokio::spawn(async move {
+                                crate::net::publish_keys(&pk_net, &pk_engine).await;
+                            });
+                            crate::net::spawn_ws(&rt, state, store, ctx.clone(), base, token);
+                        }
+                        Err(e) => {
+                            eprintln!("bysyc: {e}");
+                            crate::store::keyring_delete(&username);
+                            {
+                                let s = state::guard(&store);
+                                let _ = s.del_setting("username");
+                            }
+                            let mut st = state::guard(&state);
+                            st.sign_out_local("");
+                            st.login_error =
+                                Some("cannot open the local crypto store — sign in again".into());
+                        }
+                    }
                 }
                 Err(_) => {
                     crate::store::keyring_delete(&username);

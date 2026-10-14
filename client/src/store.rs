@@ -6,13 +6,16 @@
 //! Message rows carry a `plaintext` column that stays `NULL` until C2/C3
 //! decrypt and fill it via [`Store::set_plaintext`].
 
+use std::collections::HashSet;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use bysyc_common::protocol::{
     AccountBrief, AttachmentMeta, ChannelInfo, DmChannel, GuildInfo, MessageDto, MessageKind,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::crypto::Engine;
 use crate::state::guard;
 
 // ---------------------------------------------------------------------------
@@ -37,7 +40,8 @@ CREATE TABLE IF NOT EXISTS messages(
     reply_to       INTEGER NULL,
     attachment_json TEXT NULL,
     created_at_ms  INTEGER NOT NULL,
-    plaintext      TEXT NULL
+    plaintext      TEXT NULL,
+    deleted        INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel_id);
 CREATE TABLE IF NOT EXISTS friends(
@@ -86,6 +90,12 @@ impl Store {
         let conn = Connection::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
         conn.execute_batch(SCHEMA)
             .map_err(|e| format!("migrate {}: {e}", path.display()))?;
+        // `CREATE TABLE IF NOT EXISTS` does not extend an existing table with
+        // new columns; add them best-effort (an error means "already there").
+        let _ = conn.execute(
+            "ALTER TABLE messages ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
         Ok(Store { conn })
     }
 
@@ -155,6 +165,17 @@ impl Store {
         Ok(())
     }
 
+    /// Drop every pickled crypto blob. Called when a different account signs
+    /// in on this device: the pickles belong to exactly one account (the
+    /// pickle passphrase is keychain-scoped per username), so keeping them
+    /// would make [`Engine::new`] fail with a wrong-passphrase error.
+    pub fn clear_pickles(&self) -> Result<(), String> {
+        self.conn
+            .execute("DELETE FROM keys", [])
+            .map_err(|e| format!("keys: {e}"))?;
+        Ok(())
+    }
+
     // -- messages --------------------------------------------------------------
 
     /// Persist a server-confirmed message (optimistic temps are never
@@ -197,7 +218,7 @@ impl Store {
             "SELECT id, channel_id, sender_id, kind, content, reply_to,
                     attachment_json, created_at_ms
              FROM messages
-             WHERE channel_id = ?1 AND (?2 IS NULL OR id < ?2)
+             WHERE channel_id = ?1 AND deleted = 0 AND (?2 IS NULL OR id < ?2)
              ORDER BY id DESC
              LIMIT ?3",
         ) {
@@ -250,6 +271,58 @@ impl Store {
             .ok()
             .flatten()
             .flatten()
+    }
+
+    /// Mark a message deleted (an [`crate::crypto::Envelope::Delete`] asked
+    /// peers to hide it). Queries filter deleted rows out; the ciphertext
+    /// stays for audit.
+    pub fn delete_message(&self, msg_id: i64) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE messages SET deleted = 1 WHERE id = ?1",
+                params![msg_id],
+            )
+            .map_err(|e| format!("messages: {e}"))?;
+        Ok(())
+    }
+
+    /// `(id, sender_id, content)` of cached messages in a channel that still
+    /// have no decrypted plaintext — the retry set for history backfill once
+    /// a Megolm session share arrives.
+    pub fn undecrypted(&self, channel_id: i64) -> Vec<(i64, i64, String)> {
+        let Ok(mut stmt) = self.conn.prepare(
+            "SELECT id, sender_id, content FROM messages
+             WHERE channel_id = ?1 AND deleted = 0 AND plaintext IS NULL
+             ORDER BY id",
+        ) else {
+            return Vec::new();
+        };
+        let Ok(rows) = stmt.query_map(params![channel_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        }) else {
+            return Vec::new();
+        };
+        rows.filter_map(|r| r.ok()).collect()
+    }
+
+    // -- outbound megolm channels (C3 bookkeeping) -----------------------------
+
+    /// Channels for which this device holds an outbound Megolm session (i.e.
+    /// we have sent there), persisted so guild-newcomer sharing survives a
+    /// restart.
+    pub fn save_outbound_channels(&self, channels: &HashSet<i64>) -> Result<(), String> {
+        let ids: Vec<i64> = channels.iter().copied().collect();
+        self.set_setting(
+            "outbound_channels",
+            &serde_json::to_string(&ids).unwrap_or_else(|_| "[]".into()),
+        )
+    }
+
+    pub fn load_outbound_channels(&self) -> HashSet<i64> {
+        self.setting("outbound_channels")
+            .and_then(|s| serde_json::from_str::<Vec<i64>>(&s).ok())
+            .map(|ids| ids.into_iter().collect())
+            .unwrap_or_default()
     }
 
     // -- world cache ---------------------------------------------------------------
@@ -375,23 +448,34 @@ impl Store {
 }
 
 // ---------------------------------------------------------------------------
-// Keychain (session token)
+// Keychain (session token + pickle passphrase)
 // ---------------------------------------------------------------------------
 
 const KEYCHAIN_SERVICE: &str = "bysyc";
+/// Separate keychain service for the pickle passphrase (ADR 0001: the
+/// passphrase never lives in the SQLite file it protects).
+const KEYCHAIN_PICKLE_SERVICE: &str = "bysyc-pickle";
+
+fn keyring_get_in(service: &str, account: &str) -> Option<String> {
+    let entry = keyring::Entry::new(service, account).ok()?;
+    entry.get_password().ok()
+}
+
+fn keyring_set_in(service: &str, account: &str, secret: &str) -> Result<(), String> {
+    keyring::Entry::new(service, account)
+        .map_err(|e| format!("keychain: {e}"))?
+        .set_password(secret)
+        .map_err(|e| format!("keychain: {e}"))
+}
 
 /// Store the session token for `username` in the OS keychain.
 pub fn keyring_set(username: &str, token: &str) -> Result<(), String> {
-    keyring::Entry::new(KEYCHAIN_SERVICE, username)
-        .map_err(|e| format!("keychain: {e}"))?
-        .set_password(token)
-        .map_err(|e| format!("keychain: {e}"))
+    keyring_set_in(KEYCHAIN_SERVICE, username, token)
 }
 
 /// Read the stored session token, if any.
 pub fn keyring_get(username: &str) -> Option<String> {
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, username).ok()?;
-    entry.get_password().ok()
+    keyring_get_in(KEYCHAIN_SERVICE, username)
 }
 
 /// Delete the stored session token (best-effort). keyring 4 renamed this
@@ -400,6 +484,74 @@ pub fn keyring_delete(username: &str) {
     if let Ok(entry) = keyring::Entry::new(KEYCHAIN_SERVICE, username) {
         let _ = entry.delete_credential();
     }
+}
+
+// ---------------------------------------------------------------------------
+// Crypto engine bootstrap (C3)
+// ---------------------------------------------------------------------------
+
+/// Adapter that lets the engine (which holds `Arc<dyn KeyStore>`) pickle into
+/// the shared [`Store`]. Failures are logged and swallowed: the engine's
+/// contract wants `put` to be fire-and-forget, and a failed pickle write only
+/// costs a re-share after restart, never correctness of an in-flight message.
+pub struct KeyStoreImpl(pub Arc<Mutex<Store>>);
+
+impl crate::crypto::KeyStore for KeyStoreImpl {
+    fn get(&self, scope: &str) -> Option<Vec<u8>> {
+        lock_store(&self.0).pickle(scope)
+    }
+
+    fn put(&self, scope: &str, blob: &[u8]) {
+        if let Err(e) = lock_store(&self.0).put_pickle(scope, blob) {
+            eprintln!("[bysyc] pickle write failed ({scope}): {e}");
+        }
+    }
+
+    fn delete(&self, scope: &str) {
+        if let Err(e) = lock_store(&self.0).del_pickle(scope) {
+            eprintln!("[bysyc] pickle delete failed ({scope}): {e}");
+        }
+    }
+}
+
+/// 32 random bytes as 64 hex chars (OS entropy via `rand`).
+fn random_hex32() -> String {
+    use rand::Rng;
+    let mut bytes = [0u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The passphrase protecting this account's pickles: looked up in the OS
+/// keychain under [`KEYCHAIN_PICKLE_SERVICE`]/`username`, generated and stored
+/// on first login. Losing it means losing the identity (ADR 0001 accepts
+/// that: one device per account, no key export in v1), so a failed keychain
+/// *write* is an error rather than a silent disposable secret.
+pub fn pickle_passphrase(username: &str) -> Result<String, String> {
+    if let Some(p) = keyring_get_in(KEYCHAIN_PICKLE_SERVICE, username) {
+        return Ok(p);
+    }
+    let p = random_hex32();
+    keyring_set_in(KEYCHAIN_PICKLE_SERVICE, username, &p)?;
+    Ok(p)
+}
+
+/// Build the crypto engine for `username` and load the persisted outbound
+/// Megolm channel set (used for share-to-newcomer bookkeeping).
+///
+/// Callers that may be switching accounts (login screen) should call
+/// [`Store::clear_pickles`] first when the username differs from the one the
+/// local state belongs to; the session-restore path calls this with the same
+/// username every time.
+pub fn bootstrap_engine(
+    store: &Arc<Mutex<Store>>,
+    username: &str,
+) -> Result<(Arc<Engine>, HashSet<i64>), String> {
+    let passphrase = pickle_passphrase(username)?;
+    let engine = Engine::new(Arc::new(KeyStoreImpl(store.clone())), passphrase)
+        .map_err(|e| format!("crypto engine init failed: {e}"))?;
+    let outbound = lock_store(store).load_outbound_channels();
+    Ok((Arc::new(engine), outbound))
 }
 
 // ---------------------------------------------------------------------------
@@ -439,4 +591,103 @@ fn parse_kind_channel(s: &str) -> bysyc_common::protocol::ChannelKind {
 /// Convenience for locking the shared store without propagating poisoning.
 pub fn lock_store(store: &std::sync::Mutex<Store>) -> std::sync::MutexGuard<'_, Store> {
     guard(store)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fresh Store in a unique temp file (tests never touch the real DB).
+    fn tmp_store(tag: &str) -> Store {
+        let path = std::env::temp_dir().join(format!(
+            "bysyc-test-{}-{tag}-{}.db",
+            std::process::id(),
+            now_tag()
+        ));
+        Store::open(&path).expect("open temp store")
+    }
+
+    fn now_tag() -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        N.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn msg(id: i64, channel: i64) -> MessageDto {
+        MessageDto {
+            id,
+            channel_id: channel,
+            sender_id: 7,
+            kind: MessageKind::Chat,
+            content: format!("cipher-{id}"),
+            reply_to: None,
+            attachment: None,
+            created_at_ms: id * 1000,
+        }
+    }
+
+    #[test]
+    fn outbound_channels_roundtrip() {
+        let s = tmp_store("outbound");
+        assert!(s.load_outbound_channels().is_empty());
+        let mut set = HashSet::new();
+        set.insert(1);
+        set.insert(42);
+        s.save_outbound_channels(&set).unwrap();
+        assert_eq!(s.load_outbound_channels(), set);
+        // Reopen semantics: settings persist in the same file; overwrite wins.
+        let set2 = HashSet::from([42]);
+        s.save_outbound_channels(&set2).unwrap();
+        assert_eq!(s.load_outbound_channels(), set2);
+    }
+
+    #[test]
+    fn undecrypted_tracks_plaintext_and_delete() {
+        let s = tmp_store("undecrypted");
+        s.append_message(&msg(1, 10)).unwrap();
+        s.append_message(&msg(2, 10)).unwrap();
+        s.append_message(&msg(3, 10)).unwrap();
+
+        let rows = s.undecrypted(10);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], (1, 7, "cipher-1".to_string()));
+
+        // Decrypting one row removes just it from the retry set.
+        s.set_plaintext(2, "hello").unwrap();
+        assert_eq!(s.undecrypted(10).len(), 2);
+        assert_eq!(s.plaintext(2).as_deref(), Some("hello"));
+
+        // A Delete hides the row from history and from the retry set.
+        s.delete_message(3).unwrap();
+        let visible: Vec<i64> = s.messages_for(10, None, 50).iter().map(|m| m.id).collect();
+        assert_eq!(visible, vec![1, 2]);
+        assert_eq!(s.undecrypted(10).len(), 1);
+
+        // Plaintext of a deleted row is irrelevant (never rendered).
+        s.delete_message(2).unwrap();
+        let visible: Vec<i64> = s.messages_for(10, None, 50).iter().map(|m| m.id).collect();
+        assert_eq!(visible, vec![1]);
+    }
+
+    #[test]
+    fn clear_pickles_wipes_every_scope() {
+        let s = tmp_store("pickles");
+        s.put_pickle("olm_account", b"blob-a").unwrap();
+        s.put_pickle("megolm_out", b"blob-b").unwrap();
+        assert_eq!(
+            s.pickle("olm_account").as_deref(),
+            Some(b"blob-a".as_slice())
+        );
+        s.clear_pickles().unwrap();
+        assert!(s.pickle("olm_account").is_none());
+        assert!(s.pickle("megolm_out").is_none());
+    }
+
+    #[test]
+    fn random_hex32_shape() {
+        let h = random_hex32();
+        assert_eq!(h.len(), 64);
+        assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(h, random_hex32());
+    }
 }

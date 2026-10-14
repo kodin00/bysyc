@@ -143,14 +143,42 @@ pub fn show(app: &mut BysycApp, ui: &mut egui::Ui) {
                 let rt_in_task = rt.clone();
                 let ctx = ui.ctx().clone();
                 rt.spawn(async move {
+                    // A different account signing in on this device owns the
+                    // pickled crypto state; drop it before the new engine
+                    // opens the store (the pickle passphrase is keychain
+                    // scoped per username, so a stale pickle can only fail
+                    // to decrypt). ADR 0001: one device per account.
+                    {
+                        let s = guard(&store);
+                        if let Some(prev) = s.setting("username") {
+                            if prev != username {
+                                let _ = s.clear_pickles();
+                                let _ = s.del_setting("outbound_channels");
+                            }
+                        }
+                    }
+                    // The engine must exist before registration (it supplies
+                    // the identity key) and before the first WS Ready (it
+                    // decrypts the mailbox batch of session shares that
+                    // Ready carries).
+                    let (engine, outbound) = match store::bootstrap_engine(&store, &username) {
+                        Ok(boot) => boot,
+                        Err(e) => {
+                            eprintln!("bysyc: {e}");
+                            let mut st = guard(&state);
+                            st.phase = Phase::Disconnected;
+                            st.login_error = Some("cannot open the local crypto store".into());
+                            ctx.request_repaint();
+                            return;
+                        }
+                    };
                     let net = Net::new(&base);
                     let result = if register {
                         net.register(&RegisterRequest {
                             username: username.clone(),
                             password: password.clone(),
                             invite_code: invite.clone(),
-                            // C2 replaces this with the real identity key.
-                            identity_key: net::PLACEHOLDER_IDENTITY_KEY.to_string(),
+                            identity_key: engine.identity_key(),
                         })
                         .await
                     } else {
@@ -163,11 +191,24 @@ pub fn show(app: &mut BysycApp, ui: &mut egui::Ui) {
                     match result {
                         Ok(tr) => {
                             {
+                                let mut st = guard(&state);
+                                st.pending_engine = Some(crate::state::EngineBoot {
+                                    engine: engine.clone(),
+                                    outbound,
+                                });
+                            }
+                            {
                                 let s = guard(&store);
                                 let _ = s.set_setting("server_url", &base);
                                 let _ = s.set_setting("username", &tr.account.username);
                             }
                             let _ = store::keyring_set(&tr.account.username, &tr.token);
+                            // Publish the identity key (login path; register
+                            // carried it in the request body already) and a
+                            // batch of one-time keys so peers can open Olm
+                            // sessions with us immediately.
+                            let authed = Net::authenticated(&base, &tr.token);
+                            net::publish_keys(&authed, &engine).await;
                             net::spawn_ws(&rt_in_task, state, store, ctx.clone(), base, tr.token);
                         }
                         Err(e) => {

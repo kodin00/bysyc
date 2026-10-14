@@ -9,7 +9,7 @@
 //! [`crate::net`] calls it, nothing else touches these fields ad hoc.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use bysyc_common::protocol::{
@@ -18,7 +18,9 @@ use bysyc_common::protocol::{
 };
 use eframe::egui::Context;
 
+use crate::crypto::{Engine, Envelope};
 use crate::net::NetHandle;
+use crate::store::Store;
 
 /// Current Unix time in whole milliseconds.
 pub fn now_ms() -> i64 {
@@ -35,6 +37,12 @@ pub fn guard<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// How long a typing indicator stays valid after the last `Typing` event.
 pub const TYPING_TTL_SECS: u64 = 6;
+
+/// A mailbox item older than this is acked and dropped unread: session shares
+/// older than a week predate any rotation window we care about (ADR 0001
+/// rotates at 100 messages / 1 week), so they cannot unlock anything the
+/// user still sees.
+pub const MAILBOX_STALE_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
 // ---------------------------------------------------------------------------
 // Phases
@@ -108,6 +116,31 @@ pub struct MainState {
     pub notice: Option<String>,
     /// Socket state.
     pub connection: ConnStatus,
+    // -- E2EE (C3) ------------------------------------------------------------
+    /// The crypto engine; `None` only if bootstrap failed (chat then refuses
+    /// to send rather than going out in the clear).
+    pub engine: Option<Arc<Engine>>,
+    /// account id → base64 identity key, learned from every AccountBrief the
+    /// server sends and from OTK-claim responses. Feeds Olm sender
+    /// authentication (this is the trust-on-first-use set, v1).
+    pub identities: HashMap<i64, String>,
+    /// guild id → known member ids (owner + self + MemberJoined discoveries;
+    /// the server does not push full rosters). Drives the share roster.
+    pub guild_members: HashMap<i64, HashSet<i64>>,
+    /// Channels we hold an outbound Megolm session for (persisted; drives
+    /// newcomer sharing and bootstrap detection after a restart).
+    pub outbound: HashSet<i64>,
+    /// channel → session id of the outbound session as of the last send; a
+    /// change means rotation, which re-triggers the share loop.
+    pub outbound_sid: HashMap<i64, String>,
+    /// (guild, member) pairs waiting for a share-to-newcomer task (drained by
+    /// [`crate::net::drain_followups`]).
+    pub pending_newcomers: Vec<(i64, i64)>,
+    /// Mailbox ids to ack on the next drain (set by [`MainState::process_mailbox`]).
+    pub outbox_acks: Vec<i64>,
+    /// Latest guild invite code to show/copy: (guild name, code). Transient
+    /// UI state that outlives the REST task, like [`MainState::notice`].
+    pub invite: Option<(String, String)>,
 }
 
 impl MainState {
@@ -119,8 +152,13 @@ impl MainState {
         guilds: Vec<GuildInfo>,
         dms: Vec<DmChannel>,
         mailbox: Vec<MailboxItem>,
+        boot: Option<EngineBoot>,
     ) -> Self {
         let online = friends.iter().filter(|f| f.online).map(|f| f.id).collect();
+        let (engine, outbound) = match boot {
+            Some(b) => (Some(b.engine), b.outbound),
+            None => (None, HashSet::new()),
+        };
         MainState {
             account,
             friends,
@@ -141,6 +179,14 @@ impl MainState {
             has_more: HashMap::new(),
             notice: None,
             connection: ConnStatus::Online,
+            engine,
+            identities: HashMap::new(),
+            guild_members: HashMap::new(),
+            outbound,
+            outbound_sid: HashMap::new(),
+            pending_newcomers: Vec::new(),
+            outbox_acks: Vec::new(),
+            invite: None,
         }
     }
 
@@ -279,6 +325,333 @@ impl MainState {
             Selection::Friends => {}
         }
     }
+
+    // -- E2EE helpers (C3) ------------------------------------------------------
+
+    /// Seed derived crypto world state after (re)connect: identity keys from
+    /// every AccountBrief the server handed us, and guild rosters seeded
+    /// with owner + self. MemberJoined events widen the rosters over time,
+    /// so seeding merges rather than replaces.
+    fn seed_world(&mut self) {
+        self.identities
+            .insert(self.account.id, self.account.identity_key.clone());
+        for a in self
+            .friends
+            .iter()
+            .chain(self.incoming_requests.iter())
+            .chain(self.outgoing_requests.iter())
+            .chain(self.dms.iter().map(|d| &d.peer))
+        {
+            self.identities.insert(a.id, a.identity_key.clone());
+        }
+        for g in &self.guilds {
+            let roster = self.guild_members.entry(g.id).or_default();
+            roster.insert(g.owner_id);
+            roster.insert(self.account.id);
+        }
+    }
+
+    /// Who a channel's Megolm session must be shared with: the DM peer, or
+    /// (guild channels) the owner + ourselves + every member discovered via
+    /// `MemberJoined`. The sender's current session reaches exactly these
+    /// accounts; history before a member's join point stays unreadable by
+    /// design (ADR 0001).
+    pub fn channel_peer_ids(&self, channel_id: i64) -> Vec<i64> {
+        if let Some(dm) = self.dms.iter().find(|d| d.channel.id == channel_id) {
+            return vec![dm.peer.id];
+        }
+        let Some(g) = self
+            .guilds
+            .iter()
+            .find(|g| g.channels.iter().any(|c| c.id == channel_id))
+        else {
+            return Vec::new();
+        };
+        let mut ids: Vec<i64> = self
+            .guild_members
+            .get(&g.id)
+            .map(|r| r.iter().copied().collect())
+            .unwrap_or_default();
+        if !ids.contains(&g.owner_id) {
+            ids.push(g.owner_id);
+        }
+        if !ids.contains(&self.account.id) {
+            ids.push(self.account.id);
+        }
+        ids
+    }
+
+    /// Drop a message from the live cache (an [`Envelope::Delete`] landed).
+    pub fn remove_message(&mut self, channel_id: i64, target: i64) {
+        if let Some(v) = self.messages.get_mut(&channel_id) {
+            v.retain(|m| m.id != target);
+        }
+    }
+
+    /// Decrypt one incoming chat message (Megolm) and persist its plaintext.
+    /// Returns `false` when the message must not render at all — the carrier
+    /// of a Delete envelope. Our own sends skip decryption: the send task
+    /// already stored the plaintext from the REST response, and the engine
+    /// deliberately holds no self-import. Undecryptable rows get a terminal
+    /// "[undecryptable]" marker; with no engine the row stays NULL and
+    /// renders as "[encrypted]" until backfill can retry it.
+    fn apply_chat_message(&mut self, store: &Arc<Mutex<Store>>, dto: &MessageDto) -> bool {
+        if dto.sender_id == self.account.id {
+            return true;
+        }
+        let Some(engine) = self.engine.clone() else {
+            return true;
+        };
+        // Engine call first, store write after: the engine pickles into the
+        // store while we hold no store lock (lock order state→engine→store).
+        let plain = decrypt_envelope_text(&engine, dto.channel_id, dto.sender_id, &dto.content);
+        match plain {
+            Decrypted::Text(text) => {
+                guard(store).set_plaintext(dto.id, &text).ok();
+            }
+            Decrypted::Deleted(target) => {
+                self.remove_message(dto.channel_id, target);
+                let s = guard(store);
+                let _ = s.delete_message(target);
+                let _ = s.delete_message(dto.id); // carrier never renders again
+                return false;
+            }
+            Decrypted::Failed => {
+                guard(store).set_plaintext(dto.id, "[undecryptable]").ok();
+            }
+        }
+        true
+    }
+
+    /// Decrypt + apply every mailbox item we can: Olm-decrypt the transport,
+    /// expect an [`Envelope::SessionShare`], import the Megolm key. Items
+    /// whose sender identity is not known yet are kept (not acked) for a
+    /// later retry; stale items (older than [`MAILBOX_STALE_MS`]) and
+    /// undecryptable/malformed ones are acked and dropped — the mailbox must
+    /// never block. Acks queue in [`MainState::outbox_acks`] for the WS loop
+    /// to flush (there is no socket handle at the first Ready yet).
+    fn process_mailbox(&mut self, store: &Arc<Mutex<Store>>) {
+        let Some(engine) = self.engine.clone() else {
+            return; // no engine: keep everything, retry after bootstrap
+        };
+        let now = now_ms();
+        let mut keep = Vec::new();
+        let mut acks = Vec::new();
+        let mut imported: Vec<i64> = Vec::new();
+        for item in std::mem::take(&mut self.mailbox) {
+            if now.saturating_sub(item.created_at_ms) > MAILBOX_STALE_MS {
+                acks.push(item.id);
+                continue;
+            }
+            let Some(identity) = self.identities.get(&item.sender_id).cloned() else {
+                keep.push(item); // identity unknown yet; retry once learned
+                continue;
+            };
+            match engine.olm_decrypt_from(item.sender_id, &identity, &item.content) {
+                Ok(plaintext) => match serde_json::from_str::<Envelope>(&plaintext) {
+                    Ok(Envelope::SessionShare {
+                        channel_id,
+                        session_id,
+                        session_key,
+                    }) => {
+                        match engine.megolm_import(
+                            channel_id,
+                            item.sender_id,
+                            &session_id,
+                            &session_key,
+                        ) {
+                            Ok(()) => imported.push(channel_id),
+                            Err(e) => {
+                                eprintln!("bysyc: megolm import failed (channel {channel_id}): {e}")
+                            }
+                        }
+                        acks.push(item.id);
+                    }
+                    _ => acks.push(item.id), // not a share → malformed for us: skip
+                },
+                Err(_) => acks.push(item.id), // undecryptable: ack + skip
+            }
+        }
+        self.mailbox = keep;
+        self.outbox_acks.extend(acks);
+        // A freshly imported session may unlock history we already cached.
+        for ch in imported {
+            self.backfill_plaintexts(store, ch);
+        }
+    }
+
+    /// Retry decryption for cached history rows that still have no plaintext
+    /// (e.g. loaded before the session share arrived). Store writes happen
+    /// strictly after the engine calls — never under the store lock — for
+    /// the same lock-order reason as [`MainState::apply_chat_message`].
+    pub fn backfill_plaintexts(&self, store: &Arc<Mutex<Store>>, channel_id: i64) {
+        let Some(engine) = self.engine.as_ref() else {
+            return;
+        };
+        let rows = guard(store).undecrypted(channel_id);
+        let mut decrypted: Vec<(i64, String)> = Vec::new();
+        for (id, sender, content) in rows {
+            if sender == self.account.id {
+                continue; // own rows get their plaintext from the send task
+            }
+            if let Decrypted::Text(text) =
+                decrypt_envelope_text(engine, channel_id, sender, &content)
+            {
+                decrypted.push((id, text));
+            }
+        }
+        if decrypted.is_empty() {
+            return;
+        }
+        let s = guard(store);
+        for (id, text) in decrypted {
+            let _ = s.set_plaintext(id, &text);
+        }
+    }
+}
+
+/// Result of decrypting one message ciphertext into renderable text.
+enum Decrypted {
+    Text(String),
+    /// A Delete envelope: hide `target` (and the carrier).
+    Deleted(i64),
+    /// Could not decrypt or parse.
+    Failed,
+}
+
+/// Megolm-decrypt `content` from `sender` in `channel` and map the envelope
+/// to renderable text. Sharing [`Envelope::File`] rendering duties with C4:
+/// v1 renders the "[file: name]" placeholder via plaintext.
+fn decrypt_envelope_text(engine: &Engine, channel: i64, sender: i64, content: &str) -> Decrypted {
+    let Ok(plaintext) = engine.megolm_decrypt(channel, sender, "", content) else {
+        return Decrypted::Failed;
+    };
+    match serde_json::from_str::<Envelope>(&plaintext) {
+        Ok(Envelope::Chat { text, .. }) => Decrypted::Text(text),
+        Ok(Envelope::File { name, .. }) => Decrypted::Text(format!("[file: {name}]")),
+        Ok(Envelope::Delete { target }) => Decrypted::Deleted(target),
+        Ok(Envelope::SessionShare { .. }) | Err(_) => Decrypted::Failed,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bysyc_common::protocol::{ChannelInfo, MessageKind};
+
+    fn acct(id: i64, name: &str) -> AccountInfo {
+        AccountInfo {
+            id,
+            username: name.into(),
+            identity_key: format!("identity-{id}"),
+            created_at_ms: 0,
+        }
+    }
+
+    fn brief(id: i64, name: &str) -> AccountBrief {
+        AccountBrief {
+            id,
+            username: name.into(),
+            identity_key: format!("identity-{id}"),
+            online: false,
+        }
+    }
+
+    fn channel(id: i64, guild: Option<i64>, kind: ChannelKind, name: &str) -> ChannelInfo {
+        ChannelInfo {
+            id,
+            guild_id: guild,
+            kind,
+            name: name.into(),
+        }
+    }
+
+    fn world() -> MainState {
+        let me = acct(1, "me");
+        let owner = brief(2, "owner");
+        let peer = brief(3, "peer");
+        let guilds = vec![GuildInfo {
+            id: 100,
+            name: "guild".into(),
+            owner_id: 2,
+            channels: vec![
+                channel(101, Some(100), ChannelKind::Text, "general"),
+                channel(102, Some(100), ChannelKind::Voice, "voice"),
+            ],
+        }];
+        let dms = vec![DmChannel {
+            channel: channel(200, None, ChannelKind::Dm, "dm"),
+            peer: peer.clone(),
+        }];
+        MainState::from_ready(
+            me,
+            vec![owner.clone()],
+            vec![],
+            vec![],
+            guilds,
+            dms,
+            Vec::new(),
+            None,
+        )
+    }
+
+    #[test]
+    fn dm_roster_is_just_the_peer() {
+        let m = world();
+        assert_eq!(m.channel_peer_ids(200), vec![3]);
+    }
+
+    #[test]
+    fn guild_roster_seeds_owner_and_self_then_widens() {
+        let mut m = world();
+        m.seed_world();
+        let sorted = |mut v: Vec<i64>| {
+            v.sort_unstable();
+            v
+        };
+        // Owner + self, nobody else discovered yet.
+        assert_eq!(sorted(m.channel_peer_ids(101)), vec![1, 2]);
+        // A MemberJoined discovery widens the share roster.
+        m.guild_members.entry(100).or_default().insert(9);
+        assert_eq!(sorted(m.channel_peer_ids(101)), vec![1, 2, 9]);
+        // Leaving shrinks it again.
+        m.guild_members.get_mut(&100).unwrap().remove(&9);
+        assert_eq!(sorted(m.channel_peer_ids(101)), vec![1, 2]);
+        // Unknown channel shares with nobody.
+        assert!(m.channel_peer_ids(999).is_empty());
+    }
+
+    #[test]
+    fn seed_world_learns_every_visible_identity() {
+        let mut m = world();
+        m.seed_world();
+        assert_eq!(m.identities.get(&1).map(String::as_str), Some("identity-1"));
+        assert_eq!(m.identities.get(&2).map(String::as_str), Some("identity-2"));
+        assert_eq!(m.identities.get(&3).map(String::as_str), Some("identity-3"));
+        // Re-seeding after a reconnect must not lose anything.
+        m.seed_world();
+        assert_eq!(m.identities.len(), 3);
+    }
+
+    #[test]
+    fn delete_envelope_removes_target_from_cache() {
+        let mut m = world();
+        for id in 1..=3 {
+            m.append_message(bysyc_common::protocol::MessageDto {
+                id,
+                channel_id: 200,
+                sender_id: 3,
+                kind: MessageKind::Chat,
+                content: format!("ct-{id}"),
+                reply_to: None,
+                attachment: None,
+                created_at_ms: id,
+            });
+        }
+        m.remove_message(200, 2);
+        let ids: Vec<i64> = m.messages[&200].iter().map(|x| x.id).collect();
+        assert_eq!(ids, vec![1, 3]);
+    }
 }
 
 /// Ascending by id, with optimistic temps (negative ids) kept at the tail.
@@ -294,6 +667,15 @@ fn sort_messages(v: &mut [MessageDto]) {
 // ClientState
 // ---------------------------------------------------------------------------
 
+/// A crypto engine built by the login/restore task before the WS `Ready`
+/// arrives, so the first mailbox batch (session shares!) can decrypt the
+/// moment the world exists.
+pub struct EngineBoot {
+    pub engine: Arc<Engine>,
+    /// Persisted outbound-Megolm channel set loaded alongside the engine.
+    pub outbound: HashSet<i64>,
+}
+
 /// Root state. `ws_generation` invalidates stale WS loops: every spawned
 /// loop carries the generation current at its start and exits once the
 /// counter moves (logout, or a new login superseding it).
@@ -302,6 +684,8 @@ pub struct ClientState {
     pub ws_generation: u64,
     /// Last login/restore failure to show on the login view.
     pub login_error: Option<String>,
+    /// Engine staged by login/restore, consumed by the first WS `Ready`.
+    pub pending_engine: Option<EngineBoot>,
 }
 
 impl ClientState {
@@ -310,6 +694,7 @@ impl ClientState {
             phase: Phase::Disconnected,
             ws_generation: 0,
             login_error: None,
+            pending_engine: None,
         }
     }
 
@@ -337,6 +722,7 @@ impl ClientState {
     pub fn sign_out_local(&mut self, reason: &str) {
         self.ws_generation += 1;
         self.phase = Phase::Disconnected;
+        self.pending_engine = None;
         if !reason.is_empty() {
             self.login_error = Some(reason.to_string());
         }
@@ -351,9 +737,16 @@ impl ClientState {
 /// Returns `true` when the message was `Ready`.
 ///
 /// The WS task stamps `MainState::net` itself right after a `Ready` (it owns
-/// the handle); message persistence to [`crate::store`] also happens in the
-/// caller, which holds the store.
-pub fn apply_server_msg(state: &Mutex<ClientState>, ctx: &Context, msg: WsServerMsg) -> bool {
+/// the handle). Message persistence happens in the caller *before* this runs
+/// (the caller holds the store and the raw dto); decryption, delete-marking
+/// and plaintext writes happen here under the state lock (lock order:
+/// state → engine → store, never store → engine).
+pub fn apply_server_msg(
+    state: &Mutex<ClientState>,
+    store: &Arc<Mutex<Store>>,
+    ctx: &Context,
+    msg: WsServerMsg,
+) -> bool {
     let mut st = guard(state);
     let mut was_ready = false;
     match msg.body {
@@ -370,7 +763,8 @@ pub fn apply_server_msg(state: &Mutex<ClientState>, ctx: &Context, msg: WsServer
             st.login_error = None;
             if let Phase::LoggedIn(m) = &mut st.phase {
                 // Reconnect resync: replace the server-owned world, keep
-                // local caches (messages, selection, voice, pending signals).
+                // local caches (messages, selection, voice, pending signals,
+                // crypto state).
                 m.online = friends.iter().filter(|f| f.online).map(|f| f.id).collect();
                 m.account = account;
                 m.friends = friends;
@@ -382,6 +776,7 @@ pub fn apply_server_msg(state: &Mutex<ClientState>, ctx: &Context, msg: WsServer
                 m.connection = ConnStatus::Online;
                 m.validate_selection();
             } else {
+                let boot = st.pending_engine.take();
                 st.phase = Phase::LoggedIn(MainState::from_ready(
                     account,
                     friends,
@@ -390,20 +785,55 @@ pub fn apply_server_msg(state: &Mutex<ClientState>, ctx: &Context, msg: WsServer
                     guilds,
                     dm_channels,
                     mailbox,
+                    boot,
                 ));
+            }
+            // The engine must exist before the mailbox below is processed
+            // (session shares ride in it). Login/restore stage one in
+            // `pending_engine`; if it is missing (crash between WS connect
+            // and login task?) bootstrap inline from the local store.
+            if let Some(m) = st.main_mut() {
+                if m.engine.is_none() {
+                    let username = m.account.username.clone();
+                    match crate::store::bootstrap_engine(store, &username) {
+                        Ok((engine, outbound)) => {
+                            m.engine = Some(engine);
+                            m.outbound.extend(outbound);
+                        }
+                        Err(e) => {
+                            eprintln!("bysyc: {e}");
+                            m.notice = Some("crypto engine unavailable — sending disabled".into());
+                        }
+                    }
+                }
+            }
+            if let Some(m) = st.main_mut() {
+                m.seed_world();
+                m.process_mailbox(store);
+                // A share that arrived while we were offline may unlock
+                // history cached from the previous session.
+                let loaded: Vec<i64> = m.loaded.iter().copied().collect();
+                for ch in loaded {
+                    m.backfill_plaintexts(store, ch);
+                }
             }
         }
         WsServerBody::Message(dto) => {
             if let Some(m) = st.main_mut() {
-                m.append_message(dto.clone());
-                if dto.kind == MessageKind::Chat && !m.is_selected_channel(dto.channel_id) {
-                    m.unread.insert(dto.channel_id);
+                if dto.kind == MessageKind::Control {
+                    // v1 has no chat-routed control payloads; drop.
+                } else if m.apply_chat_message(store, &dto) {
+                    m.append_message(dto.clone());
+                    if !m.is_selected_channel(dto.channel_id) {
+                        m.unread.insert(dto.channel_id);
+                    }
                 }
             }
         }
         WsServerBody::MailboxAppend(item) => {
             if let Some(m) = st.main_mut() {
                 m.mailbox.push(item);
+                m.process_mailbox(store);
             }
         }
         WsServerBody::Presence { account_id, online } => {
@@ -428,6 +858,7 @@ pub fn apply_server_msg(state: &Mutex<ClientState>, ctx: &Context, msg: WsServer
         }
         WsServerBody::FriendRequested { from } => {
             if let Some(m) = st.main_mut() {
+                m.identities.insert(from.id, from.identity_key.clone());
                 if !m.incoming_requests.iter().any(|a| a.id == from.id) {
                     m.incoming_requests.push(from);
                 }
@@ -435,6 +866,7 @@ pub fn apply_server_msg(state: &Mutex<ClientState>, ctx: &Context, msg: WsServer
         }
         WsServerBody::FriendRequestAccepted { by } => {
             if let Some(m) = st.main_mut() {
+                m.identities.insert(by.id, by.identity_key.clone());
                 m.outgoing_requests.retain(|a| a.id != by.id);
                 if !m.friends.iter().any(|a| a.id == by.id) {
                     if by.online {
@@ -453,6 +885,9 @@ pub fn apply_server_msg(state: &Mutex<ClientState>, ctx: &Context, msg: WsServer
         }
         WsServerBody::GuildJoined { guild } => {
             if let Some(m) = st.main_mut() {
+                let roster = m.guild_members.entry(guild.id).or_default();
+                roster.insert(guild.owner_id);
+                roster.insert(m.account.id);
                 match m.guilds.iter_mut().find(|g| g.id == guild.id) {
                     Some(existing) => *existing = guild,
                     None => m.guilds.push(guild),
@@ -481,14 +916,39 @@ pub fn apply_server_msg(state: &Mutex<ClientState>, ctx: &Context, msg: WsServer
                 }
             }
         }
-        WsServerBody::MemberLeft { .. } | WsServerBody::MemberJoined { .. } => {
-            // v1 keeps no guild member roster; nothing to update.
+        WsServerBody::MemberJoined { guild_id, account } => {
+            if let Some(m) = st.main_mut() {
+                m.identities
+                    .insert(account.id, account.identity_key.clone());
+                m.guild_members
+                    .entry(guild_id)
+                    .or_default()
+                    .insert(account.id);
+                // Their session share may already sit in the mailbox.
+                m.process_mailbox(store);
+                if account.id != m.account.id {
+                    m.pending_newcomers.push((guild_id, account.id));
+                }
+            }
+        }
+        WsServerBody::MemberLeft {
+            guild_id,
+            account_id,
+        } => {
+            if let Some(m) = st.main_mut() {
+                if let Some(roster) = m.guild_members.get_mut(&guild_id) {
+                    roster.remove(&account_id);
+                }
+            }
         }
         WsServerBody::VoiceState {
             channel_id,
             participants,
         } => {
             if let Some(m) = st.main_mut() {
+                for p in &participants {
+                    m.identities.insert(p.id, p.identity_key.clone());
+                }
                 if participants.is_empty() {
                     m.voice.remove(&channel_id); // empty snapshot = call ended
                 } else {

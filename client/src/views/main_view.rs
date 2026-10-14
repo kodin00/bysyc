@@ -19,11 +19,13 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 
 use bysyc_common::protocol::{
-    ChannelKind, MessageDto, MessageKind, OpenDmRequest, SendMessageRequest, WsClientBody,
+    ChannelKind, CreateChannelRequest, CreateGuildInviteRequest, CreateGuildRequest,
+    JoinGuildRequest, MessageDto, MessageKind, OpenDmRequest, SendMessageRequest, WsClientBody,
     WsClientMsg,
 };
 
 use crate::app::BysycApp;
+use crate::crypto::Envelope;
 use crate::net::{self, NetHandle};
 use crate::state::{ClientState, ConnStatus, Selection, TYPING_TTL_SECS, guard, now_ms};
 use crate::store::Store;
@@ -38,6 +40,20 @@ pub struct MainView {
     pub temp_id: i64,
     /// Add-friend input.
     pub add_friend: String,
+    /// Per channel: the message id the composer is replying to.
+    pub reply_to: HashMap<i64, i64>,
+    /// "+"-guild popup open?
+    pub guild_popup: bool,
+    /// Inputs for the guild popup (create / join-by-code).
+    pub new_guild_name: String,
+    pub join_code: String,
+    /// "+ channel" popup open (guild owner only).
+    pub channel_popup: bool,
+    pub new_channel_name: String,
+    /// `false` = text channel, `true` = voice channel.
+    pub new_channel_voice: bool,
+    /// "+ dm" friend picker open?
+    pub dm_picker: bool,
 }
 
 impl MainView {
@@ -47,6 +63,14 @@ impl MainView {
             last_typing_sent: HashMap::new(),
             temp_id: -1,
             add_friend: String::new(),
+            reply_to: HashMap::new(),
+            guild_popup: false,
+            new_guild_name: String::new(),
+            join_code: String::new(),
+            channel_popup: false,
+            new_channel_name: String::new(),
+            new_channel_voice: false,
+            dm_picker: false,
         }
     }
 }
@@ -66,7 +90,7 @@ pub fn show(app: &mut BysycApp, ui: &mut egui::Ui) {
     egui::Panel::left("nav")
         .resizable(false)
         .default_size(190.0)
-        .show(ui, |ui| nav(ui, state, store, rt, &ctx));
+        .show(ui, |ui| nav(ui, state, store, rt, main_view, &ctx));
 
     egui::Panel::left("middle")
         .resizable(false)
@@ -74,6 +98,9 @@ pub fn show(app: &mut BysycApp, ui: &mut egui::Ui) {
         .show(ui, |ui| middle(ui, state, rt, main_view, &ctx));
 
     egui::CentralPanel::default().show(ui, |ui| chat(ui, state, store, rt, main_view, &ctx));
+
+    // Transient popups driven by background tasks (invite codes).
+    invite_window(state, &ctx);
 
     // C5 renders the call overlay from here.
     crate::call::ui::overlay(&ctx, state, rt);
@@ -88,7 +115,8 @@ fn nav(
     state: &Arc<Mutex<ClientState>>,
     store: &Arc<Mutex<Store>>,
     rt: &tokio::runtime::Handle,
-    _ctx: &egui::Context,
+    mv: &mut MainView,
+    ctx: &egui::Context,
 ) {
     let (guilds, dms, selected, unread, online, incoming) = {
         let st = guard(state);
@@ -122,6 +150,9 @@ fn nav(
                 }
             }
         }
+    }
+    if ui.button("+ guild").clicked() {
+        mv.guild_popup = !mv.guild_popup;
     }
 
     ui.add_space(8.0);
@@ -166,11 +197,96 @@ fn nav(
             }
         });
     }
+    if ui.button("+ dm").clicked() {
+        mv.dm_picker = !mv.dm_picker;
+    }
 
     ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
         if ui.button("Log out").clicked() {
             logout(state, store, rt);
         }
+    });
+
+    guild_popup(state, rt, mv, ctx);
+    dm_picker(state, rt, mv, ctx);
+}
+
+/// Create-a-guild / join-by-code window ("+ guild").
+fn guild_popup(
+    state: &Arc<Mutex<ClientState>>,
+    rt: &tokio::runtime::Handle,
+    mv: &mut MainView,
+    ctx: &egui::Context,
+) {
+    let mut open = mv.guild_popup;
+    let mut close = false;
+    egui::Window::new("Add a guild")
+        .id(egui::Id::new("guild_popup"))
+        .open(&mut open)
+        .collapsible(false)
+        .show(ctx, |ui| {
+            ui.label("Create");
+            ui.text_edit_singleline(&mut mv.new_guild_name);
+            if ui.button("Create guild").clicked() {
+                let name = mv.new_guild_name.trim().to_string();
+                if !name.is_empty() {
+                    mv.new_guild_name.clear();
+                    close = true;
+                    spawn_guild_rest(state, rt, ctx, move |h| async move {
+                        h.net.create_guild(&CreateGuildRequest { name }).await
+                    });
+                }
+            }
+            ui.separator();
+            ui.label("Join with an invite code");
+            ui.text_edit_singleline(&mut mv.join_code);
+            if ui.button("Join").clicked() {
+                let code = mv.join_code.trim().to_string();
+                if !code.is_empty() {
+                    mv.join_code.clear();
+                    close = true;
+                    spawn_guild_rest(state, rt, ctx, move |h| async move {
+                        h.net.join_guild(&JoinGuildRequest { code }).await
+                    });
+                }
+            }
+        });
+    mv.guild_popup = open && !close;
+}
+
+/// Shared REST half of create/join guild: run the call, merge the returned
+/// guild locally (the WS `GuildJoined` echo is deduped on insert).
+fn spawn_guild_rest<F, Fut>(
+    state: &Arc<Mutex<ClientState>>,
+    rt: &tokio::runtime::Handle,
+    ctx: &egui::Context,
+    fut_fn: F,
+) where
+    F: FnOnce(NetHandle) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<bysyc_common::protocol::GuildInfo, String>>
+        + Send
+        + 'static,
+{
+    let Some(h) = net_handle(state) else { return };
+    let state = Arc::clone(state);
+    let ctx = ctx.clone();
+    rt.spawn(async move {
+        match fut_fn(h).await {
+            Ok(g) => {
+                let mut st = guard(&state);
+                if let Some(m) = st.main_mut() {
+                    if !m.guilds.iter().any(|x| x.id == g.id) {
+                        m.guilds.push(g);
+                    }
+                }
+            }
+            Err(e) => {
+                if let Some(m) = guard(&state).main_mut() {
+                    m.notice = Some(e);
+                }
+            }
+        }
+        ctx.request_repaint();
     });
 }
 
@@ -195,6 +311,137 @@ fn logout(state: &Arc<Mutex<ClientState>>, store: &Arc<Mutex<Store>>, rt: &tokio
             let _ = h.net.logout().await;
         });
     }
+}
+
+/// "+ dm" picker: friends list → open (or reuse) a DM and select it.
+fn dm_picker(
+    state: &Arc<Mutex<ClientState>>,
+    rt: &tokio::runtime::Handle,
+    mv: &mut MainView,
+    ctx: &egui::Context,
+) {
+    let friends = {
+        let st = guard(state);
+        st.main().map(|m| m.friends.clone()).unwrap_or_default()
+    };
+    let mut open = mv.dm_picker;
+    let mut close = false;
+    egui::Window::new("Start a direct message")
+        .id(egui::Id::new("dm_picker"))
+        .open(&mut open)
+        .collapsible(false)
+        .show(ctx, |ui| {
+            if friends.is_empty() {
+                ui.weak("no friends yet — add some on the Friends page");
+            }
+            for f in &friends {
+                if ui.button(f.username.clone()).clicked() {
+                    close = true;
+                    open_dm_and_select(state, rt, ctx, f.id);
+                }
+            }
+        });
+    mv.dm_picker = open && !close;
+}
+
+/// Open (or reuse) a DM with `peer_id` and select it.
+fn open_dm_and_select(
+    state: &Arc<Mutex<ClientState>>,
+    rt: &tokio::runtime::Handle,
+    ctx: &egui::Context,
+    peer_id: i64,
+) {
+    let Some(h) = net_handle(state) else { return };
+    let state = Arc::clone(state);
+    let ctx = ctx.clone();
+    rt.spawn(async move {
+        match h
+            .net
+            .open_dm(&OpenDmRequest {
+                account_id: peer_id,
+            })
+            .await
+        {
+            Ok(dm) => {
+                let channel_id = dm.channel.id;
+                let mut st = guard(&state);
+                if let Some(m) = st.main_mut() {
+                    if !m.dms.iter().any(|d| d.channel.id == channel_id) {
+                        m.dms.push(dm);
+                    }
+                    m.selected = Selection::Dm(channel_id);
+                }
+            }
+            Err(e) => {
+                if let Some(m) = guard(&state).main_mut() {
+                    m.notice = Some(e);
+                }
+            }
+        }
+        ctx.request_repaint();
+    });
+}
+
+/// Owner's "invite": mint a 24 h code and surface it in [`invite_window`].
+fn spawn_invite(
+    state: &Arc<Mutex<ClientState>>,
+    rt: &tokio::runtime::Handle,
+    ctx: &egui::Context,
+    guild_id: i64,
+    guild_name: String,
+) {
+    let Some(h) = net_handle(state) else { return };
+    let state = Arc::clone(state);
+    let ctx = ctx.clone();
+    rt.spawn(async move {
+        match h
+            .net
+            .create_guild_invite(
+                guild_id,
+                &CreateGuildInviteRequest {
+                    max_uses: None,
+                    ttl_secs: Some(24 * 60 * 60),
+                },
+            )
+            .await
+        {
+            Ok(inv) => {
+                if let Some(m) = guard(&state).main_mut() {
+                    m.invite = Some((guild_name, inv.code));
+                }
+            }
+            Err(e) => {
+                if let Some(m) = guard(&state).main_mut() {
+                    m.notice = Some(e);
+                }
+            }
+        }
+        ctx.request_repaint();
+    });
+}
+
+/// Invite-code window: filled by the owner's "invite" action, with a
+/// copy-to-clipboard button.
+fn invite_window(state: &Arc<Mutex<ClientState>>, ctx: &egui::Context) {
+    let invite = { guard(state).main().and_then(|m| m.invite.clone()) };
+    let Some((guild, code)) = invite else { return };
+    egui::Window::new("Guild invite")
+        .id(egui::Id::new("invite_window"))
+        .collapsible(false)
+        .show(ctx, |ui| {
+            ui.label(format!("Invite to {guild}:"));
+            ui.monospace(code.clone());
+            if ui.button("Copy").clicked() {
+                ui.ctx().output_mut(|o| {
+                    o.commands.push(egui::OutputCommand::CopyText(code.clone()));
+                });
+            }
+            if ui.button("Close").clicked() {
+                if let Some(m) = guard(state).main_mut() {
+                    m.invite = None;
+                }
+            }
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -242,42 +489,144 @@ fn middle(
                 return;
             };
             ui.heading(g.name.clone());
+            let is_owner = g.owner_id == my_id;
+            if is_owner {
+                ui.horizontal(|ui| {
+                    if ui.small_button("+ channel").clicked() {
+                        mv.channel_popup = !mv.channel_popup;
+                    }
+                    if ui.small_button("invite").clicked() {
+                        spawn_invite(state, rt, ctx, g.id, g.name.clone());
+                    }
+                });
+            }
             ui.separator();
             for c in &g.channels {
                 match c.kind {
                     ChannelKind::Text => {
                         let sel = c.id == ch;
-                        if ui.selectable_label(sel, format!("# {}", c.name)).clicked() {
-                            let mut st = guard(state);
-                            if let Some(m) = st.main_mut() {
-                                m.selected = Selection::Channel(c.id);
-                                m.unread.remove(&c.id);
+                        ui.horizontal(|ui| {
+                            if ui.selectable_label(sel, format!("# {}", c.name)).clicked() {
+                                let mut st = guard(state);
+                                if let Some(m) = st.main_mut() {
+                                    m.selected = Selection::Channel(c.id);
+                                    m.unread.remove(&c.id);
+                                }
                             }
-                        }
+                            if is_owner && ui.small_button("×").clicked() {
+                                let id = c.id;
+                                spawn_rest(state, rt, ctx, move |h| async move {
+                                    h.net.delete_channel(id).await
+                                });
+                            }
+                        });
                     }
                     ChannelKind::Voice => {
                         let participants = voice.get(&c.id);
                         let n = participants.map_or(0, Vec::len);
-                        let joined =
-                            participants.is_some_and(|v| v.iter().any(|p| p.id == my_id));
+                        let joined = participants.is_some_and(|v| v.iter().any(|p| p.id == my_id));
                         let label = if joined {
                             format!("(v) {} — {n} in call  [leave]", c.name)
                         } else {
                             format!("(v) {} — {n} in call", c.name)
                         };
-                        if ui.selectable_label(joined, label).clicked() {
-                            if joined {
-                                crate::call::leave_active_call(state, rt);
-                            } else {
-                                crate::call::join_voice_channel(state, rt, c.id);
+                        ui.horizontal(|ui| {
+                            if ui.selectable_label(joined, label).clicked() {
+                                if joined {
+                                    crate::call::leave_active_call(state, rt);
+                                } else {
+                                    crate::call::join_voice_channel(state, rt, c.id);
+                                }
                             }
-                        }
+                            if is_owner && ui.small_button("×").clicked() {
+                                let id = c.id;
+                                spawn_rest(state, rt, ctx, move |h| async move {
+                                    h.net.delete_channel(id).await
+                                });
+                            }
+                        });
                     }
                     ChannelKind::Dm => {}
                 }
             }
+            channel_popup(state, rt, mv, ctx, g.id, is_owner);
         }
     }
+}
+
+/// "+ channel" window for guild owners: name + text/voice toggle.
+fn channel_popup(
+    state: &Arc<Mutex<ClientState>>,
+    rt: &tokio::runtime::Handle,
+    mv: &mut MainView,
+    ctx: &egui::Context,
+    guild_id: i64,
+    is_owner: bool,
+) {
+    if !is_owner {
+        return;
+    }
+    let mut open = mv.channel_popup;
+    let mut close = false;
+    egui::Window::new("New channel")
+        .id(egui::Id::new("channel_popup"))
+        .open(&mut open)
+        .collapsible(false)
+        .show(ctx, |ui| {
+            ui.text_edit_singleline(&mut mv.new_channel_name);
+            ui.checkbox(&mut mv.new_channel_voice, "voice channel");
+            if ui.button("Create").clicked() {
+                let name = mv.new_channel_name.trim().to_string();
+                if !name.is_empty() {
+                    mv.new_channel_name.clear();
+                    close = true;
+                    let kind = if mv.new_channel_voice {
+                        ChannelKind::Voice
+                    } else {
+                        ChannelKind::Text
+                    };
+                    spawn_channel_rest(state, rt, ctx, guild_id, name, kind);
+                }
+            }
+        });
+    mv.channel_popup = open && !close;
+}
+
+fn spawn_channel_rest(
+    state: &Arc<Mutex<ClientState>>,
+    rt: &tokio::runtime::Handle,
+    ctx: &egui::Context,
+    guild_id: i64,
+    name: String,
+    kind: ChannelKind,
+) {
+    let Some(h) = net_handle(state) else { return };
+    let state = Arc::clone(state);
+    let ctx = ctx.clone();
+    rt.spawn(async move {
+        match h
+            .net
+            .create_channel(guild_id, &CreateChannelRequest { name, kind })
+            .await
+        {
+            Ok(c) => {
+                let mut st = guard(&state);
+                if let Some(m) = st.main_mut() {
+                    if let Some(g) = m.guilds.iter_mut().find(|g| g.id == guild_id) {
+                        if !g.channels.iter().any(|x| x.id == c.id) {
+                            g.channels.push(c);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                if let Some(m) = guard(&state).main_mut() {
+                    m.notice = Some(e);
+                }
+            }
+        }
+        ctx.request_repaint();
+    });
 }
 
 fn friends_panel(
@@ -349,7 +698,23 @@ fn friends_panel(
     if !outgoing.is_empty() {
         ui.strong("Sent requests");
         for f in &outgoing {
-            ui.label(f.username.clone());
+            ui.horizontal(|ui| {
+                ui.label(f.username.clone());
+                if ui.small_button("cancel").clicked() {
+                    let id = f.id;
+                    {
+                        let mut st = guard(state);
+                        if let Some(m) = st.main_mut() {
+                            m.outgoing_requests.retain(|a| a.id != id);
+                        }
+                    }
+                    // The decline endpoint doubles as cancel for the
+                    // caller's own outgoing request.
+                    spawn_rest(state, rt, ctx, move |h| async move {
+                        h.net.decline_friend_request(id).await
+                    });
+                }
+            });
         }
         ui.add_space(4.0);
     }
@@ -371,37 +736,7 @@ fn friends_panel(
             );
             ui.label(f.username.clone());
             if ui.button("Message").clicked() {
-                let peer_id = f.id;
-                let state2 = Arc::clone(state);
-                let ctx2 = ctx.clone();
-                if let Some(h) = net_handle(state) {
-                    rt.spawn(async move {
-                        match h
-                            .net
-                            .open_dm(&OpenDmRequest {
-                                account_id: peer_id,
-                            })
-                            .await
-                        {
-                            Ok(dm) => {
-                                let channel_id = dm.channel.id;
-                                let mut st = guard(&state2);
-                                if let Some(m) = st.main_mut() {
-                                    if !m.dms.iter().any(|d| d.channel.id == channel_id) {
-                                        m.dms.push(dm);
-                                    }
-                                    m.selected = Selection::Dm(channel_id);
-                                }
-                            }
-                            Err(e) => {
-                                if let Some(m) = guard(&state2).main_mut() {
-                                    m.notice = Some(e);
-                                }
-                            }
-                        }
-                        ctx2.request_repaint();
-                    });
-                }
+                open_dm_and_select(state, rt, ctx, f.id);
             }
         });
     }
@@ -548,22 +883,72 @@ fn chat(
         .auto_shrink([false, false])
         .stick_to_bottom(true)
         .show_rows(ui, 18.0, count, |ui, range| {
-            let st = guard(state);
-            let Some(m) = st.main() else { return };
-            let Some(msgs) = m.messages.get(&ch) else {
-                return;
-            };
-            for i in range {
-                let Some(msg) = msgs.get(i) else { continue };
-                let time = fmt_time(msg.created_at_ms);
-                let sender = m.account_name(msg.sender_id);
-                // C2/C3 replace this with the decrypted plaintext.
-                let body = if msg.id < 0 {
-                    msg.content.clone() + " …"
-                } else {
-                    "[encrypted]".to_string()
+            // Snapshot the visible slice under the state lock, then read
+            // plaintexts from the store after releasing it (lock order
+            // state → store only, never held the other way around).
+            let rows: Vec<(MessageDto, String)> = {
+                let st = guard(state);
+                let Some(m) = st.main() else { return };
+                let Some(msgs) = m.messages.get(&ch) else {
+                    return;
                 };
-                ui.label(format!("{time}  {sender}:  {body}"));
+                range
+                    .filter_map(|i| {
+                        let msg = msgs.get(i)?;
+                        if msg.kind == MessageKind::Control {
+                            return None;
+                        }
+                        Some((msg.clone(), m.account_name(msg.sender_id)))
+                    })
+                    .collect()
+            };
+            let plains: HashMap<i64, String> = {
+                let s = guard(store);
+                rows.iter()
+                    .filter(|(msg, _)| msg.id > 0)
+                    .filter_map(|(msg, _)| s.plaintext(msg.id).map(|p| (msg.id, p)))
+                    .collect()
+            };
+            // Reply prefixes need the replied-to sender's name.
+            let reply_names: HashMap<i64, String> = {
+                let st = guard(state);
+                let Some(m) = st.main() else {
+                    return;
+                };
+                match m.messages.get(&ch) {
+                    Some(msgs) => rows
+                        .iter()
+                        .filter_map(|(msg, _)| msg.reply_to)
+                        .filter_map(|rid| {
+                            msgs.iter()
+                                .find(|x| x.id == rid)
+                                .map(|x| (rid, m.account_name(x.sender_id)))
+                        })
+                        .collect(),
+                    None => HashMap::new(),
+                }
+            };
+            for (msg, sender) in &rows {
+                let time = fmt_time(msg.created_at_ms);
+                let body = if msg.id < 0 {
+                    format!("{} …", msg.content)
+                } else {
+                    plains
+                        .get(&msg.id)
+                        .cloned()
+                        .unwrap_or_else(|| "[encrypted]".into())
+                };
+                let prefix = msg
+                    .reply_to
+                    .and_then(|rid| reply_names.get(&rid))
+                    .map(|n| format!("↪ [{n}] "))
+                    .unwrap_or_default();
+                ui.horizontal(|ui| {
+                    ui.label(format!("{time}  {sender}:  {prefix}{body}"));
+                    if msg.id > 0 && ui.small_button("reply").clicked() {
+                        mv.reply_to.insert(ch, msg.id);
+                    }
+                });
             }
         });
 
@@ -587,6 +972,32 @@ fn chat(
     };
     if let Some(name) = typing_line {
         ui.weak(format!("{name} is typing…"));
+    }
+
+    // Reply banner: who and what is being replied to, cancellable.
+    if let Some(rid) = mv.reply_to.get(&ch).copied() {
+        let target = {
+            let st = guard(state);
+            st.main().and_then(|m| {
+                m.messages.get(&ch).and_then(|v| {
+                    v.iter()
+                        .find(|x| x.id == rid)
+                        .map(|x| (m.account_name(x.sender_id), preview_body(store, x)))
+                })
+            })
+        };
+        let known = target.is_some();
+        let (name, snippet) = target.unwrap_or_else(|| ("(gone)".into(), String::new()));
+        if known {
+            ui.horizontal(|ui| {
+                ui.weak(format!("replying to {name}: {snippet}"));
+                if ui.small_button("cancel").clicked() {
+                    mv.reply_to.remove(&ch);
+                }
+            });
+        } else {
+            mv.reply_to.remove(&ch);
+        }
     }
 
     // Composer.
@@ -649,10 +1060,20 @@ fn fetch_history(
                         let _ = s.append_message(m);
                     }
                 }
-                let mut st = guard(&state);
-                if let Some(m) = st.main_mut() {
-                    m.merge_messages(ch, page.messages);
-                    m.has_more.insert(ch, page.has_more);
+                {
+                    let mut st = guard(&state);
+                    if let Some(m) = st.main_mut() {
+                        m.merge_messages(ch, page.messages);
+                        m.has_more.insert(ch, page.has_more);
+                    }
+                }
+                // Rows that arrived before their Megolm session share get a
+                // second chance now that this page is cached.
+                {
+                    let st = guard(&state);
+                    if let Some(m) = st.main() {
+                        m.backfill_plaintexts(&store, ch);
+                    }
                 }
             }
             Err(e) => {
@@ -665,6 +1086,23 @@ fn fetch_history(
     });
 }
 
+/// The encrypted send path. Everything the crypto half needs is gathered
+/// under one state lock up front; the network work then runs on the runtime.
+///
+/// 1. Wrap the text in [`Envelope::Chat`] and Megolm-encrypt it with our
+///    outbound session for the channel (the engine creates or rotates the
+///    session when needed and queues a share in that case).
+/// 2. Bootstrap rule — when this is the channel's first send (`outbound`
+///    does not contain it), or the session id changed since the last send
+///    (rotation), or the sid is simply unknown after a restart — claim each
+///    roster peer's keys and mailbox them the session key *before* the
+///    message goes out, so the very first message is already decryptable.
+/// 3. POST the ciphertext; on success store the plaintext for our own row
+///    (the engine deliberately holds no self-import) and reconcile the
+///    optimistic temp row.
+///
+/// No engine → no send: chat refuses to fall back to plaintext.
+#[allow(clippy::too_many_arguments)]
 fn do_send(
     state: &Arc<Mutex<ClientState>>,
     store: &Arc<Mutex<Store>>,
@@ -676,14 +1114,37 @@ fn do_send(
 ) {
     let temp = mv.temp_id;
     mv.temp_id -= 1;
-    let me = guard(state).main().map(|m| m.account.id).unwrap_or(0);
+    let reply_to = mv.reply_to.remove(&ch);
+
+    let gather = {
+        let st = guard(state);
+        st.main().map(|m| {
+            (
+                m.account.id,
+                m.engine.clone(),
+                m.channel_peer_ids(ch),
+                !m.outbound.contains(&ch),
+                m.outbound_sid.get(&ch).cloned(),
+            )
+        })
+    };
+    let Some((me, engine, peers, need_share, known_sid)) = gather else {
+        return;
+    };
+    let Some(engine) = engine else {
+        if let Some(m) = guard(state).main_mut() {
+            m.notice = Some("crypto engine unavailable — sending is disabled".into());
+        }
+        return;
+    };
+
     let optimistic = MessageDto {
         id: temp,
         channel_id: ch,
         sender_id: me,
         kind: MessageKind::Chat,
         content: text.clone(),
-        reply_to: None,
+        reply_to,
         attachment: None,
         created_at_ms: now_ms(),
     };
@@ -693,6 +1154,9 @@ fn do_send(
 
     let Some(h) = net_handle(state) else {
         if let Some(m) = guard(state).main_mut() {
+            if let Some(v) = m.messages.get_mut(&ch) {
+                v.retain(|x| x.id != temp);
+            }
             m.notice = Some("not connected".into());
         }
         return;
@@ -702,10 +1166,50 @@ fn do_send(
     let store = Arc::clone(store);
     let ctx = ctx.clone();
     rt.spawn(async move {
+        let fail = |e: String| {
+            let mut st = guard(&state);
+            if let Some(m) = st.main_mut() {
+                if let Some(v) = m.messages.get_mut(&ch) {
+                    v.retain(|x| x.id != temp);
+                }
+                m.notice = Some(format!("send failed: {e}"));
+            }
+        };
+
+        // 1. Encrypt.
+        let envelope = Envelope::Chat {
+            text: text.clone(),
+            reply_to,
+        };
+        let plaintext = serde_json::to_string(&envelope).unwrap_or_default();
+        let (sid, ciphertext) = match engine.megolm_encrypt(ch, &plaintext) {
+            Ok(x) => x,
+            Err(e) => {
+                fail(format!("encrypt: {e}"));
+                ctx.request_repaint();
+                return;
+            }
+        };
+
+        // 2. Bootstrap / rotation share, strictly before the message POST.
+        let rotated = known_sid.as_deref() != Some(sid.as_str());
+        if need_share || rotated {
+            net::share_session_with_peers(&state, &engine, &h.net, ch, peers).await;
+            {
+                let mut st = guard(&state);
+                if let Some(m) = st.main_mut() {
+                    m.outbound.insert(ch);
+                    m.outbound_sid.insert(ch, sid.clone());
+                }
+            }
+            net::persist_outbound(&state, &store);
+        }
+
+        // 3. Send.
         let req = SendMessageRequest {
             kind: MessageKind::Chat,
-            content: text,
-            reply_to: None,
+            content: ciphertext,
+            reply_to,
             attachment_id: None,
         };
         match net::send_message(&h.net, ch, &req).await {
@@ -713,24 +1217,36 @@ fn do_send(
                 {
                     let s = guard(&store);
                     let _ = s.append_message(&dto);
+                    // Our own row: we cannot Megolm-decrypt our own message,
+                    // so store the outgoing plaintext directly.
+                    let _ = s.set_plaintext(dto.id, &text);
                 }
                 let mut st = guard(&state);
                 if let Some(m) = st.main_mut() {
                     m.replace_temp(temp, dto);
                 }
             }
-            Err(e) => {
-                let mut st = guard(&state);
-                if let Some(m) = st.main_mut() {
-                    if let Some(v) = m.messages.get_mut(&ch) {
-                        v.retain(|x| x.id != temp);
-                    }
-                    m.notice = Some(format!("send failed: {e}"));
-                }
-            }
+            Err(e) => fail(e),
         }
         ctx.request_repaint();
     });
+}
+
+/// Short quote of a message for the reply banner: decrypted plaintext when
+/// we have it, else the raw buffer (temps), else a placeholder.
+fn preview_body(store: &Arc<Mutex<Store>>, msg: &MessageDto) -> String {
+    let body = if msg.id < 0 {
+        msg.content.clone()
+    } else {
+        guard(store)
+            .plaintext(msg.id)
+            .unwrap_or_else(|| "[encrypted]".into())
+    };
+    let mut s: String = body.chars().take(40).collect();
+    if body.chars().count() > 40 {
+        s.push('…');
+    }
+    s
 }
 
 /// One Typing event per channel per 3 s while the composer changes.
