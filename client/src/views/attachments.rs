@@ -342,7 +342,7 @@ async fn upload_and_send(
 ///
 /// On `Err` nothing is cleaned up — the caller owns the temp row and
 /// decides what the user sees.
-pub(crate) async fn encrypt_share_and_send(
+pub async fn encrypt_share_and_send(
     state: &Arc<Mutex<ClientState>>,
     store: &Arc<Mutex<Store>>,
     net: &Net,

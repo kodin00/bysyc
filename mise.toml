@@ -15,3 +15,21 @@ run = "docker compose up -d postgres redis seaweedfs coturn"
 
 [tasks.infra-down]
 run = "docker compose down"
+
+# End-to-end test of the real client stack (state/net/store/crypto) against
+# the live dev server (mise run dev-server in another terminal, or any
+# Instance at $BYSYC_E2E_BASE). Sources .env so make-invite can reach the
+# database. Skipped silently unless BYSYC_E2E=1 — normal `cargo test` stays
+# hermetic (the test is also #[ignore]-gated).
+[tasks.test-e2e]
+run = "set -a; . ./.env; set +a; BYSYC_E2E=1 cargo test -p bysyc-client --test e2e -- --ignored --nocapture"
+depends = ["build-server-bin"]
+
+[tasks.build-server-bin]
+run = "cargo build -p bysyc-server"
+sources = ["server/src/**/*", "common/src/**/*", "Cargo.toml", "Cargo.lock"]
+outputs = ["target/debug/bysyc-server"]
+
+# Optimized workspace build (LTO is configured in Cargo.toml).
+[tasks.release]
+run = "cargo build --release --workspace"

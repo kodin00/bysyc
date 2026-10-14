@@ -1,21 +1,13 @@
 //! bysyc client entry point: one tokio runtime for all background work, the
 //! local SQLite store, shared client state, and the eframe window.
 
-mod app;
-mod call;
-mod crypto;
-mod net;
-mod state;
-mod store;
-mod views;
-
 use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 
-use app::BysycApp;
-use state::ClientState;
-use store::Store;
+use bysyc_client::app::BysycApp;
+use bysyc_client::state::ClientState;
+use bysyc_client::store::Store;
 
 fn main() -> eframe::Result<()> {
     // Single runtime owned for the whole process lifetime: the UI thread

@@ -55,14 +55,16 @@ pub fn router() -> axum::Router<AppState> {
 
 /// Validate that `content` is base64 ciphertext of at most 64 KiB decoded
 /// (ADR 0001: content is opaque — shape and size are all the Instance
-/// checks). Accepts both standard and URL-safe/no-pad encodings; anything
-/// else is rejected as [`ErrorCode::InvalidRequest`].
+/// checks). Accepts standard (padded or unpadded — vodozemac's Megolm
+/// `to_base64` emits unpadded standard) and URL-safe/no-pad encodings;
+/// anything else is rejected as [`ErrorCode::InvalidRequest`].
 pub(crate) fn check_ciphertext(content: &str) -> Result<(), ApiError> {
     if content.len() > MAX_CIPHERTEXT_CHARS {
         return Err(ApiError::invalid("content exceeds 64 KiB of ciphertext"));
     }
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(content.as_bytes())
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(content.as_bytes()))
         .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(content.as_bytes()))
         .map_err(|_| ApiError::invalid("content must be base64 ciphertext"))?;
     if decoded.len() > MAX_CIPHERTEXT_BYTES {
@@ -331,6 +333,10 @@ mod tests {
         assert!(check_ciphertext("").is_ok());
         assert!(check_ciphertext("aGVsbG8=").is_ok());
         assert!(check_ciphertext("aGVsbG8").is_ok()); // url-safe no-pad fallback
+        // Unpadded standard alphabet (contains + and /): what vodozemac's
+        // MegolmMessage::to_base64 emits. Rejected by padded-STANDARD and
+        // URL_SAFE alike.
+        assert!(check_ciphertext("+/+/AA").is_ok());
         // 90_001 chars of valid base64 -> rejected on raw length.
         let too_long = "A".repeat(90_001);
         assert!(check_ciphertext(&too_long).is_err());

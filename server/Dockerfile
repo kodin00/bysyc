@@ -9,7 +9,9 @@ COPY client ./client
 COPY server ./server
 RUN cargo build --release -p bysyc-server
 
-FROM debian:bookworm-slim
+# Runtime must match the builder's glibc (rust:1.99 is trixie, glibc >= 2.38;
+# bookworm's 2.36 fails with "GLIBC_2.38 not found").
+FROM debian:trixie-slim
 COPY --from=build /build/target/release/bysyc-server /usr/local/bin/bysyc-server
 EXPOSE 8080
 ENTRYPOINT ["bysyc-server"]

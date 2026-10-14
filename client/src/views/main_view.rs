@@ -284,8 +284,12 @@ fn spawn_guild_rest<F, Fut>(
     let state = Arc::clone(state);
     let ctx = ctx.clone();
     rt.spawn(async move {
+        let h2 = h.clone();
         match fut_fn(h).await {
             Ok(g) => {
+                // Joined guild channels: subscribe now instead of waiting
+                // out the periodic heartbeat (see NetHandle::heartbeat).
+                h2.heartbeat();
                 let mut st = guard(&state);
                 if let Some(m) = st.main_mut() {
                     if !m.guilds.iter().any(|x| x.id == g.id) {
@@ -376,6 +380,10 @@ fn open_dm_and_select(
             .await
         {
             Ok(dm) => {
+                // New channel: poke the gateway to subscribe us now (see
+                // NetHandle::heartbeat) instead of waiting out the periodic
+                // heartbeat interval.
+                h.heartbeat();
                 let channel_id = dm.channel.id;
                 let mut st = guard(&state);
                 if let Some(m) = st.main_mut() {

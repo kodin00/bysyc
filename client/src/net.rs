@@ -202,27 +202,32 @@ impl Net {
     }
 
     pub async fn send_friend_request(&self, account_id: i64) -> Result<(), String> {
-        self.exec(
+        // The server answers with the refreshed FriendList; the world is
+        // updated from the WS events instead, so only error-check the body.
+        self.exec::<serde_json::Value>(
             self.authed(reqwest::Method::POST, "/friends/requests")
                 .json(&serde_json::json!({ "account_id": account_id })),
         )
         .await
+        .map(|_| ())
     }
 
     pub async fn accept_friend_request(&self, account_id: i64) -> Result<(), String> {
-        self.exec(self.authed(
+        self.exec::<serde_json::Value>(self.authed(
             reqwest::Method::POST,
             &format!("/friends/requests/{account_id}/accept"),
         ))
         .await
+        .map(|_| ())
     }
 
     pub async fn decline_friend_request(&self, account_id: i64) -> Result<(), String> {
-        self.exec(self.authed(
+        self.exec::<serde_json::Value>(self.authed(
             reqwest::Method::POST,
             &format!("/friends/requests/{account_id}/decline"),
         ))
         .await
+        .map(|_| ())
     }
 
     pub async fn remove_friend(&self, account_id: i64) -> Result<(), String> {
@@ -580,6 +585,19 @@ pub fn drain_followups(
 pub struct NetHandle {
     pub out: mpsc::Sender<WsClientMsg>,
     pub net: Net,
+}
+
+impl NetHandle {
+    /// Ask the gateway to re-sync channel subscriptions now. The gateway
+    /// docs make the client heartbeat the sync point after joining a guild
+    /// or opening a DM; without this nudge, live events on the new channel
+    /// lag behind by up to the 30 s periodic heartbeat.
+    pub fn heartbeat(&self) {
+        let _ = self.out.try_send(WsClientMsg {
+            id: next_msg_id(),
+            body: WsClientBody::Heartbeat,
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------
