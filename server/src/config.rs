@@ -37,9 +37,7 @@ impl Config {
             admin_password: std::env::var("ADMIN_PASSWORD")
                 .ok()
                 .filter(|s| !s.is_empty()),
-            attachment_max_bytes: env("ATTACHMENT_MAX_MB", "50")
-                .parse::<u64>()
-                .unwrap_or(50)
+            attachment_max_bytes: env("ATTACHMENT_MAX_MB", "50").parse::<u64>().unwrap_or(50)
                 * 1024
                 * 1024,
         }

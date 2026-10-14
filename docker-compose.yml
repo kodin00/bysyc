@@ -33,13 +33,17 @@ services:
     image: chrislusf/seaweedfs:3.80
     # Single-process mode: master + volume + filer + S3 gateway in one container.
     # Clients never talk to it directly — only bysyc-server does, via the S3 API.
+    # s3.json (generated from .env — see deploy/seaweedfs/) enforces SigV4
+    # auth on the gateway; regenerate it whenever S3_* keys change.
     command: >
       server -dir=/data -master.volumeSizeLimitMB=1024
       -s3 -s3.port=8333 -ip=seaweedfs
+      -s3.config=/etc/seaweedfs/s3.json
     ports:
       - "127.0.0.1:8333:8333"
     volumes:
       - seaweed:/data
+      - ./deploy/seaweedfs/s3.json:/etc/seaweedfs/s3.json:ro
     # TODO: add healthcheck once we settle the image's shell tooling for probes.
 
   coturn:
