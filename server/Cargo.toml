@@ -1,0 +1,9 @@
+[package]
+name = "bysyc-server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bysyc-common = { workspace = true }
+axum = { version = "0.8", features = ["ws"] }
+tokio = { workspace = true }

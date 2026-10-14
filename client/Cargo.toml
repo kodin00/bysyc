@@ -1,0 +1,8 @@
+[package]
+name = "bysyc-client"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bysyc-common = { workspace = true }
+eframe = "0.36"

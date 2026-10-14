@@ -1,0 +1,73 @@
+# bysyc — one self-hosted Instance.
+# Copy .env.example to .env and set the passwords before `docker compose up`.
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: bysyc
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+      POSTGRES_DB: bysyc
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bysyc -d bysyc"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  seaweedfs:
+    image: chrislusf/seaweedfs:3.80
+    # Single-process mode: master + volume + filer + S3 gateway in one container.
+    # Clients never talk to it directly — only bysyc-server does, via the S3 API.
+    command: >
+      server -dir=/data -master.volumeSizeLimitMB=1024
+      -s3 -s3.port=8333 -ip=seaweedfs
+    volumes:
+      - seaweed:/data
+    # TODO: add healthcheck once we settle the image's shell tooling for probes.
+
+  coturn:
+    image: coturn/coturn:alpine
+    # Relay for peers behind hard NATs. Forwarded packets stay E2EE —
+    # TURN never holds keys. Production on a public host: add
+    # --external-ip and a real --listening-ip.
+    command: >
+      -n --realm=bysyc --fingerprint --lt-cred-mech
+      --user=bysyc:${TURN_PASSWORD:?set in .env}
+      --min-port=49160 --max-port=49200
+    ports:
+      - "3478:3478/udp"
+      - "3478:3478/tcp"
+      - "49160-49200:49160-49200/udp"
+
+  server:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      DATABASE_URL: postgres://bysyc:${POSTGRES_PASSWORD}@postgres/bysyc
+      REDIS_URL: redis://redis/1
+      S3_ENDPOINT: http://seaweedfs:8333
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:?set in .env}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:?set in .env}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_started
+
+volumes:
+  pgdata:
+  seaweed:

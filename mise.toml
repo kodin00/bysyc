@@ -1,0 +1,17 @@
+[tools]
+rust = "1.99.0"
+
+[tasks.check]
+run = "cargo check --workspace"
+
+[tasks.dev-server]
+run = "cargo run -p bysyc-server"
+
+[tasks.dev-client]
+run = "cargo run -p bysyc-client"
+
+[tasks.infra-up]
+run = "docker compose up -d postgres redis seaweedfs coturn"
+
+[tasks.infra-down]
+run = "docker compose down"
