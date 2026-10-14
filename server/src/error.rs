@@ -1,9 +1,9 @@
 //! Shared API error type — the single error shape crossing REST/WS boundaries.
 //! Owned by the orchestrator; agents use it, never redefine it.
 
+use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use bysyc_common::protocol::{ApiError as ApiErrorDto, ErrorCode};
 
 pub struct ApiError {
@@ -16,7 +16,11 @@ pub type ApiResult<T> = Result<T, ApiError>;
 
 impl ApiError {
     fn new(status: StatusCode, code: ErrorCode, message: impl Into<String>) -> Self {
-        Self { status, code, message: message.into() }
+        Self {
+            status,
+            code,
+            message: message.into(),
+        }
     }
 
     pub fn unauthorized(msg: impl Into<String>) -> Self {
@@ -44,7 +48,14 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.status, Json(ApiErrorDto { code: self.code, message: self.message })).into_response()
+        (
+            self.status,
+            Json(ApiErrorDto {
+                code: self.code,
+                message: self.message,
+            }),
+        )
+            .into_response()
     }
 }
 

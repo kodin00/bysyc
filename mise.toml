@@ -5,7 +5,7 @@ rust = "1.99.0"
 run = "cargo check --workspace"
 
 [tasks.dev-server]
-run = "cargo run -p bysyc-server"
+run = "set -a; . ./.env; set +a; cargo run -p bysyc-server"
 
 [tasks.dev-client]
 run = "cargo run -p bysyc-client"

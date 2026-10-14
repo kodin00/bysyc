@@ -29,8 +29,12 @@ impl Config {
             turn_addr: env("TURN_ADDR", "localhost:3478"),
             turn_user: env("TURN_USER", "bysyc"),
             turn_password: env("TURN_PASSWORD", "bysyc"),
-            admin_username: std::env::var("ADMIN_USERNAME").ok().filter(|s| !s.is_empty()),
-            admin_password: std::env::var("ADMIN_PASSWORD").ok().filter(|s| !s.is_empty()),
+            admin_username: std::env::var("ADMIN_USERNAME")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            admin_password: std::env::var("ADMIN_PASSWORD")
+                .ok()
+                .filter(|s| !s.is_empty()),
         }
     }
 }

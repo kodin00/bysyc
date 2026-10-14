@@ -36,5 +36,8 @@ pub async fn publish_to_channel(
 }
 
 fn wrap(body: &WsServerBody) -> bysyc_common::protocol::WsServerMsg {
-    bysyc_common::protocol::WsServerMsg { id: None, body: body.clone() }
+    bysyc_common::protocol::WsServerMsg {
+        id: None,
+        body: body.clone(),
+    }
 }

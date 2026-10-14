@@ -9,6 +9,10 @@ services:
       POSTGRES_DB: bysyc
     volumes:
       - pgdata:/var/lib/postgresql/data
+    # Host port is 15432, not 5432, to stay out of the way of any local
+    # postgres install. Loopback-only: never exposed on a public interface.
+    ports:
+      - "127.0.0.1:15432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U bysyc -d bysyc"]
       interval: 5s
@@ -17,6 +21,8 @@ services:
 
   redis:
     image: redis:7-alpine
+    ports:
+      - "127.0.0.1:16379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -30,6 +36,8 @@ services:
     command: >
       server -dir=/data -master.volumeSizeLimitMB=1024
       -s3 -s3.port=8333 -ip=seaweedfs
+    ports:
+      - "127.0.0.1:8333:8333"
     volumes:
       - seaweed:/data
     # TODO: add healthcheck once we settle the image's shell tooling for probes.

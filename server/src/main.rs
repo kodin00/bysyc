@@ -4,12 +4,12 @@ mod config;
 mod db;
 mod error;
 mod events;
-mod passwd;
 mod friends;
 mod guilds;
 mod keys;
 mod mailbox;
 mod messages;
+mod passwd;
 mod routes;
 mod s3;
 mod session;
@@ -21,7 +21,9 @@ use db::AppState;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("info".parse()?))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env().add_directive("info".parse()?),
+        )
         .init();
 
     let config = config::Config::from_env();
@@ -49,5 +51,9 @@ async fn boot(config: &config::Config) -> anyhow::Result<AppState> {
     db::migrate(&pg).await?;
     let redis_client = redis::Client::open(config.redis_url.as_str())?;
     let redis = redis::aio::ConnectionManager::new(redis_client).await?;
-    Ok(AppState { pg, redis, config: config.clone() })
+    Ok(AppState {
+        pg,
+        redis,
+        config: config.clone(),
+    })
 }
