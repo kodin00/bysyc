@@ -11,6 +11,8 @@ pub fn router(state: AppState) -> axum::Router {
         .merge(crate::keys::router())
         .merge(crate::guilds::router())
         .merge(crate::attachments::router())
+        .merge(crate::messages::router())
+        .merge(crate::mailbox::router())
         .merge(crate::voice::router())
         .merge(crate::ws::router())
         .route("/healthz", axum::routing::get(|| async { "ok" }))

@@ -3,6 +3,8 @@ mod auth;
 mod config;
 mod db;
 mod error;
+mod events;
+mod passwd;
 mod friends;
 mod guilds;
 mod keys;

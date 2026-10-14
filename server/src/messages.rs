@@ -1,5 +1,5 @@
-//! Channel message send/fetch — owned by S4
+//! Channel message send/fetch — owned by S4.
 
-pub fn router() -> axum::Router {
+pub fn router() -> axum::Router<crate::db::AppState> {
     axum::Router::new()
 }

@@ -719,6 +719,22 @@ pub enum WsServerBody {
         /// The new Channel.
         channel: ChannelInfo,
     },
+    /// A Channel was deleted from a Guild the caller can see. Clients drop
+    /// local state (messages stay in the local cache until pruned).
+    ChannelDeleted {
+        /// Guild that lost the Channel.
+        guild_id: i64,
+        /// The deleted Channel.
+        channel_id: i64,
+    },
+    /// A Member left a Guild (voluntarily or removed). Broadcast to the
+    /// remaining Members; the leaver receives nothing.
+    MemberLeft {
+        /// Guild that was left.
+        guild_id: i64,
+        /// The Account that left.
+        account_id: i64,
+    },
     /// Another Account joined a Guild the caller is in (broadcast to the
     /// pre-existing Members; the joiner gets [`WsServerBody::GuildJoined`]
     /// instead).
