@@ -15,6 +15,7 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 rusqlite = { version = "0.40", features = ["bundled"] }
 keyring = "4"
 vodozemac = "0.11"
+aes-gcm = "0.10"
 str0m = "0.24"
 cpal = "0.18"
 opus = "0.4"
@@ -24,3 +25,4 @@ anyhow = "1"
 rand = "0.10"
 directories = "6"
 futures-util = "0.3"
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
