@@ -207,12 +207,26 @@ pub struct TokenResponse {
 // Keys REST (Olm prekey bootstrap)
 // ---------------------------------------------------------------------------
 
-/// Batch-upload of Olm one-time prekeys (base64 public parts) so peers can
-/// start an encrypted DM while this Account is offline.
+/// Batch-upload of Olm one-time prekeys so peers can start an encrypted DM
+/// while this Account is offline.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct UploadOtkRequest {
-    /// Base64 one-time prekey public parts to pool on the server.
+    /// One-time prekey entries, each the single string `"{key_id}:{b64
+    /// pubkey}"` (the id must not contain `:`). Stored and re-served
+    /// verbatim on claim.
     pub one_time_keys: Vec<String>,
+}
+
+/// TURN relay credentials for Calls, returned by `GET /turn`. Static
+/// long-term credentials for the whole Instance in v1.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct TurnInfo {
+    /// Candidate URLs, e.g. `turn:host:3478`.
+    pub urls: Vec<String>,
+    /// TURN username (shared, v1).
+    pub username: String,
+    /// TURN password (shared, v1).
+    pub credential: String,
 }
 
 /// Result of claiming a peer's one-time key. Claiming is destructive:

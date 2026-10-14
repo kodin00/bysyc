@@ -15,6 +15,8 @@ pub struct Config {
     /// First-boot admin account (created only when the accounts table is empty).
     pub admin_username: Option<String>,
     pub admin_password: Option<String>,
+    /// Ciphertext-size cap per attachment, from `ATTACHMENT_MAX_MB` (default 50).
+    pub attachment_max_bytes: u64,
 }
 
 impl Config {
@@ -35,6 +37,11 @@ impl Config {
             admin_password: std::env::var("ADMIN_PASSWORD")
                 .ok()
                 .filter(|s| !s.is_empty()),
+            attachment_max_bytes: env("ATTACHMENT_MAX_MB", "50")
+                .parse::<u64>()
+                .unwrap_or(50)
+                * 1024
+                * 1024,
         }
     }
 }

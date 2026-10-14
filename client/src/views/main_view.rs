@@ -76,7 +76,7 @@ pub fn show(app: &mut BysycApp, ui: &mut egui::Ui) {
     egui::CentralPanel::default().show(ui, |ui| chat(ui, state, store, rt, main_view, &ctx));
 
     // C5 renders the call overlay from here.
-    crate::call::ui::overlay(&ctx);
+    crate::call::ui::overlay(&ctx, state, rt);
 }
 
 // ---------------------------------------------------------------------------
@@ -208,10 +208,10 @@ fn middle(
     mv: &mut MainView,
     ctx: &egui::Context,
 ) {
-    let (selected, guilds, voice) = {
+    let (selected, guilds, voice, my_id) = {
         let st = guard(state);
         let Some(m) = st.main() else { return };
-        (m.selected, m.guilds.clone(), m.voice.clone())
+        (m.selected, m.guilds.clone(), m.voice.clone(), m.account.id)
     };
 
     match selected {
@@ -223,11 +223,15 @@ fn middle(
                     m.dms
                         .iter()
                         .find(|d| d.channel.id == ch)
-                        .map(|d| d.peer.username.clone())
+                        .map(|d| d.peer.clone())
                 })
             };
-            ui.heading(format!("@{}", peer.unwrap_or_else(|| "dm".into())));
+            let Some(peer) = peer else { return };
+            ui.heading(format!("@{}", peer.username));
             ui.weak("private, end-to-end encrypted");
+            if ui.button("Call").clicked() {
+                crate::call::start_private_call(state, rt, peer, ch);
+            }
         }
         Selection::Channel(ch) => {
             let Some(g) = guilds
@@ -252,9 +256,22 @@ fn middle(
                         }
                     }
                     ChannelKind::Voice => {
-                        // Listed with live participant count; joining is C5's.
-                        let n = voice.get(&c.id).map_or(0, Vec::len);
-                        ui.weak(format!("(v) {} — {n} in call", c.name));
+                        let participants = voice.get(&c.id);
+                        let n = participants.map_or(0, Vec::len);
+                        let joined =
+                            participants.is_some_and(|v| v.iter().any(|p| p.id == my_id));
+                        let label = if joined {
+                            format!("(v) {} — {n} in call  [leave]", c.name)
+                        } else {
+                            format!("(v) {} — {n} in call", c.name)
+                        };
+                        if ui.selectable_label(joined, label).clicked() {
+                            if joined {
+                                crate::call::leave_active_call(state, rt);
+                            } else {
+                                crate::call::join_voice_channel(state, rt, c.id);
+                            }
+                        }
                     }
                     ChannelKind::Dm => {}
                 }
