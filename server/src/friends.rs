@@ -114,7 +114,10 @@ async fn lookup_by_username(
             .await?;
     let row = row.ok_or_else(|| ApiError::not_found("no such account"))?;
     Ok(Json(
-        with_online(&state, vec![row]).await?.pop().expect("one brief"),
+        with_online(&state, vec![row])
+            .await?
+            .pop()
+            .expect("one brief"),
     ))
 }
 
