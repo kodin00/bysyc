@@ -7,7 +7,8 @@
 //!   decline requests, open DMs, add by username).
 //! - right: message history of the selected channel or DM plus the composer
 //!   (Enter sends, Shift+Enter breaks the line; attached or dropped files
-//!   queue above it and ride the next send).
+//!   queue above it and ride the next send; an emoji picker inserts at the
+//!   caret — see [`emoji`]).
 //!
 //! History is loaded from SQLite first, then merged with a REST page on
 //! first open; sends are optimistic (negative temp ids, pinned at the tail)
@@ -33,6 +34,7 @@ use crate::net::{self, NetHandle};
 use crate::state::{ClientState, ConnStatus, Selection, TYPING_TTL_SECS, guard, now_ms};
 use crate::store::Store;
 use crate::views::attachments;
+use crate::views::emoji;
 
 /// View-lifetime UI state (input buffers, throttles).
 pub struct MainView {
@@ -103,6 +105,9 @@ pub struct MainView {
     pub guild_popup_focus: bool,
     /// Focus the new-channel name field on the popup's next frame.
     pub channel_popup_focus: bool,
+    /// Composer emoji picker open? Reset on channel switch and when the
+    /// chat column is left (the draft it feeds is per channel).
+    pub emoji_picker_open: bool,
 }
 
 /// A "Load older" scroll anchor (see [`MainView::load_anchor`]): keeps the
@@ -153,6 +158,7 @@ impl MainView {
             attach_rx,
             guild_popup_focus: false,
             channel_popup_focus: false,
+            emoji_picker_open: false,
         }
     }
 }
@@ -1066,6 +1072,7 @@ fn chat(
         // Leaving the chat column forgets the last channel so returning
         // to one re-scrolls to the bottom (see the message list below).
         mv.chat_channel_prev = None;
+        mv.emoji_picker_open = false;
         ui.heading("bysyc");
         ui.weak("select a channel, a direct message, or Friends");
         return;
@@ -1094,9 +1101,13 @@ fn chat(
     attachments::add_dropped(ui, mv, ch);
 
     // Channel-switch detection for the message list's scroll state (see
-    // the ScrollArea below).
+    // the ScrollArea below). A fresh channel also closes the emoji picker
+    // — its insertions belong to the previous conversation's draft.
     let scroll_reset = mv.chat_channel_prev != Some(ch);
     mv.chat_channel_prev = Some(ch);
+    if scroll_reset {
+        mv.emoji_picker_open = false;
+    }
 
     // Older history. The click remembers the currently-oldest row so the
     // message list can hold the reading position when the older page
@@ -1209,8 +1220,10 @@ fn chat(
             // vanishing shifted the id and silently dropped keyboard focus
             // mid-typing. The channel id in the salt keeps one cursor state
             // per conversation (drafts already live in `mv.composer`).
+            // `show` (not `ui.add`) keeps the TextEditOutput around: its
+            // cursor range is where the emoji picker inserts.
             let line_height = ui.text_style_height(&egui::TextStyle::Body);
-            let response = {
+            let mut output = {
                 let buf = mv.composer.entry(ch).or_default();
                 // The wrapping ScrollArea grows with the text up to
                 // COMPOSER_MAX_ROWS rows and scrolls past that, so a long
@@ -1224,24 +1237,23 @@ fn chat(
                         egui::containers::scroll_area::ScrollBarVisibility::AlwaysHidden,
                     )
                     .show(ui, |ui| {
-                        ui.add(
-                            egui::TextEdit::multiline(buf)
-                                .id_salt(("composer", ch))
-                                .hint_text("Message…  (Enter to send, Shift+Enter for a new line)")
-                                .desired_width(f32::INFINITY)
-                                .desired_rows(1),
-                        )
+                        egui::TextEdit::multiline(buf)
+                            .id_salt(("composer", ch))
+                            .hint_text("Message…  (Enter to send, Shift+Enter for a new line)")
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(1)
+                            .show(ui)
                     })
                     .inner
             };
-            if response.changed() {
+            if output.response.changed() {
                 maybe_send_typing(state, mv, ch);
             }
             // Escape cancels a pending reply while the composer holds
             // focus, consuming the key so the call overlay — which only
             // acts when no widget is focused — never sees it (a focused
             // composer wins; the overlay renders after this view).
-            if response.has_focus()
+            if output.response.has_focus()
                 && mv.reply_to.contains_key(&ch)
                 && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
             {
@@ -1250,7 +1262,7 @@ fn chat(
             // Enter (without Shift) sends; Shift+Enter keeps the newline
             // the field just inserted. `has_focus` gates the key so Enter
             // pressed in another field never sends here.
-            let mut send = response.has_focus()
+            let mut send = output.response.has_focus()
                 && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
             ui.horizontal(|ui| {
                 if icon_button(ui, "bytes://send.svg", ICON_SEND, "Send").clicked() {
@@ -1258,6 +1270,35 @@ fn chat(
                 }
                 if icon_button(ui, "bytes://attach.svg", ICON_ATTACH, "Attach file").clicked() {
                     attachments::begin_attach(ctx, mv, ch);
+                }
+                // Emoji picker (see [`emoji`]): selections insert at the
+                // composer's cursor; the popup stays open for multi-inserts.
+                // The push_id keeps the toggle — and the popup id derived
+                // from it — stable against the conditional strips above.
+                let mut caret = None;
+                {
+                    let cursor =
+                        output.cursor_range.map(|r| usize::from(r.primary.index));
+                    let open = &mut mv.emoji_picker_open;
+                    let draft = mv.composer.entry(ch).or_default();
+                    let on_pick = |emoji: &str| {
+                        caret = Some(emoji::insert_at_cursor(draft, cursor, emoji));
+                    };
+                    ui.push_id(("emoji_picker", ch), |ui| {
+                        emoji::picker(ui, open, on_pick);
+                    });
+                }
+                if let Some(caret) = caret {
+                    // Park the caret after the inserted emoji (the TextEdit
+                    // state still points at the pre-insert position) and
+                    // hand focus back so Enter sends and the next insert
+                    // appends instead of stacking backwards.
+                    output.state.cursor.set_char_range(Some(
+                        egui::text::CCursorRange::one(egui::text::CCursor::new(caret)),
+                    ));
+                    output.state.store(ctx, output.response.id);
+                    maybe_send_typing(state, mv, ch);
+                    output.response.request_focus();
                 }
             });
             if send {
@@ -1276,7 +1317,7 @@ fn chat(
                 }
                 // A button click moves focus to the button — put it back
                 // so typing continues without a re-click.
-                response.request_focus();
+                output.response.request_focus();
             }
         });
 

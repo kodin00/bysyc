@@ -34,6 +34,11 @@ impl BysycApp {
         // plane / paper clip). Idempotent, so a re-created app is fine.
         egui_extras::install_image_loaders(&cc.egui_ctx);
 
+        // Current Noto Emoji as the emoji fallback font (the builtin copy
+        // predates Unicode 11); also the basis of the composer's emoji
+        // picker (see [`crate::views::emoji`]).
+        crate::views::emoji::install_fonts(&cc.egui_ctx);
+
         let default_url = {
             let s = state::guard(&store);
             s.setting("server_url")

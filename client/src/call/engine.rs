@@ -94,6 +94,8 @@ pub struct UiState {
     pub muted: Arc<AtomicBool>,
     pub participants: Mutex<Vec<ParticipantUi>>,
     pub audio_error: Mutex<Option<String>>,
+    /// Status line under the roster; empty when there is nothing to report
+    /// (alone in the call — the roster placeholder covers it).
     pub status: Mutex<String>,
     /// True while TURN relays this call (status decoration).
     pub relayed: AtomicBool,
@@ -112,7 +114,7 @@ impl UiState {
             muted: Arc::new(AtomicBool::new(false)),
             participants: Mutex::new(Vec::new()),
             audio_error: Mutex::new(None),
-            status: Mutex::new("connecting…".to_string()),
+            status: Mutex::new(String::new()),
             relayed: AtomicBool::new(false),
             finished: AtomicBool::new(false),
         }
@@ -961,7 +963,7 @@ pub fn spawn_session(cfg: SessionConfig) -> SessionHandle {
     if spawned.is_err() {
         // No thread to raise the flag via the drop guard: publish the end
         // here so the overlay tears the entry down instead of showing a
-        // "connecting…" window forever.
+        // dead call window forever.
         ui.set_status("call failed to start");
         ui.finished.store(true, Ordering::Relaxed);
     }
@@ -1207,18 +1209,29 @@ fn run(cfg: SessionConfig, rx: std::sync::mpsc::Receiver<SessionCmd>, ui: Arc<Ui
     ui.set_status(core.end_status.unwrap_or("call ended"));
 }
 
+/// Push the peer roster and a single truthful status line to the UI.
+/// With no peers at all there is nothing to connect to, so the status is
+/// empty — the roster placeholder in the call window ("waiting for
+/// participants…") already covers that case. With peers it is
+/// "connecting…" while ICE is in flight and "N connected" once up; a
+/// missing capture device always reports "no audio device — text only".
 fn refresh_ui(core: &SessionCore, ui: &UiState, relay: bool, have_audio: bool) {
     let parts = core.participants_ui();
     let connected = parts.iter().filter(|p| p.connected).count();
+    let alone = parts.is_empty();
     *ui.participants.lock().unwrap_or_else(|p| p.into_inner()) = parts;
     let status = if !have_audio {
         "no audio device — text only".to_string()
+    } else if alone {
+        String::new()
     } else if connected == 0 {
         "connecting…".to_string()
     } else {
         format!("{connected} connected")
     };
-    let status = if relay {
+    // Decorate only a non-empty status: alone means nothing to report,
+    // not even the relay note.
+    let status = if relay && !status.is_empty() {
         format!("{status} · relay")
     } else {
         status
@@ -1691,5 +1704,51 @@ mod tests {
         core.pump_audio(t0 + Duration::from_millis(20), &ring);
         // Not connected: everything discarded.
         assert!(ring.is_empty());
+    }
+
+    #[test]
+    fn refresh_ui_status_is_single_and_truthful() {
+        fn status_of(ui: &UiState) -> String {
+            ui.status.lock().unwrap_or_else(|p| p.into_inner()).clone()
+        }
+        let t0 = Instant::now();
+        let mut core = SessionCore::new(10, CallKind::Channel, t0);
+        core.set_local(&["127.0.0.1:49001".parse().unwrap()], &mut Vec::new());
+        let ui = UiState::new(1, CallKind::Channel);
+
+        // Before the first refresh there is nothing to report either.
+        assert_eq!(status_of(&ui), "");
+
+        // Alone in the channel: no peers, nothing to connect to — the
+        // status stays empty even when the relay is ready, so the roster
+        // placeholder ("waiting for participants…") speaks alone.
+        refresh_ui(&core, &ui, false, true);
+        assert_eq!(status_of(&ui), "");
+        refresh_ui(&core, &ui, true, true);
+        assert_eq!(status_of(&ui), "");
+
+        // A peer arrives but ICE is still in flight.
+        core.apply_roster(
+            &[account(10, "a"), account(20, "b")],
+            &mut Vec::new(),
+        );
+        refresh_ui(&core, &ui, false, true);
+        assert_eq!(status_of(&ui), "connecting…");
+
+        // A missing capture device outranks the peer states, as before.
+        refresh_ui(&core, &ui, false, false);
+        assert_eq!(status_of(&ui), "no audio device — text only");
+
+        // Once connected: the count, plus the relay decoration.
+        let me_a = account(1, "alice");
+        let me_b = account(2, "bob");
+        let mut p = Pair::new(me_a.id, me_b.id);
+        p.begin_private(&me_a, &me_b);
+        p.connect();
+        let ui_a = UiState::new(2, CallKind::Private);
+        refresh_ui(&p.a, &ui_a, false, true);
+        assert_eq!(status_of(&ui_a), "1 connected");
+        refresh_ui(&p.a, &ui_a, true, true);
+        assert_eq!(status_of(&ui_a), "1 connected · relay");
     }
 }
