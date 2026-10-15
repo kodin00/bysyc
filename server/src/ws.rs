@@ -12,8 +12,8 @@
 //! 3. **Task layout** (one task per connection, single writer):
 //!
 //!    ```text
-//!    [bus forwarder task] --raw JSON--> [out mpsc] --> [writer task] --> socket
-//!    [connection loop] ----direct replies-^
+//!    [bus forwarder task] --msgpack frames--> [out mpsc] --> [writer task] --> socket
+//!    [connection loop] ----direct replies------^
 //!    ```
 //!
 //!    Every frame to the client is written by the writer task alone, in
@@ -32,8 +32,10 @@
 //!    in the [`EventBus`]; a worker's first holder of a topic subscribes
 //!    it, its last holder out unsubscribes. Workers forward
 //!    `(topic, payload)` pairs into per-worker `tokio::sync::broadcast`
-//!    rings; each connection's forwarder task filters its home ring by its
-//!    own topics and writes payloads verbatim. A connection that lags the
+//!    rings (transcoding each JSON payload to a binary MessagePack frame
+//!    once, so every connection homed on the worker reuses the same frame
+//!    bytes); each connection's forwarder task filters its home ring by its
+//!    own topics and forwards the frame verbatim. A connection that lags the
 //!    ring simply misses events — backfill is `GET /channels/{id}/messages`.
 //!    A client that just joined a Guild or opened a DM should send a
 //!    `Heartbeat` to start receiving the new channel's events (the beat
@@ -94,7 +96,8 @@ use tokio::sync::{broadcast, mpsc, Mutex};
 use bysyc_common::PROTOCOL_VERSION;
 use bysyc_common::protocol::{
     AccountBrief, AccountInfo, ChannelInfo, ChannelKind, DmChannel, ErrorCode, GuildInfo,
-    MailboxItem, WsClientBody, WsClientMsg, WsServerBody, WsServerMsg,
+    MailboxItem, WsClientBody, WsClientMsg, WsServerBody, WsServerMsg, decode_ws_client_msg,
+    encode_ws_server_msg,
 };
 
 use crate::db::AppState;
@@ -169,12 +172,30 @@ async fn ws_upgrade(
 // ---------------------------------------------------------------------------
 
 /// One gateway event as the workers forward it: the Redis topic it was
-/// published to plus the already-serialized `WsServerMsg` JSON (see
-/// [`crate::events`]). `Arc` on both fields and on the event itself keeps
-/// broadcast fan-out to refcount bumps.
+/// published to plus the already-encoded binary `WsMessage` frame. The
+/// payload arrives from [`crate::events`] as a JSON `WsServerMsg`; the
+/// worker transcodes it once (see [`event_frame`]) so every connection homed
+/// there shares the same frame bytes — the forwarder never re-encodes.
+/// `Arc` on the topic and on the event itself keeps broadcast fan-out to
+/// refcount bumps (the frame clones as a `Bytes` refcount bump).
 struct BusEvent {
     topic: Arc<str>,
-    payload: Arc<str>,
+    frame: WsMessage,
+}
+
+/// Transcode one Redis pub/sub payload — the JSON `WsServerMsg` published by
+/// [`crate::events`] — into the gateway's binary MessagePack frame.
+/// Returns `None` (and logs) for a payload that does not parse: only this
+/// process's publishers write these topics, so that is a bug, not a client
+/// error.
+fn event_frame(payload: &str) -> Option<WsMessage> {
+    match serde_json::from_str::<WsServerMsg>(payload) {
+        Ok(msg) => Some(WsMessage::Binary(encode_ws_server_msg(&msg).into())),
+        Err(e) => {
+            tracing::warn!("ignoring undecodable pub/sub payload: {e}");
+            None
+        }
+    }
 }
 
 /// Topic-management command from the registry to one subscriber worker.
@@ -392,12 +413,11 @@ async fn run_event_worker(
                 Step::Msg(Some(m)) => {
                     let topic = Arc::from(m.get_channel_name());
                     if let Ok(payload) = m.get_payload::<String>() {
-                        // A send error just means no live receivers right
-                        // now — the publish already happened, move on.
-                        let _ = bus_tx.send(Arc::new(BusEvent {
-                            topic,
-                            payload: Arc::from(payload),
-                        }));
+                        if let Some(frame) = event_frame(&payload) {
+                            // A send error just means no live receivers right
+                            // now — the publish already happened, move on.
+                            let _ = bus_tx.send(Arc::new(BusEvent { topic, frame }));
+                        }
                     }
                 }
                 Step::Msg(None) => {
@@ -441,10 +461,7 @@ async fn run_bus_forwarder(
             event = events.recv() => match event {
                 Ok(event) => {
                     if held.contains(event.topic.as_ref())
-                        && out_tx
-                            .send(WsMessage::Text(event.payload.as_ref().into()))
-                            .await
-                            .is_err()
+                        && out_tx.send(event.frame.clone()).await.is_err()
                     {
                         bus.set_topics(home, &mut held, HashSet::new()).await;
                         return; // writer gone -> connection over
@@ -510,7 +527,7 @@ async fn run_connected(state: &AppState, socket: WebSocket, me: i64) -> Result<(
     //    single writer drains the mpsc, so it is always the first frame.
     let (out_tx, out_rx) = mpsc::channel::<WsMessage>(OUT_QUEUE_DEPTH);
     out_tx
-        .send(text_msg(WsServerMsg {
+        .send(frame_msg(WsServerMsg {
             id: None,
             body: WsServerBody::Ready {
                 account: ready.account,
@@ -552,16 +569,24 @@ async fn run_connected(state: &AppState, socket: WebSocket, me: i64) -> Result<(
             }
             frame = stream.next() => match frame {
                 None => break, // client went away
+                Some(Ok(WsMessage::Binary(data))) => {
+                    let decoded =
+                        decode_ws_client_msg(&data).map_err(|e| format!("malformed message: {e}"));
+                    handle_client_msg(state, &sub_tx, &out, me, decoded, &mut conn).await;
+                }
+                // Pre-v2 clients spoke JSON text frames; the read side still
+                // accepts them (every reply is MessagePack either way).
                 Some(Ok(WsMessage::Text(txt))) => {
-                    handle_client_msg(state, &sub_tx, &out, me, txt.as_str(), &mut conn).await;
+                    let decoded = serde_json::from_str::<WsClientMsg>(txt.as_str())
+                        .map_err(|e| format!("malformed message: {e}"));
+                    handle_client_msg(state, &sub_tx, &out, me, decoded, &mut conn).await;
                 }
                 Some(Ok(WsMessage::Close(_))) => break,
                 Some(Err(e)) => {
                     tracing::debug!(me, "socket read error: {e}");
                     break;
                 }
-                // Pings are answered by axum itself; binary frames are not
-                // part of the protocol and are ignored.
+                // Pings are answered by axum itself.
                 Some(Ok(_)) => {}
             },
         }
@@ -635,18 +660,13 @@ async fn handle_client_msg(
     sub_tx: &mpsc::Sender<HashSet<Arc<str>>>,
     out: &mpsc::Sender<WsMessage>,
     me: i64,
-    text: &str,
+    decoded: Result<WsClientMsg, String>,
     conn: &mut ConnState,
 ) {
-    let msg: WsClientMsg = match serde_json::from_str(text) {
+    let msg: WsClientMsg = match decoded {
         Ok(m) => m,
         Err(e) => {
-            send_error(
-                out,
-                None,
-                ErrorCode::InvalidRequest,
-                format!("malformed message: {e}"),
-            );
+            send_error(out, None, ErrorCode::InvalidRequest, e);
             return;
         }
     };
@@ -729,7 +749,7 @@ async fn handle_client_msg(
                     // immediately, before (and independent of) the pub/sub
                     // VoiceState that voice::join publishes to the channel.
                     let _ = out
-                        .send(text_msg(WsServerMsg {
+                        .send(frame_msg(WsServerMsg {
                             id: None,
                             body: WsServerBody::VoiceState {
                                 channel_id,
@@ -801,7 +821,7 @@ fn send_error(
     };
     // try_send: never block the reader on a stalled client; if the queue
     // is full the socket is wedged anyway.
-    let _ = out.try_send(text_msg(msg));
+    let _ = out.try_send(frame_msg(msg));
 }
 
 // ---------------------------------------------------------------------------
@@ -1173,12 +1193,10 @@ async fn write_loop(mut sink: SplitSink<WebSocket, WsMessage>, mut rx: mpsc::Rec
     let _ = sink.send(WsMessage::Close(None)).await;
 }
 
-fn text_msg(msg: WsServerMsg) -> WsMessage {
-    WsMessage::Text(
-        serde_json::to_string(&msg)
-            .expect("WsServerMsg always serializes")
-            .into(),
-    )
+/// Encode a direct (non-bus) server frame as a binary MessagePack message —
+/// the gateway's only write format since protocol v2.
+fn frame_msg(msg: WsServerMsg) -> WsMessage {
+    WsMessage::Binary(encode_ws_server_msg(&msg).into())
 }
 
 #[cfg(test)]
@@ -1196,8 +1214,8 @@ mod tests {
     }
 
     #[test]
-    fn text_msg_serializes_envelope() {
-        let frame = text_msg(WsServerMsg {
+    fn frame_msg_encodes_msgpack_envelope() {
+        let frame = frame_msg(WsServerMsg {
             id: None,
             body: WsServerBody::Presence {
                 account_id: 2,
@@ -1205,8 +1223,9 @@ mod tests {
             },
         });
         match frame {
-            WsMessage::Text(txt) => {
-                let parsed: WsServerMsg = serde_json::from_str(txt.as_str()).expect("valid json");
+            WsMessage::Binary(data) => {
+                let parsed = bysyc_common::protocol::decode_ws_server_msg(&data)
+                    .expect("valid msgpack frame");
                 assert_eq!(
                     parsed.body,
                     WsServerBody::Presence {
@@ -1216,8 +1235,30 @@ mod tests {
                 );
                 assert_eq!(parsed.id, None);
             }
-            other => panic!("expected text frame, got {other:?}"),
+            other => panic!("expected binary frame, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn event_frame_transcodes_pubsub_json_to_msgpack() {
+        // The exact bytes `crate::events` puts on Redis (its pinned envelope).
+        let payload = r#"{"id":null,"body":{"presence":{"account_id":2,"online":true}}}"#;
+        let frame = event_frame(payload).expect("pubsub payload transcodes");
+        let WsMessage::Binary(data) = frame else {
+            panic!("expected binary frame, got {frame:?}");
+        };
+        let parsed = bysyc_common::protocol::decode_ws_server_msg(&data).expect("decodes");
+        assert_eq!(
+            parsed,
+            WsServerMsg {
+                id: None,
+                body: WsServerBody::Presence {
+                    account_id: 2,
+                    online: true,
+                }
+            }
+        );
+        assert!(event_frame("not json").is_none());
     }
 
     #[test]

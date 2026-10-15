@@ -5,7 +5,11 @@
 //! contract.
 
 /// Current wire protocol version. Clients and server refuse mismatched versions.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// v2: the WebSocket gateway moved from JSON text frames to binary
+/// MessagePack frames (see the codec helpers in [`protocol`]); REST bodies
+/// stay JSON.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// The wire protocol: every REST DTO, the WebSocket envelopes, and the
 /// error model shared by client and server.

@@ -31,7 +31,10 @@
 //! ```
 //!
 //! A `protocol` query parameter that does not match is rejected with
-//! [`ErrorCode::ProtocolVersion`].
+//! [`ErrorCode::ProtocolVersion`]. Since v2 the gateway carries
+//! [`WsClientMsg`] / [`WsServerMsg`] as **binary** WebSocket frames encoded
+//! with MessagePack (see the codec helpers at the bottom of this module);
+//! REST bodies remain JSON, built from the same types.
 //!
 //! # REST error envelope
 //!
@@ -53,7 +56,7 @@
 //! | `DELETE /channels/{id}/messages/{message_id}` | delete one of the caller's own messages | — |
 //! | `POST /attachments/image` | upload a WebP image (server-stored, unencrypted) | raw WebP bytes → [`ImageUploadResponse`] |
 //! | `GET /attachments/{id}/download-url` | presigned download URL | [`DownloadUrlResponse`] |
-//! | `GET /ws?token=...&protocol=1` | WebSocket gateway | [`WsClientMsg`] / [`WsServerMsg`] |
+//! | `GET /ws?token=...&protocol=2` | WebSocket gateway | [`WsClientMsg`] / [`WsServerMsg`] (binary MessagePack) |
 //!
 //! The remaining REST routes (auth, keys, guild/channel creation, invites,
 //! attachments, DMs) are owned by the server crate; the request/response
@@ -295,13 +298,14 @@ pub enum ChannelKind {
     Dm,
 }
 
-/// A single Channel. For DMs `guild_id` is `None` and `kind` is
-/// [`ChannelKind::Dm`].
+/// A single Channel. For DMs `guild_id` is `None` (and omitted on the wire)
+/// and `kind` is [`ChannelKind::Dm`].
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ChannelInfo {
     /// Channel id.
     pub id: i64,
     /// Owning Guild, or `None` for a DM channel.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub guild_id: Option<i64>,
     /// Which of text/voice/dm this channel is.
     pub kind: ChannelKind,
@@ -467,8 +471,10 @@ pub struct MessageDto {
     /// each recipient.
     pub content: String,
     /// Id of the Message this one replies to, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<i64>,
     /// Attachment referenced by this Message, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub attachment: Option<AttachmentMeta>,
     /// When the server accepted the Message, Unix epoch milliseconds.
     pub created_at_ms: i64,
@@ -585,6 +591,7 @@ pub enum CallSignalKind {
         /// SDP "a=candidate:" line payload.
         candidate: String,
         /// Media (m-line) index the candidate belongs to, when known.
+        #[serde(skip_serializing_if = "Option::is_none")]
         mid: Option<u16>,
     },
     /// Leave the Call / tear down the peer connection.
@@ -819,12 +826,46 @@ pub enum WsServerBody {
     /// [`WsClientMsg::id`].
     Error {
         /// The [`WsClientMsg::id`] this error answers, when attributable.
+        #[serde(skip_serializing_if = "Option::is_none")]
         reply_to: Option<u64>,
         /// Machine-readable classification (same codes as REST).
         code: ErrorCode,
         /// Human-readable explanation.
         message: String,
     },
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket frame codec (binary MessagePack; REST stays JSON)
+// ---------------------------------------------------------------------------
+
+/// Encode one server→client frame for the gateway's binary WebSocket
+/// messages.
+///
+/// The encoding is *named* — struct fields become map keys, mirroring the
+/// JSON shape. That is required, not a preference: several `Option` fields
+/// skip serialization when `None`, and MessagePack's compact positional
+/// struct representation cannot omit fields. Both sides of the gateway use
+/// these helpers, so the representation cannot drift.
+pub fn encode_ws_server_msg(msg: &WsServerMsg) -> Vec<u8> {
+    rmp_serde::to_vec_named(msg).expect("WsServerMsg always serializes")
+}
+
+/// Encode one client→server frame (see [`encode_ws_server_msg`]).
+pub fn encode_ws_client_msg(msg: &WsClientMsg) -> Vec<u8> {
+    rmp_serde::to_vec_named(msg).expect("WsClientMsg always serializes")
+}
+
+/// Decode one server→client frame from a binary WebSocket message. Accepts
+/// both named and positional MessagePack (the decoder is agnostic; only the
+/// encoders above are pinned to named).
+pub fn decode_ws_server_msg(bytes: &[u8]) -> Result<WsServerMsg, rmp_serde::decode::Error> {
+    rmp_serde::from_slice(bytes)
+}
+
+/// Decode one client→server frame from a binary WebSocket message.
+pub fn decode_ws_client_msg(bytes: &[u8]) -> Result<WsClientMsg, rmp_serde::decode::Error> {
+    rmp_serde::from_slice(bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -1248,5 +1289,207 @@ mod tests {
         });
         let meta: AttachmentMeta = serde_json::from_value(legacy).expect("legacy json parses");
         assert!(meta.encrypted);
+    }
+
+    /// The gateway's binary frames are MessagePack; round-trip the same
+    /// representative shapes the JSON tests pin, through the codec helpers
+    /// both sides of the gateway actually call.
+    #[test]
+    fn ws_frames_msgpack_roundtrip() {
+        fn roundtrip_bin<T>(
+            value: T,
+            encode: fn(&T) -> Vec<u8>,
+            decode: fn(&[u8]) -> Result<T, rmp_serde::decode::Error>,
+        ) where
+            T: PartialEq + std::fmt::Debug,
+        {
+            let bytes = encode(&value);
+            let back = decode(&bytes).expect("msgpack decodes");
+            assert_eq!(&back, &value, "msgpack roundtrip mismatch");
+        }
+
+        // Server frames: a plain chat Message with all-None options, the
+        // same Message with reply + attachment set, an Error attributing a
+        // client id, one attributing none, a call-signal candidate with and
+        // without `mid`, and the full Ready snapshot.
+        let mut with_optional = message_dto();
+        with_optional.reply_to = Some(99);
+        with_optional.attachment = Some(AttachmentMeta {
+            id: 300,
+            name: "cat.png".into(),
+            size: 4096,
+            nonce: "bm9uY2U=".into(),
+            encrypted: true,
+        });
+        let enc = |v: &WsServerMsg| encode_ws_server_msg(v);
+        let dec: fn(&[u8]) -> Result<WsServerMsg, _> = decode_ws_server_msg;
+        roundtrip_bin(
+            WsServerMsg {
+                id: Some(2),
+                body: WsServerBody::Message(message_dto()),
+            },
+            enc,
+            dec,
+        );
+        roundtrip_bin(
+            WsServerMsg {
+                id: Some(2),
+                body: WsServerBody::Message(with_optional),
+            },
+            enc,
+            dec,
+        );
+        roundtrip_bin(
+            WsServerMsg {
+                id: None,
+                body: WsServerBody::Error {
+                    reply_to: Some(6),
+                    code: ErrorCode::VoiceChannelFull,
+                    message: "voice channel is full".into(),
+                },
+            },
+            enc,
+            dec,
+        );
+        roundtrip_bin(
+            WsServerMsg {
+                id: None,
+                body: WsServerBody::Error {
+                    reply_to: None,
+                    code: ErrorCode::InvalidRequest,
+                    message: "malformed message".into(),
+                },
+            },
+            enc,
+            dec,
+        );
+        roundtrip_bin(
+            WsServerMsg {
+                id: None,
+                body: WsServerBody::CallSignal {
+                    call_id: 12,
+                    from: 2,
+                    kind: CallSignalKind::Candidate {
+                        candidate: "candidate:2 1 UDP 1694498815 10.0.0.7 50001 typ srflx".into(),
+                        mid: Some(0),
+                    },
+                },
+            },
+            enc,
+            dec,
+        );
+        roundtrip_bin(
+            WsServerMsg {
+                id: None,
+                body: WsServerBody::Ready {
+                    account: info(),
+                    friends: vec![brief()],
+                    incoming_requests: vec![],
+                    outgoing_requests: vec![],
+                    guilds: vec![
+                        guild(),
+                        GuildInfo {
+                            id: 6,
+                            name: "empty".into(),
+                            owner_id: 1,
+                            channels: vec![],
+                        },
+                    ],
+                    dm_channels: vec![dm_channel()],
+                    mailbox: vec![mailbox_item()],
+                },
+            },
+            enc,
+            dec,
+        );
+
+        // Client frames: a bare unit variant and a struct variant.
+        let enc_c = |v: &WsClientMsg| encode_ws_client_msg(v);
+        let dec_c: fn(&[u8]) -> Result<WsClientMsg, _> = decode_ws_client_msg;
+        roundtrip_bin(
+            WsClientMsg {
+                id: 1,
+                body: WsClientBody::Heartbeat,
+            },
+            enc_c,
+            dec_c,
+        );
+        roundtrip_bin(
+            WsClientMsg {
+                id: 2,
+                body: WsClientBody::Typing { channel_id: 10 },
+            },
+            enc_c,
+            dec_c,
+        );
+        roundtrip_bin(
+            WsClientMsg {
+                id: 3,
+                body: WsClientBody::AckMailbox {
+                    ids: vec![200, 201],
+                },
+            },
+            enc_c,
+            dec_c,
+        );
+    }
+
+    /// `skip_serializing_if` must reach the msgpack encoding too (the reason
+    /// the codec is pinned to the named representation): a None option field
+    /// leaves no trace in the frame bytes.
+    #[test]
+    fn msgpack_encoding_omits_none_option_fields() {
+        let plain = encode_ws_server_msg(&WsServerMsg {
+            id: None,
+            body: WsServerBody::Message(message_dto()),
+        });
+        assert!(!plain.windows(8).any(|w| w == b"reply_to"));
+        assert!(!plain.windows(10).any(|w| w == b"attachment"));
+
+        let mut with = message_dto();
+        with.reply_to = Some(99);
+        with.attachment = Some(AttachmentMeta {
+            id: 300,
+            name: "cat.png".into(),
+            size: 4096,
+            nonce: "bm9uY2U=".into(),
+            encrypted: true,
+        });
+        let rich = encode_ws_server_msg(&WsServerMsg {
+            id: None,
+            body: WsServerBody::Message(with),
+        });
+        assert!(rich.windows(8).any(|w| w == b"reply_to"));
+        assert!(rich.windows(10).any(|w| w == b"attachment"));
+    }
+
+    /// Omitted keys (the new JSON shape on REST and in the client's local
+    /// store) and explicit nulls (rows persisted before the skip) must both
+    /// deserialize to `None` — no consumer relies on the null being present.
+    #[test]
+    fn json_missing_and_null_option_fields_both_deserialize_none() {
+        let omitted = serde_json::json!({
+            "id": 100,
+            "channel_id": 10,
+            "sender_id": 1,
+            "kind": "chat",
+            "content": "aGVsbG8=",
+            "created_at_ms": 1_700_000_000_123i64
+        });
+        let nulls = serde_json::json!({
+            "id": 100,
+            "channel_id": 10,
+            "sender_id": 1,
+            "kind": "chat",
+            "content": "aGVsbG8=",
+            "reply_to": null,
+            "attachment": null,
+            "created_at_ms": 1_700_000_000_123i64
+        });
+        for v in [omitted, nulls] {
+            let dto: MessageDto = serde_json::from_value(v).expect("deserializes");
+            assert_eq!(dto.reply_to, None);
+            assert_eq!(dto.attachment, None);
+        }
     }
 }

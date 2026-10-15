@@ -11,7 +11,7 @@
 //!   · `DELETE /friends/{id}`
 //! - `GET /channels/{id}/messages?before=<id>&limit=<n>` ([`MessagePage`])
 //! - `GET /attachments/{id}/download-url` ([`DownloadUrlResponse`])
-//! - `GET /ws?token=...&protocol=1` (WebSocket)
+//! - `GET /ws?token=...&protocol=2` (WebSocket; frames are binary MessagePack)
 //!
 //! The paths below are the client's assumed contract for endpoints whose
 //! routes the server crate still owns (server modules are stubs at the time
@@ -59,7 +59,7 @@ use bysyc_common::protocol::{
     DownloadUrlResponse, ErrorCode, FriendList, GuildInfo, GuildInviteDto, JoinGuildRequest,
     LoginRequest, MailboxItem, MessageDto, MessagePage, OpenDmRequest, RegisterRequest,
     SendMessageRequest, TokenResponse, TurnInfo, UploadOtkRequest, WsClientBody, WsClientMsg,
-    WsServerBody, WsServerMsg,
+    WsServerBody, decode_ws_server_msg, encode_ws_client_msg,
 };
 use eframe::egui::Context;
 use futures_util::{SinkExt, StreamExt};
@@ -814,16 +814,14 @@ pub async fn run_ws(
                             // partial batch can sit uncached.
                             flush_pending(&store, &mut pending);
                             let msg = WsClientMsg { id: next_msg_id(), body: WsClientBody::Heartbeat };
-                            match serde_json::to_string(&msg) {
-                                Ok(text) => {
-                                    if write.send(tokio_tungstenite::tungstenite::Message::text(text))
-                                        .await
-                                        .is_err()
-                                    {
-                                        break Err("write failed".into());
-                                    }
-                                }
-                                Err(_) => unreachable!("WsClientMsg is always serializable"),
+                            if write
+                                .send(tokio_tungstenite::tungstenite::Message::binary(
+                                    encode_ws_client_msg(&msg),
+                                ))
+                                .await
+                                .is_err()
+                            {
+                                break Err("write failed".into());
                             }
                             if !alive(&state, generation) {
                                 return;
@@ -832,13 +830,14 @@ pub async fn run_ws(
                         queued = outgoing.recv() => {
                             match queued {
                                 Some(msg) => {
-                                    if let Ok(text) = serde_json::to_string(&msg) {
-                                        if write.send(tokio_tungstenite::tungstenite::Message::text(text))
-                                            .await
-                                            .is_err()
-                                        {
-                                            break Err("write failed".into());
-                                        }
+                                    if write
+                                        .send(tokio_tungstenite::tungstenite::Message::binary(
+                                            encode_ws_client_msg(&msg),
+                                        ))
+                                        .await
+                                        .is_err()
+                                    {
+                                        break Err("write failed".into());
                                     }
                                 }
                                 // All NetHandles dropped (session torn down).
@@ -852,8 +851,8 @@ pub async fn run_ws(
                             match frame {
                                 None | Some(Err(_)) => break Err("connection lost".into()),
                                 Some(Ok(msg)) => match msg {
-                                    tokio_tungstenite::tungstenite::Message::Text(text) => {
-                                        match serde_json::from_str::<WsServerMsg>(&text) {
+                                    tokio_tungstenite::tungstenite::Message::Binary(data) => {
+                                        match decode_ws_server_msg(&data) {
                                             Ok(msg) => {
                                                 if let WsServerBody::Error {
                                                     code: ErrorCode::Unauthorized,
@@ -910,8 +909,9 @@ pub async fn run_ws(
                                         break Err("closed by server".into());
                                     }
                                     // Ping/Pong are answered by the transport
-                                    // itself; binary frames are not part of
-                                    // the protocol.
+                                    // itself; since protocol v2 the gateway
+                                    // speaks binary MessagePack frames only,
+                                    // so a text frame never arrives.
                                     _ => {}
                                 },
                             }
