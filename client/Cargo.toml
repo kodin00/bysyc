@@ -6,7 +6,7 @@ edition.workspace = true
 [dependencies]
 bysyc-common = { workspace = true }
 eframe = "0.36"
-egui_extras = { version = "0.36", features = ["image"] }
+egui_extras = { version = "0.36", features = ["image", "svg"] }
 image = { version = "0.25", features = ["png", "jpeg", "gif", "webp"] }
 tokio = { workspace = true }
 serde = { workspace = true }

@@ -30,6 +30,10 @@ impl BysycApp {
         store: Arc<Mutex<Store>>,
         rt: tokio::runtime::Handle,
     ) -> Self {
+        // Image loaders for the embedded SVG icons in the chat view (paper
+        // plane / paper clip). Idempotent, so a re-created app is fine.
+        egui_extras::install_image_loaders(&cc.egui_ctx);
+
         let default_url = {
             let s = state::guard(&store);
             s.setting("server_url")

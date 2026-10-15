@@ -17,6 +17,10 @@
 //! - Decoded images cross back to the UI thread through an `mpsc` channel
 //!   drained by [`drain_decoded`]; textures are created only on the UI
 //!   thread (egui requirement).
+//! - Save/Open exports ride the same rails (dialog `std::thread` → runtime
+//!   → `spawn_blocking` write/opener) and report progress as strip rows in
+//!   [`FILE_OPS`], which outlives a logout that wipes `MainState`
+//!   mid-export so the row can still say how it ended.
 //!
 //! Memory and disk posture:
 //!
@@ -26,10 +30,11 @@
 //!   (one file per attachment id); plaintext is only ever written when the
 //!   user explicitly Saves or Opens.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 
@@ -63,6 +68,14 @@ pub const POPUP_IMAGE_PX: egui::Vec2 = egui::Vec2::new(900.0, 700.0);
 
 /// Fresh upload ids for the progress strip (UI-thread allocated).
 static UPLOAD_SEQ: AtomicU64 = AtomicU64::new(1);
+/// Fresh Save/Open ids for the export rows of the same strip.
+static FILE_OP_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// Upload ids the user cancelled from the strip ("x" on an active row). The
+/// pipeline consumes the flag at its phase boundaries; a presigned PUT
+/// already on the wire is best-effort — it finishes, we just stop tracking.
+static CANCELLED_UPLOADS: LazyLock<Mutex<HashSet<u64>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 
 // ---------------------------------------------------------------------------
 // Send path
@@ -128,6 +141,10 @@ pub fn begin_attach(
             drop_upload(&state, upload_id);
             return;
         }
+        if upload_stopped(&state, upload_id, ch, temp) {
+            ctx.request_repaint();
+            return;
+        }
 
         let name = sanitize_filename(
             &path
@@ -162,6 +179,10 @@ pub fn begin_attach(
             ctx.request_repaint();
             return;
         }
+        if upload_stopped(&state, upload_id, ch, temp) {
+            ctx.request_repaint();
+            return;
+        }
         let (ciphertext, key_b64, nonce_b64) = match engine.encrypt_file(&bytes) {
             Ok(x) => x,
             Err(e) => {
@@ -171,6 +192,10 @@ pub fn begin_attach(
             }
         };
         ctx.request_repaint();
+        if upload_stopped(&state, upload_id, ch, temp) {
+            ctx.request_repaint();
+            return;
+        }
 
         // Network half on the runtime.
         let upload = UploadJob {
@@ -234,6 +259,10 @@ async fn upload_and_send(
         ctx.request_repaint();
         return;
     };
+    if upload_stopped(&state, upload_id, ch, temp) {
+        ctx.request_repaint();
+        return;
+    }
 
     // 1. Reserve the attachment: the server records id/name/ciphertext-size/
     //    nonce (all non-secret) and hands back a presigned PUT URL.
@@ -254,6 +283,13 @@ async fn upload_and_send(
         }
     };
     let att = created.attachment;
+
+    if upload_stopped(&state, upload_id, ch, temp) {
+        // Cancelled after presign: the reserved id simply never receives
+        // its ciphertext (an orphan the server never exposes).
+        ctx.request_repaint();
+        return;
+    }
 
     // The File envelope the receivers will decrypt. `size` is the ORIGINAL
     // size — the receiver's "[file: name (size)]" row and auto-image
@@ -294,6 +330,13 @@ async fn upload_and_send(
         ctx.request_repaint();
         return;
     }
+    if upload_stopped(&state, upload_id, ch, temp) {
+        // The PUT already went out — best-effort: pull the optimistic row
+        // and stop tracking instead of posting the message that would
+        // reveal the file.
+        ctx.request_repaint();
+        return;
+    }
     if !session_alive(&state, generation) {
         // Logged out mid-upload; the whole MainState (temp row included) is
         // already gone or about to be.
@@ -326,6 +369,7 @@ async fn upload_and_send(
                 m.file_meta.insert(dto.id, envelope);
                 set_upload_on(m, upload_id, |u| u.phase = UploadPhase::Done);
             }
+            clear_upload_cancel(upload_id);
         }
         Err(e) => {
             remove_temp(&state, ch, temp);
@@ -508,21 +552,28 @@ async fn ensure_encrypted_bytes(net: &Net, attachment_id: i64) -> Result<Vec<u8>
     Ok(bytes)
 }
 
-/// Decrypt the attachment end-to-end: cache/download → AES-GCM decrypt on a
-/// blocking thread. Returns the ORIGINAL plaintext bytes (kept only in this
-/// task's scope — never in long-lived state).
+/// Decrypt the attachment end-to-end for an export row: cache/download →
+/// AES-GCM decrypt on a blocking thread, moving the row through its
+/// Downloading/Decrypting phases as it goes. Returns the ORIGINAL plaintext
+/// bytes (kept only in this task's scope — never in long-lived state).
 async fn materialize(
+    ctx: &egui::Context,
+    op_id: u64,
     state: &Arc<Mutex<ClientState>>,
     attachment_id: i64,
     key_b64: &str,
     nonce_b64: &str,
 ) -> Result<Vec<u8>, String> {
     let h = net_handle(state).ok_or("not connected")?;
+    set_file_op_phase(op_id, FileOpPhase::Downloading);
+    ctx.request_repaint();
     let encrypted = ensure_encrypted_bytes(&h.net, attachment_id).await?;
     let Some(engine) = guard(state).main().and_then(|m| m.engine.clone()) else {
         return Err("crypto engine unavailable".into());
     };
     let (key, nonce) = (key_b64.to_string(), nonce_b64.to_string());
+    set_file_op_phase(op_id, FileOpPhase::Decrypting);
+    ctx.request_repaint();
     tokio::task::spawn_blocking(move || {
         engine
             .decrypt_file(&encrypted, &key, &nonce)
@@ -655,10 +706,19 @@ pub fn drain_decoded(ctx: &egui::Context, mv: &mut MainView) {
 // Rendering
 // ---------------------------------------------------------------------------
 
-/// The upload progress strip above the composer. Completed rows vanish;
-/// failed ones stay until dismissed.
+/// The progress strip above the composer: upload rows on top, Save/Open
+/// export rows underneath. Completed uploads vanish; failed ones stay until
+/// dismissed; the "x" on an active upload row cancels it at its next
+/// checkpoint (best-effort — see [`CANCELLED_UPLOADS`]).
 pub fn uploads_ui(ui: &mut egui::Ui, state: &Arc<Mutex<ClientState>>) {
+    upload_rows(ui, state);
+    file_ops_ui(ui);
+}
+
+/// The upload half of [`uploads_ui`].
+fn upload_rows(ui: &mut egui::Ui, state: &Arc<Mutex<ClientState>>) {
     let mut dismiss: Option<u64> = None;
+    let mut cancel: Option<u64> = None;
     {
         let mut st = guard(state);
         let Some(m) = st.main_mut() else { return };
@@ -683,8 +743,17 @@ pub fn uploads_ui(ui: &mut egui::Ui, state: &Arc<Mutex<ClientState>>) {
                     }
                 } else {
                     ui.weak(line);
+                    if ui.small_button("x").clicked() {
+                        cancel = Some(u.id);
+                    }
                 }
             });
+        }
+        if let Some(id) = cancel {
+            // Flag the pipeline for its next checkpoint; the row stops
+            // being tracked right away.
+            request_upload_cancel(id);
+            m.uploads.retain(|u| u.id != id);
         }
         if let Some(id) = dismiss {
             m.uploads.retain(|u| u.id != id);
@@ -871,11 +940,160 @@ pub fn image_popup(
 }
 
 // ---------------------------------------------------------------------------
-// Save / Open (explicit export of plaintext — the only path that ever
-// writes decrypted bytes to disk)
+// Save/Open export rows (the strip's second half, under the uploads)
 // ---------------------------------------------------------------------------
 
-/// Save dialog (std thread — it blocks), then decrypt + write.
+/// Where one Save/Open export is right now; the strip renders it as
+/// "name — label…" beside a spinner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileOpPhase {
+    /// Native save dialog is open (worker thread).
+    Choosing,
+    /// Encrypted-cache read or presigned GET.
+    Downloading,
+    /// AES-GCM decrypt on a blocking thread.
+    Decrypting,
+    /// Writing the plaintext to the chosen path (Save).
+    Saving,
+    /// Writing the temp copy and handing it to the OS opener (Open).
+    Opening,
+}
+
+impl FileOpPhase {
+    fn label(self) -> &'static str {
+        match self {
+            FileOpPhase::Choosing => "choosing destination…",
+            FileOpPhase::Downloading => "downloading…",
+            FileOpPhase::Decrypting => "decrypting…",
+            FileOpPhase::Saving => "saving…",
+            FileOpPhase::Opening => "opening…",
+        }
+    }
+}
+
+/// Terminal states of one export row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FileOpStatus {
+    /// In flight (phase label + spinner).
+    Working(FileOpPhase),
+    /// Success — lingers [`FILE_OP_DONE_LINGER`] as the confirmation: Save
+    /// names the destination it wrote, Open just says it handed the file
+    /// off to the OS.
+    Done(String),
+    /// Terminal failure (dismissible, like a failed upload row).
+    Failed(String),
+}
+
+/// One Save/Open row of the progress strip.
+struct FileOp {
+    id: u64,
+    name: String,
+    status: FileOpStatus,
+    /// When the current status was set; expires `Done` rows.
+    since: Instant,
+}
+
+/// Live Save/Open exports. Module-local on purpose: an export still running
+/// when a logout wipes `MainState` (whose `uploads` die with it) must be
+/// able to report how it ended, and background tasks address their row by
+/// id, not by session.
+static FILE_OPS: LazyLock<Mutex<Vec<FileOp>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// How long a finished export row lingers as its confirmation.
+const FILE_OP_DONE_LINGER: Duration = Duration::from_secs(6);
+
+fn file_ops() -> std::sync::MutexGuard<'static, Vec<FileOp>> {
+    FILE_OPS.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// First row state for a fresh export; returns the id its task updates.
+fn push_file_op(name: &str, phase: FileOpPhase) -> u64 {
+    let id = FILE_OP_SEQ.fetch_add(1, Ordering::Relaxed);
+    file_ops().push(FileOp {
+        id,
+        name: name.to_string(),
+        status: FileOpStatus::Working(phase),
+        since: Instant::now(),
+    });
+    id
+}
+
+/// `Working` → `Working` (a phase boundary was crossed).
+fn set_file_op_phase(id: u64, phase: FileOpPhase) {
+    if let Some(op) = file_ops().iter_mut().find(|o| o.id == id) {
+        op.status = FileOpStatus::Working(phase);
+        op.since = Instant::now();
+    }
+}
+
+/// `Working` → `Done` (the Save/Open confirmation).
+fn finish_file_op(id: u64, msg: String) {
+    if let Some(op) = file_ops().iter_mut().find(|o| o.id == id) {
+        op.status = FileOpStatus::Done(msg);
+        op.since = Instant::now();
+    }
+}
+
+/// `Working` → `Failed`: red strip row plus the app-wide notice (the error
+/// surface Save/Open already had before these rows existed).
+fn fail_file_op(state: &Arc<Mutex<ClientState>>, id: u64, context: &str, why: String) {
+    let msg = format!("{context}: {why}");
+    if let Some(op) = file_ops().iter_mut().find(|o| o.id == id) {
+        op.status = FileOpStatus::Failed(msg.clone());
+        op.since = Instant::now();
+    }
+    notice(state, msg);
+}
+
+/// Remove a row outright (the user closed the save dialog).
+fn drop_file_op(id: u64) {
+    file_ops().retain(|o| o.id != id);
+}
+
+/// Export rows under the upload rows: spinner while an export runs, a short
+/// green confirmation when it lands, red + dismiss when it fails.
+fn file_ops_ui(ui: &mut egui::Ui) {
+    let mut ops = file_ops();
+    ops.retain(|o| {
+        !matches!(o.status, FileOpStatus::Done(_)) || o.since.elapsed() < FILE_OP_DONE_LINGER
+    });
+    if ops.is_empty() {
+        return;
+    }
+    let mut dismiss: Option<u64> = None;
+    for op in &*ops {
+        ui.horizontal(|ui| match &op.status {
+            FileOpStatus::Working(phase) => {
+                ui.add(egui::Spinner::new());
+                ui.weak(format!("{} — {}", op.name, phase.label()));
+            }
+            FileOpStatus::Done(msg) => {
+                ui.colored_label(egui::Color32::GREEN, format!("{} — {msg}", op.name));
+                // Let the row expire on its own, input or no input.
+                ui.ctx()
+                    .request_repaint_after(FILE_OP_DONE_LINGER.saturating_sub(op.since.elapsed()));
+            }
+            FileOpStatus::Failed(why) => {
+                ui.colored_label(egui::Color32::RED, format!("{} — failed: {why}", op.name));
+                if ui.small_button("x").clicked() {
+                    dismiss = Some(op.id);
+                }
+            }
+        });
+    }
+    if let Some(id) = dismiss {
+        ops.retain(|o| o.id != id);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Save / Open (explicit export of plaintext — the only path that ever
+// writes decrypted bytes to disk; every phase is a strip row)
+// ---------------------------------------------------------------------------
+
+/// Save dialog (std thread — it blocks), then download + decrypt + write,
+/// reported as a strip row: spinner through each phase, then the
+/// "saved to …" confirmation or the failure.
 #[allow(clippy::too_many_arguments)]
 fn save_attachment(
     state: &Arc<Mutex<ClientState>>,
@@ -890,25 +1108,43 @@ fn save_attachment(
     let rt = rt.clone();
     let ctx = ctx.clone();
     let (key, nonce) = (key_b64.to_string(), nonce_b64.to_string());
+    let op_id = push_file_op(&name, FileOpPhase::Choosing);
     std::thread::spawn(move || {
         let Some(path) = rfd::FileDialog::new().set_file_name(&name).save_file() else {
+            drop_file_op(op_id);
+            ctx.request_repaint();
             return;
         };
+        ctx.request_repaint();
         rt.spawn(async move {
-            match materialize(&state, attachment_id, &key, &nonce).await {
+            let result = match materialize(&ctx, op_id, &state, attachment_id, &key, &nonce).await {
                 Ok(bytes) => {
-                    if let Err(e) = std::fs::write(&path, &bytes) {
-                        notice(&state, format!("save failed: {e}"));
+                    set_file_op_phase(op_id, FileOpPhase::Saving);
+                    ctx.request_repaint();
+                    let shown = path.display().to_string();
+                    match tokio::task::spawn_blocking(move || {
+                        std::fs::write(&path, &bytes).map_err(|e| format!("write: {e}"))
+                    })
+                    .await
+                    {
+                        Ok(Ok(())) => Ok(shown),
+                        Ok(Err(e)) => Err(e),
+                        Err(e) => Err(format!("worker: {e}")),
                     }
                 }
-                Err(e) => notice(&state, format!("save failed: {e}")),
+                Err(e) => Err(e),
+            };
+            match result {
+                Ok(shown) => finish_file_op(op_id, format!("saved to {shown}")),
+                Err(e) => fail_file_op(&state, op_id, "save failed", e),
             }
             ctx.request_repaint();
         });
     });
 }
 
-/// Decrypt to a temp path and hand it to the OS opener (best-effort).
+/// Download + decrypt to a temp path and hand it to the OS opener — every
+/// phase, including the opener's own verdict, is a strip row.
 fn open_attachment(
     state: &Arc<Mutex<ClientState>>,
     rt: &tokio::runtime::Handle,
@@ -922,13 +1158,28 @@ fn open_attachment(
     let ctx = ctx.clone();
     let path = temp_open_path(&name);
     let (key, nonce) = (key_b64.to_string(), nonce_b64.to_string());
+    let op_id = push_file_op(&name, FileOpPhase::Downloading);
     rt.spawn(async move {
-        match materialize(&state, attachment_id, &key, &nonce).await {
-            Ok(bytes) => match std::fs::write(&path, &bytes) {
-                Ok(()) => open_with_os(&path),
-                Err(e) => notice(&state, format!("open failed: {e}")),
-            },
-            Err(e) => notice(&state, format!("open failed: {e}")),
+        let result = match materialize(&ctx, op_id, &state, attachment_id, &key, &nonce).await {
+            Ok(bytes) => {
+                set_file_op_phase(op_id, FileOpPhase::Opening);
+                ctx.request_repaint();
+                match tokio::task::spawn_blocking(move || {
+                    std::fs::write(&path, &bytes)
+                        .map_err(|e| format!("write: {e}"))
+                        .and_then(|()| open_with_os(&path))
+                })
+                .await
+                {
+                    Ok(r) => r,
+                    Err(e) => Err(format!("worker: {e}")),
+                }
+            }
+            Err(e) => Err(e),
+        };
+        match result {
+            Ok(()) => finish_file_op(op_id, "opened".into()),
+            Err(e) => fail_file_op(&state, op_id, "open failed", e),
         }
         ctx.request_repaint();
     });
@@ -946,18 +1197,35 @@ fn temp_open_path(name: &str) -> PathBuf {
     dir.join(format!("{stamp}-{}", sanitize_filename(name)))
 }
 
-/// Best-effort "open with the default app".
-fn open_with_os(path: &std::path::Path) {
+/// Hand a path to the OS opener and wait just long enough to learn whether
+/// it actually took: a missing `xdg-open` or an app that refuses the file
+/// is a user-visible failure, not a terminal-only one.
+fn open_with_os(path: &std::path::Path) -> Result<(), String> {
     #[cfg(target_os = "macos")]
-    let spawned = std::process::Command::new("open").arg(path).spawn();
+    let mut cmd = {
+        let mut c = std::process::Command::new("open");
+        c.arg(path);
+        c
+    };
     #[cfg(target_os = "windows")]
-    let spawned = std::process::Command::new("cmd")
-        .args(["/C", "start", "", path])
-        .spawn();
+    let mut cmd = {
+        let mut c = std::process::Command::new("cmd");
+        c.arg("/C").arg("start").arg("").arg(path);
+        c
+    };
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let spawned = std::process::Command::new("xdg-open").arg(path).spawn();
-    if let Err(e) = spawned {
-        eprintln!("bysyc: OS opener failed for {}: {e}", path.display());
+    let mut cmd = {
+        let mut c = std::process::Command::new("xdg-open");
+        c.arg(path);
+        c
+    };
+    let status = cmd
+        .status()
+        .map_err(|e| format!("OS opener failed to start: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("OS opener exited with {status}"))
     }
 }
 
@@ -999,6 +1267,7 @@ fn set_upload_on(m: &mut MainState, id: u64, f: impl FnOnce(&mut UploadStatus)) 
 }
 
 fn fail_upload(state: &Arc<Mutex<ClientState>>, id: u64, why: String) {
+    clear_upload_cancel(id);
     let mut st = guard(state);
     if let Some(m) = st.main_mut() {
         set_upload_on(m, id, |u| u.phase = UploadPhase::Failed(why));
@@ -1006,6 +1275,7 @@ fn fail_upload(state: &Arc<Mutex<ClientState>>, id: u64, why: String) {
 }
 
 fn drop_upload(state: &Arc<Mutex<ClientState>>, id: u64) {
+    clear_upload_cancel(id);
     let mut st = guard(state);
     if let Some(m) = st.main_mut() {
         m.uploads.retain(|u| u.id != id);
@@ -1025,6 +1295,46 @@ fn notice(state: &Arc<Mutex<ClientState>>, msg: String) {
     if let Some(m) = guard(state).main_mut() {
         m.notice = Some(msg);
     }
+}
+
+// -- Upload cancellation ------------------------------------------------------
+
+/// Flag an in-flight upload as cancelled (the strip's "x" on an active
+/// row); the running pipeline notices at its next checkpoint.
+fn request_upload_cancel(id: u64) {
+    CANCELLED_UPLOADS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(id);
+}
+
+/// Has the user cancelled this upload?
+fn upload_cancelled(id: u64) -> bool {
+    CANCELLED_UPLOADS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .contains(&id)
+}
+
+/// Terminal-path tidy-up so the flag set never outlives its upload (the
+/// three funnels are `fail_upload`, `drop_upload`, and the Done phase).
+fn clear_upload_cancel(id: u64) {
+    CANCELLED_UPLOADS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&id);
+}
+
+/// Cancel checkpoint for the send pipeline: when the strip's "x" flagged
+/// this upload, consume the flag, pull any optimistic row, and stop
+/// tracking the upload. `true` = caller returns without sending anything.
+fn upload_stopped(state: &Arc<Mutex<ClientState>>, id: u64, ch: i64, temp: i64) -> bool {
+    if !upload_cancelled(id) {
+        return false;
+    }
+    remove_temp(state, ch, temp);
+    drop_upload(state, id); // clears the flag too
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -1071,5 +1381,49 @@ mod tests {
         assert_eq!(absolute("http://x", "http://cdn/y"), "http://cdn/y");
         assert_eq!(absolute("http://x/", "/z"), "http://x/z");
         assert_eq!(absolute("http://x", "z"), "http://x/z");
+    }
+
+    #[test]
+    fn file_op_rows_track_their_lifecycle() {
+        // Working → Working → Done/Failed → dropped, addressed by id.
+        let id = push_file_op("report.pdf", FileOpPhase::Choosing);
+        set_file_op_phase(id, FileOpPhase::Downloading);
+        {
+            let ops = file_ops();
+            let op = ops.iter().find(|o| o.id == id).unwrap();
+            assert_eq!(op.status, FileOpStatus::Working(FileOpPhase::Downloading));
+        }
+        fail_file_op(
+            &Arc::new(Mutex::new(ClientState::new())),
+            id,
+            "open failed",
+            "HTTP 404".into(),
+        );
+        {
+            let ops = file_ops();
+            let op = ops.iter().find(|o| o.id == id).unwrap();
+            assert_eq!(
+                op.status,
+                FileOpStatus::Failed("open failed: HTTP 404".into())
+            );
+        }
+        finish_file_op(id, "saved to /tmp/x".into());
+        {
+            let ops = file_ops();
+            let op = ops.iter().find(|o| o.id == id).unwrap();
+            assert_eq!(op.status, FileOpStatus::Done("saved to /tmp/x".into()));
+        }
+        drop_file_op(id);
+        assert!(file_ops().iter().all(|o| o.id != id));
+    }
+
+    #[test]
+    fn upload_cancel_flags_round_trip() {
+        // An id no real upload can reach, so parallel tests never collide.
+        let id = 1 << 62;
+        request_upload_cancel(id);
+        assert!(upload_cancelled(id));
+        clear_upload_cancel(id);
+        assert!(!upload_cancelled(id));
     }
 }

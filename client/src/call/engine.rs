@@ -55,6 +55,10 @@ use crate::net::{NetHandle, next_msg_id};
 pub const MAX_PARTICIPANTS: usize = 6;
 /// Main loop cadence floor; also the audio pump period (20 ms frames).
 const TICK: Duration = Duration::from_millis(20);
+/// How long an outgoing private call rings with nobody picking up before
+/// the session ends with "no answer" (the callee's prompt auto-declines at
+/// the same duration).
+const NO_ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
 /// Opus payload type in str0m's default codec config; both endpoints run
 /// this client, so the static PT is exactly negotiated.
 const OPUS_PT: u8 = 111;
@@ -93,6 +97,11 @@ pub struct UiState {
     pub status: Mutex<String>,
     /// True while TURN relays this call (status decoration).
     pub relayed: AtomicBool,
+    /// True once the engine thread has left the session loop on ANY exit
+    /// path (peer hangup, ICE death, no-answer timeout, startup failure,
+    /// even a panic unwind). The overlay polls it and tears the registry
+    /// entry down, so the chrome cannot linger over a dead session.
+    pub finished: AtomicBool,
 }
 
 impl UiState {
@@ -105,6 +114,7 @@ impl UiState {
             audio_error: Mutex::new(None),
             status: Mutex::new("connecting…".to_string()),
             relayed: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
         }
     }
 
@@ -220,7 +230,13 @@ pub struct SessionCore {
     new_sinks: Vec<Arc<PeerSink>>,
     /// Sinks removed since the last take (engine unsubscribes them).
     dropped_sinks: Vec<Arc<PeerSink>>,
+    /// Outgoing private call we dialed that has not connected yet; drives
+    /// the no-answer timeout. Cleared by the first connected peer.
+    awaiting_answer: bool,
     ended: bool,
+    /// Status line the engine shows when the session ends on its own
+    /// (`None` → the generic "call ended").
+    end_status: Option<&'static str>,
 }
 
 impl SessionCore {
@@ -241,7 +257,9 @@ impl SessionCore {
             frame_acc: Vec::new(),
             new_sinks: Vec::new(),
             dropped_sinks: Vec::new(),
+            awaiting_answer: false,
             ended: false,
+            end_status: None,
         }
     }
 
@@ -322,6 +340,8 @@ impl SessionCore {
             return;
         }
         self.private_peer = Some(peer.clone());
+        // Only the dialing side rings; the callee's session is answering.
+        self.awaiting_answer = offer;
         self.create_peer(peer, offer, out);
     }
 
@@ -753,9 +773,13 @@ impl SessionCore {
     }
 
     /// Remove peers whose Rtc has closed. In a private call losing the only
-    /// peer ends the session.
+    /// peer ends the session, and an outgoing call that never connected
+    /// ends with "no answer" once the ring window passes.
     fn prune_dead(&mut self, now: Instant) {
-        let private = self.kind == CallKind::Private;
+        if self.peers.iter().any(|p| p.connected) {
+            // Media flowed; the ring window no longer applies.
+            self.awaiting_answer = false;
+        }
         self.peers.retain(|p| {
             let dead = !p.rtc.is_alive();
             if dead {
@@ -763,12 +787,21 @@ impl SessionCore {
             }
             !dead
         });
-        if private
-            && self.peers.is_empty()
-            && now.duration_since(self.clock0) > Duration::from_secs(15)
-        {
+        if self.kind != CallKind::Private {
+            return;
+        }
+        let elapsed = now.duration_since(self.clock0);
+        if self.awaiting_answer && elapsed > NO_ANSWER_TIMEOUT {
+            // We dialed and nobody picked up within the ring window.
+            self.awaiting_answer = false;
+            self.end_status = Some("no answer");
+            self.ended = true;
+        } else if self.peers.is_empty() && elapsed > Duration::from_secs(15) {
             // The peer connection died without a Hangup signal; end the
             // private call after the ICE grace period.
+            if self.awaiting_answer {
+                self.end_status = Some("no answer");
+            }
             self.ended = true;
         }
     }
@@ -922,10 +955,28 @@ pub fn spawn_session(cfg: SessionConfig) -> SessionHandle {
         });
     }
     let ui_thread = ui.clone();
-    let _ = std::thread::Builder::new()
+    let spawned = std::thread::Builder::new()
         .name("bysyc-call".to_string())
         .spawn(move || run(cfg, rx, ui_thread));
+    if spawned.is_err() {
+        // No thread to raise the flag via the drop guard: publish the end
+        // here so the overlay tears the entry down instead of showing a
+        // "connecting…" window forever.
+        ui.set_status("call failed to start");
+        ui.finished.store(true, Ordering::Relaxed);
+    }
     SessionHandle { cmd: tx, ui }
+}
+
+/// Sets [`UiState::finished`] when dropped, so that every exit from `run`
+/// — early return, loop break, even a panic unwind — publishes that the
+/// call is over and the registry entry may be torn down.
+struct FinishOnDrop(Arc<UiState>);
+
+impl Drop for FinishOnDrop {
+    fn drop(&mut self) {
+        self.0.finished.store(true, Ordering::Relaxed);
+    }
 }
 
 fn send_signal(net: &NetHandle, call_id: i64, to: i64, kind: CallSignalKind) {
@@ -954,10 +1005,15 @@ fn local_ips() -> Vec<std::net::IpAddr> {
 }
 
 fn run(cfg: SessionConfig, rx: std::sync::mpsc::Receiver<SessionCmd>, ui: Arc<UiState>) {
+    // Publishes `finished` on every exit path below (including this
+    // function's early returns and any panic unwind).
+    let _finished = FinishOnDrop(ui.clone());
+
     // Socket every peer and the TURN client share.
     let socket = match UdpSocket::bind("0.0.0.0:0") {
         Ok(s) => s,
         Err(e) => {
+            ui.set_status("call failed");
             ui.set_audio_error(Some(format!("call socket: {e}")));
             return;
         }
@@ -1148,7 +1204,7 @@ fn run(cfg: SessionConfig, rx: std::sync::mpsc::Receiver<SessionCmd>, ui: Arc<Ui
     core.shutdown(&mut out);
     flush_signals(&cfg.net, cfg.call_id, &out);
     drop(audio);
-    ui.set_status("call ended");
+    ui.set_status(core.end_status.unwrap_or("call ended"));
 }
 
 fn refresh_ui(core: &SessionCore, ui: &UiState, relay: bool, have_audio: bool) {
@@ -1390,6 +1446,67 @@ mod tests {
         p.b.handle_signal(me_a.id, CallSignalKind::Hangup, &mut Vec::new());
         assert!(p.b.ended());
         assert_eq!(p.b.take_dropped_sinks().len(), 1);
+    }
+
+    #[test]
+    fn unanswered_private_call_times_out() {
+        let t0 = Instant::now();
+        let peer = account(2, "b");
+        let mut core = SessionCore::new(1, CallKind::Private, t0);
+        core.set_local(&["127.0.0.1:47001".parse().unwrap()], &mut Vec::new());
+        core.start_private(&peer, true, &mut Vec::new()); // we dialed
+        core.drive(t0 + Duration::from_secs(5), &mut Vec::new());
+        assert!(!core.ended());
+        core.drive(
+            t0 + NO_ANSWER_TIMEOUT + Duration::from_secs(1),
+            &mut Vec::new(),
+        );
+        assert!(core.ended());
+        assert_eq!(core.end_status, Some("no answer"));
+    }
+
+    #[test]
+    fn ring_timeout_applies_only_to_the_caller() {
+        // The answering side never rings, so it must not time out.
+        let t0 = Instant::now();
+        let peer = account(1, "a");
+        let mut core = SessionCore::new(2, CallKind::Private, t0);
+        core.set_local(&["127.0.0.1:48001".parse().unwrap()], &mut Vec::new());
+        core.start_private(&peer, false, &mut Vec::new());
+        core.drive(
+            t0 + NO_ANSWER_TIMEOUT + Duration::from_secs(1),
+            &mut Vec::new(),
+        );
+        assert!(!core.ended());
+        assert_eq!(core.end_status, None);
+    }
+
+    #[test]
+    fn answered_private_call_escapes_ring_timeout() {
+        let me_a = account(1, "alice");
+        let me_b = account(2, "bob");
+        let mut p = Pair::new(me_a.id, me_b.id);
+        p.begin_private(&me_a, &me_b);
+        p.connect();
+        // Long past the ring window the caller is still in the call.
+        let mut sends = Vec::new();
+        p.a.drive(
+            p.t0 + NO_ANSWER_TIMEOUT + Duration::from_secs(5),
+            &mut sends,
+        );
+        assert!(!p.a.ended());
+        assert_eq!(p.a.end_status, None);
+    }
+
+    #[test]
+    fn finish_guard_marks_ui_finished() {
+        let ui = Arc::new(UiState::new(1, CallKind::Private));
+        assert!(!ui.finished.load(Ordering::Relaxed));
+        {
+            let _guard = FinishOnDrop(ui.clone());
+            assert!(!ui.finished.load(Ordering::Relaxed));
+        }
+        assert!(ui.finished.load(Ordering::Relaxed));
     }
 
     #[test]

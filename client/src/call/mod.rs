@@ -14,7 +14,9 @@ pub mod engine;
 pub mod turn;
 pub mod ui;
 
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 use bysyc_common::protocol::{AccountBrief, CallSignalKind, WsClientBody, WsClientMsg};
 
@@ -33,6 +35,9 @@ pub struct Incoming {
     pub from: AccountBrief,
     pub call_id: i64,
     pub sdp: String,
+    /// When the offer arrived; the overlay auto-declines once the ring
+    /// window passes.
+    pub arrived: Instant,
 }
 
 struct Active {
@@ -83,6 +88,7 @@ pub fn incoming_call() -> Option<Incoming> {
         from: i.from.clone(),
         call_id: i.call_id,
         sdp: i.sdp.clone(),
+        arrived: i.arrived,
     })
 }
 
@@ -273,7 +279,12 @@ pub fn accept_incoming(state: &Arc<Mutex<ClientState>>, rt: &tokio::runtime::Han
     }
     drop(reg);
 
-    let Incoming { from, call_id, sdp } = incoming;
+    let Incoming {
+        from,
+        call_id,
+        sdp,
+        arrived: _,
+    } = incoming;
     let from_id = from.id;
     replace_session(
         state,
@@ -351,6 +362,7 @@ pub fn route_signal(
                     },
                     call_id,
                     sdp,
+                    arrived: Instant::now(),
                 });
             }
         }
@@ -408,5 +420,21 @@ pub fn teardown_if_disconnected(state: &Arc<Mutex<ClientState>>) {
     drop(reg);
     if stale {
         teardown(state, false);
+    }
+}
+
+/// Tear the session down when the engine reports the call finished on its
+/// own (peer hangup, ICE death, no-answer timeout, engine crash). Without
+/// this the overlay would keep rendering live Mute/Leave buttons — or a
+/// "connecting…" window — over a session whose thread is already gone.
+pub fn teardown_if_finished(state: &Arc<Mutex<ClientState>>) {
+    let finished = {
+        let reg = registry().lock().unwrap_or_else(|p| p.into_inner());
+        reg.active
+            .as_ref()
+            .is_some_and(|a| a.handle.ui.finished.load(Ordering::Relaxed))
+    };
+    if finished {
+        teardown(state, true);
     }
 }

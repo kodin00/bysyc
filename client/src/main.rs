@@ -26,10 +26,12 @@ fn main() -> eframe::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1100.0, 720.0])
+            // The app opens on the login form: start compact (either tab
+            // fits without scrolling) and let the user resize or maximize.
+            .with_inner_size([480.0, 560.0])
             // Floor for the three-column layout + composer: below this the
             // side columns (each ≥ 140 px) starve the chat area.
-            .with_min_inner_size([640.0, 420.0])
+            .with_min_inner_size([480.0, 360.0])
             .with_title("bysyc"),
         ..Default::default()
     };

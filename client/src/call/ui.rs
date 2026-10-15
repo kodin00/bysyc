@@ -14,16 +14,24 @@ use eframe::egui;
 
 use super::{
     accept_incoming, decline_incoming, incoming_call, leave_active_call, live_call, sync_roster,
-    teardown_if_disconnected,
+    teardown_if_disconnected, teardown_if_finished,
 };
 use crate::state::ClientState;
+
+/// How long the incoming-call prompt rings before auto-declining (the
+/// caller's side gives up with "no answer" at the same duration).
+const RING_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Rendered every frame after the main view.
 pub fn overlay(ctx: &egui::Context, state: &Arc<Mutex<ClientState>>, rt: &tokio::runtime::Handle) {
     // 1. Connection-level teardown (logout / reconnect kills signaling).
     teardown_if_disconnected(state);
 
-    // 2. Drain relayed call signals.
+    // 2. Engine-reported end (peer hangup, ICE death, no answer): drop the
+    //    registry entry so the chrome disappears with the session.
+    teardown_if_finished(state);
+
+    // 3. Drain relayed call signals.
     let signals = {
         let mut st = state.lock().unwrap_or_else(|p| p.into_inner());
         st.main_mut()
@@ -34,15 +42,35 @@ pub fn overlay(ctx: &egui::Context, state: &Arc<Mutex<ClientState>>, rt: &tokio:
         super::route_signal(from, call_id, kind, state);
     }
 
-    // 3. Voice roster → engine (channel calls).
+    // 4. Voice roster → engine (channel calls).
     sync_roster(state);
 
-    // 4. Chrome.
+    // 5. Chrome.
     let live = live_call();
-    let incoming = incoming_call();
+    let mut incoming = incoming_call();
     if live.is_some() || incoming.is_some() {
         // Call state changes on the engine thread at 20 ms cadence.
         ctx.request_repaint_after(Duration::from_millis(100));
+    }
+    // Ring out: a prompt older than the window declines itself so the
+    // caller stops ringing.
+    if incoming
+        .as_ref()
+        .is_some_and(|i| i.arrived.elapsed() > RING_TIMEOUT)
+    {
+        decline_incoming(state);
+        incoming = None;
+    }
+    // Keyboard: Escape declines a ringing prompt, or — with no prompt up
+    // and no text field holding focus, so typing in chat can never drop
+    // the call — leaves the live call.
+    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        if incoming.is_some() {
+            decline_incoming(state);
+            incoming = None;
+        } else if live.is_some() && ctx.memory(|m| m.focused().is_none()) {
+            leave_active_call(state, rt);
+        }
     }
     if let Some(live) = &live {
         call_window(ctx, state, rt, live.call_id, &live.ui);
@@ -152,5 +180,6 @@ fn incoming_window(
                     decline_incoming(state);
                 }
             });
+            ui.weak("esc to decline");
         });
 }
