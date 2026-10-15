@@ -174,8 +174,11 @@ pub struct MainState {
     /// Decoded [`Envelope::File`] payloads keyed by MESSAGE id: the
     /// attachment's content key/nonce exist only inside the E2EE envelope,
     /// so this map is what lets the UI fetch, decrypt and render files
-    /// (see [`crate::views::attachments`]). Not persisted; rows fall back
-    /// to their stored "[file: …]" plaintext after a restart.
+    /// (see [`crate::views::attachments`]). Not persisted itself, but every
+    /// producer also stores the envelope JSON in the local store, and
+    /// [`MainState::backfill_plaintexts`] rebuilds this map from it — so
+    /// rows keep their chip and preview after a restart instead of falling
+    /// back to the stored "[file: …]" plaintext.
     pub file_meta: HashMap<i64, Envelope>,
     /// Live attachment uploads for the composer strip.
     pub uploads: Vec<UploadStatus>,
@@ -458,9 +461,11 @@ impl MainState {
             }
             Decrypted::File(fe) => {
                 // The attachment's key/nonce live only in this envelope:
-                // stash it (C4's UI renders from `file_meta`), then persist
-                // the placeholder text like any other row.
+                // stash it (C4's UI renders from `file_meta`), persist it
+                // so the row survives a restart, then store the placeholder
+                // text like any other row.
                 let line = file_row_text(&fe);
+                persist_file_envelope(store, dto.id, &fe);
                 self.file_meta.insert(dto.id, fe);
                 guard(store).set_plaintext(dto.id, &line).ok();
             }
@@ -536,11 +541,22 @@ impl MainState {
     }
 
     /// Retry decryption for cached history rows that still have no plaintext
-    /// (e.g. loaded before the session share arrived). Store writes happen
-    /// strictly after the engine calls — never under the store lock — for
-    /// the same lock-order reason as [`MainState::apply_chat_message`].
-    /// File envelopes additionally land in [`MainState::file_meta`].
+    /// (e.g. loaded before the session share arrived), and rebuild
+    /// [`MainState::file_meta`] from the envelopes persisted in the store —
+    /// attachment rows from earlier runs already carry their placeholder
+    /// plaintext, so the retry loop below would never visit them again (and
+    /// our own sent rows are outside it by design: the engine holds no
+    /// self-import). Store writes happen strictly after the engine calls —
+    /// never under the store lock — for the same lock-order reason as
+    /// [`MainState::apply_chat_message`].
     pub fn backfill_plaintexts(&mut self, store: &Arc<Mutex<Store>>, channel_id: i64) {
+        for (id, json) in guard(store).file_envelopes(channel_id) {
+            if !self.file_meta.contains_key(&id) {
+                if let Ok(fe) = Envelope::from_json(&json) {
+                    self.file_meta.insert(id, fe);
+                }
+            }
+        }
         let Some(engine) = self.engine.clone() else {
             return;
         };
@@ -554,6 +570,7 @@ impl MainState {
                 Decrypted::Text(text) => decrypted.push((id, text)),
                 Decrypted::File(fe) => {
                     let line = file_row_text(&fe);
+                    persist_file_envelope(store, id, &fe);
                     self.file_meta.insert(id, fe);
                     decrypted.push((id, line));
                 }
@@ -594,6 +611,20 @@ fn decrypt_envelope_text(engine: &Engine, channel: i64, sender: i64, content: &s
         Ok(fe @ Envelope::File { .. }) => Decrypted::File(fe),
         Ok(Envelope::Delete { target }) => Decrypted::Deleted(target),
         Ok(Envelope::SessionShare { .. }) | Err(_) => Decrypted::Failed,
+    }
+}
+
+/// Persist a File envelope next to its message row so attachment rendering
+/// survives a restart: `file_meta` is RAM-only, sender rows can never be
+/// re-decrypted (the engine holds no Megolm self-import), and receiver rows
+/// leave the `undecrypted` retry set once their plaintext lands. A failure
+/// only costs the chip after the next restart, so it is logged, not
+/// propagated.
+fn persist_file_envelope(store: &Arc<Mutex<Store>>, msg_id: i64, fe: &Envelope) {
+    if let Ok(json) = fe.to_json() {
+        if let Err(e) = guard(store).set_file_envelope(msg_id, &json) {
+            eprintln!("bysyc: persisting file envelope for message {msg_id} failed: {e}");
+        }
     }
 }
 
@@ -854,6 +885,7 @@ mod tests {
                 name: "cat.png".into(),
                 size: 12361,
                 nonce: "bm9uY2U=".into(),
+                encrypted: true,
             }),
             created_at_ms: 1,
         };
@@ -878,6 +910,47 @@ mod tests {
             guard(&store).plaintext(MSG).as_deref(),
             Some("[file: cat.png (12.1 KiB)]")
         );
+    }
+
+    /// The restart path for attachments: rows sent or decrypted in an
+    /// earlier run already carry their plaintext (so the undecrypted-retry
+    /// set is empty), and only the persisted envelope can bring the chip
+    /// back. The rebuild runs even without an engine — it touches no crypto.
+    #[test]
+    fn file_envelopes_rebuild_meta_after_restart() {
+        const CH: i64 = 101;
+        const MSG: i64 = 77;
+        let store = Arc::new(Mutex::new(
+            Store::open(std::path::Path::new(":memory:")).expect("open store"),
+        ));
+        let fe = Envelope::File {
+            name: "cat.png".into(),
+            size: 12345,
+            nonce: "bm9uY2U=".into(),
+            key: "a2V5".into(),
+            attachment_id: 300,
+        };
+        {
+            let s = guard(&store);
+            let _ = s.append_message(&bysyc_common::protocol::MessageDto {
+                id: MSG,
+                channel_id: CH,
+                sender_id: 7,
+                kind: MessageKind::Chat,
+                content: "ct".into(),
+                reply_to: None,
+                attachment: None,
+                created_at_ms: 1,
+            });
+            let _ = s.set_file_envelope(MSG, &fe.to_json().unwrap());
+            let _ = s.set_plaintext(MSG, &file_row_text(&fe));
+        }
+        // A "restarted" world: empty `file_meta`, nothing left to decrypt.
+        let mut m = world();
+        assert!(m.file_meta.is_empty());
+        assert!(guard(&store).undecrypted(CH).is_empty());
+        m.backfill_plaintexts(&store, CH);
+        assert_eq!(m.file_meta.get(&MSG), Some(&fe));
     }
 }
 
@@ -1056,6 +1129,20 @@ pub fn apply_server_msg(
                     }
                 }
             }
+        }
+        WsServerBody::MessageDeleted {
+            channel_id,
+            message_id,
+        } => {
+            // Drop the row from the live cache and SQLite alike; the
+            // deleter's own UI already did both when its DELETE returned
+            // (the broadcast reaches them too), so this may be a repeat —
+            // both removals are idempotent. A message we never had (a
+            // channel opened after the delete) is a no-op on either side.
+            if let Some(m) = st.main_mut() {
+                m.remove_message(channel_id, message_id);
+            }
+            let _ = guard(store).delete_message(message_id);
         }
         WsServerBody::MailboxAppend(item) => {
             if let Some(m) = st.main_mut() {

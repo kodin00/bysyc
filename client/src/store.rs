@@ -47,6 +47,10 @@ CREATE TABLE IF NOT EXISTS messages(
     deleted        INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel_id);
+CREATE TABLE IF NOT EXISTS file_envelopes(
+    message_id INTEGER PRIMARY KEY,
+    envelope   TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS friends(
     id           INTEGER PRIMARY KEY,
     username     TEXT NOT NULL,
@@ -303,6 +307,42 @@ impl Store {
         let Ok(rows) = stmt.query_map(params![channel_id], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?))
         }) else {
+            return Vec::new();
+        };
+        rows.filter_map(|r| r.ok()).collect()
+    }
+
+    // -- file envelopes (C4 persistence) ---------------------------------------
+
+    /// Persist the JSON of a decrypted [`crate::crypto::Envelope::File`]
+    /// next to its message row. The attachment's key/nonce exist only
+    /// inside that envelope, and it is written at send/decrypt time so an
+    /// attachment row survives a restart without re-decrypting — the
+    /// sender's own rows cannot be re-decrypted at all (the engine holds
+    /// no Megolm self-import).
+    pub fn set_file_envelope(&self, msg_id: i64, envelope: &str) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO file_envelopes(message_id, envelope) VALUES(?1, ?2)
+                 ON CONFLICT(message_id) DO UPDATE SET envelope = excluded.envelope",
+                params![msg_id, envelope],
+            )
+            .map_err(|e| format!("file_envelopes: {e}"))?;
+        Ok(())
+    }
+
+    /// `(message_id, envelope JSON)` of every visible (not deleted) message
+    /// in a channel that has a persisted File envelope — the rebuild set
+    /// for [`crate::state::MainState::file_meta`] after a restart.
+    pub fn file_envelopes(&self, channel_id: i64) -> Vec<(i64, String)> {
+        let Ok(mut stmt) = self.conn.prepare(
+            "SELECT fe.message_id, fe.envelope FROM file_envelopes fe
+             JOIN messages m ON m.id = fe.message_id
+             WHERE m.channel_id = ?1 AND m.deleted = 0",
+        ) else {
+            return Vec::new();
+        };
+        let Ok(rows) = stmt.query_map(params![channel_id], |r| Ok((r.get(0)?, r.get(1)?))) else {
             return Vec::new();
         };
         rows.filter_map(|r| r.ok()).collect()
@@ -730,6 +770,30 @@ mod tests {
         s.clear_pickles().unwrap();
         assert!(s.pickle("olm_account").is_none());
         assert!(s.pickle("megolm_out").is_none());
+    }
+
+    #[test]
+    fn file_envelopes_roundtrip_per_channel_and_skip_deleted() {
+        let s = tmp_store("file-env");
+        s.append_message(&msg(1, 10)).unwrap();
+        s.append_message(&msg(2, 20)).unwrap();
+        s.set_file_envelope(1, r#"{"file":{"name":"a"}}"#).unwrap();
+        s.set_file_envelope(2, r#"{"file":{"name":"b"}}"#).unwrap();
+        // Scoped to the channel, envelope JSON verbatim.
+        assert_eq!(
+            s.file_envelopes(10),
+            vec![(1, r#"{"file":{"name":"a"}}"#.to_string())]
+        );
+        assert_eq!(
+            s.file_envelopes(20),
+            vec![(2, r#"{"file":{"name":"b"}}"#.to_string())]
+        );
+        // One row per message: a re-write replaces, never duplicates.
+        s.set_file_envelope(1, r#"{"file":{"name":"a2"}}"#).unwrap();
+        assert_eq!(s.file_envelopes(10).len(), 1);
+        // A deleted message's envelope is not rebuilt after a restart.
+        s.delete_message(1).unwrap();
+        assert!(s.file_envelopes(10).is_empty());
     }
 
     #[test]

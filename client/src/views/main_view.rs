@@ -7,8 +7,9 @@
 //!   decline requests, open DMs, add by username).
 //! - right: message history of the selected channel or DM plus the composer
 //!   (Enter sends, Shift+Enter breaks the line; attached or dropped files
-//!   queue above it and ride the next send; an emoji picker inserts at the
-//!   caret — see [`emoji`]).
+//!   queue above it and ride the next send; emoji arrive via the OS IME
+//!   and render through the Noto Emoji fallback installed in
+//!   [`crate::app`]).
 //!
 //! History is loaded from SQLite first, then merged with a REST page on
 //! first open; sends are optimistic (negative temp ids, pinned at the tail)
@@ -34,7 +35,6 @@ use crate::net::{self, NetHandle};
 use crate::state::{ClientState, ConnStatus, Selection, TYPING_TTL_SECS, guard, now_ms};
 use crate::store::Store;
 use crate::views::attachments;
-use crate::views::emoji;
 
 /// View-lifetime UI state (input buffers, throttles).
 pub struct MainView {
@@ -105,9 +105,10 @@ pub struct MainView {
     pub guild_popup_focus: bool,
     /// Focus the new-channel name field on the popup's next frame.
     pub channel_popup_focus: bool,
-    /// Composer emoji picker open? Reset on channel switch and when the
-    /// chat column is left (the draft it feeds is per channel).
-    pub emoji_picker_open: bool,
+    /// Armed message deletions: message id → when the trash button was
+    /// clicked. The confirming "yes" within [`DELETE_CONFIRM_TTL`] fires
+    /// the delete.
+    pub msg_delete_confirm: Option<(i64, Instant)>,
 }
 
 /// A "Load older" scroll anchor (see [`MainView::load_anchor`]): keeps the
@@ -158,7 +159,7 @@ impl MainView {
             attach_rx,
             guild_popup_focus: false,
             channel_popup_focus: false,
-            emoji_picker_open: false,
+            msg_delete_confirm: None,
         }
     }
 }
@@ -184,10 +185,16 @@ pub fn show(app: &mut BysycApp, ui: &mut egui::Ui) {
         .max_size(400.0)
         .show(ui, |ui| nav(ui, state, store, rt, main_view, &ctx));
 
+    // The middle column's minimum (and first-run default) is its intrinsic
+    // width — the widest visible row measured against the live state, so
+    // no channel name or DM row ever wraps or truncates. egui clamps the
+    // persisted width into [min, max] every frame, so a min that grows
+    // with content also pulls the panel wider as needed.
+    let mid_min = middle_min_width(&ctx, ui.style(), state);
     egui::Panel::left("middle")
         .resizable(true)
-        .default_size(210.0)
-        .min_size(140.0)
+        .default_size(mid_min)
+        .min_size(mid_min)
         .max_size(400.0)
         .show(ui, |ui| middle(ui, state, rt, main_view, &ctx));
 
@@ -225,8 +232,8 @@ fn nav(
         )
     };
 
-    ui.heading("bysyc");
-    ui.add_space(6.0);
+    ui.heading("Guilds");
+    ui.separator();
 
     // The guild/friends/DM list scrolls when it outgrows the column; the
     // heading above and the Log out button below stay pinned.
@@ -593,6 +600,131 @@ fn invite_window(state: &Arc<Mutex<ClientState>>, ctx: &egui::Context) {
 // ---------------------------------------------------------------------------
 // Middle column: channels of the guild, DM info, or friends panel
 // ---------------------------------------------------------------------------
+
+/// The middle column's intrinsic width: the widest row the current state
+/// can render in it, so every label fits unwrapped and untruncated. All
+/// three panes (guild channels, DM info, friends) are measured — not just
+/// the visible one — so switching selections never changes the minimum
+/// and the column doesn't lurch wider or narrower.
+///
+/// Per-frame measurement is cheap: galley layout caches by (text, font)
+/// inside the fonts object, so steady-state frames are cache hits. The
+/// panel clamps its persisted width to [this, 400] every frame, so a
+/// growing minimum protects new content and a shrinking one lets the
+/// user narrow the column again.
+///
+/// Widths come from `layout_no_wrap` plus the chrome egui wraps each
+/// widget in: button-ish widgets (buttons and selectable labels, selected
+/// or not) frame their content with `button_padding + expansion` on each
+/// side; plain labels add nothing; siblings separate by `item_spacing.x`.
+/// A trailing allowance covers the panel frame's inner margin, the
+/// scrollbar the channel list may show, and slack for the bg-stroke
+/// subtraction egui applies to button frames (skipping it above errs
+/// wide, the safe direction).
+fn middle_min_width(
+    ctx: &egui::Context,
+    style: &egui::Style,
+    state: &Arc<Mutex<ClientState>>,
+) -> f32 {
+    let (my_id, guilds, dms, friends, incoming, outgoing, voice) = {
+        let st = guard(state);
+        let Some(m) = st.main() else {
+            return 140.0;
+        };
+        (
+            m.account.id,
+            m.guilds.clone(),
+            m.dms.clone(),
+            m.friends.clone(),
+            m.incoming_requests.clone(),
+            m.outgoing_requests.clone(),
+            m.voice
+                .iter()
+                .map(|(ch, ps)| (*ch, ps.len(), ps.iter().any(|p| p.id == m.account.id)))
+                .collect::<Vec<(i64, usize, bool)>>(),
+        )
+    };
+
+    let body = egui::TextStyle::Body.resolve(style);
+    let button = egui::TextStyle::Button.resolve(style);
+    let small = egui::TextStyle::Small.resolve(style);
+    let heading = egui::TextStyle::Heading.resolve(style);
+    let text_w = |t: &str, f: &egui::FontId| {
+        ctx.fonts_mut(|fs| {
+            fs.layout_no_wrap(t.to_owned(), f.clone(), egui::Color32::PLACEHOLDER)
+                .size()
+                .x
+        })
+    };
+    // Button/selectable-label chrome: `button_padding + expansion` on each
+    // side of the content (the resting — inactive — widget state).
+    let pad = 2.0 * (style.spacing.button_padding.x + style.visuals.widgets.inactive.expansion);
+    let gap = style.spacing.item_spacing.x;
+    let btn = |t: &str, f: &egui::FontId| text_w(t, f) + pad;
+
+    let mut w = 0.0f32;
+
+    // Guild-channel pane: the guild heading, the owner's button strip, and
+    // every channel row (text and voice labels reproduced as rendered,
+    // including the live call count). The owner's delete control widens a
+    // row by "×" at rest and by "yes"/"no" while armed — take the wider.
+    for g in &guilds {
+        w = w.max(text_w(&g.name, &heading));
+        if g.owner_id == my_id {
+            w = w.max(btn("+ channel", &small) + gap + btn("invite", &small));
+        }
+        for c in &g.channels {
+            let label = match c.kind {
+                ChannelKind::Text => format!("# {}", c.name),
+                ChannelKind::Voice => match voice.iter().find(|(ch, _, _)| *ch == c.id) {
+                    Some((_, n, true)) => format!("(v) {} — {n} in call  [leave]", c.name),
+                    Some((_, n, false)) => format!("(v) {} — {n} in call", c.name),
+                    None => format!("(v) {} — 0 in call", c.name),
+                },
+                ChannelKind::Dm => continue,
+            };
+            let mut row = text_w(&label, &body) + pad; // selectable_label
+            if g.owner_id == my_id {
+                let rest = btn("×", &small);
+                let armed = btn("yes", &small) + gap + btn("no", &small);
+                row += gap + rest.max(armed);
+            }
+            w = w.max(row);
+        }
+    }
+
+    // DM pane: peer heading, the E2EE note, the call button.
+    for d in &dms {
+        w = w.max(text_w(&format!("@{}", d.peer.username), &heading));
+    }
+    w = w.max(text_w("private, end-to-end encrypted", &body) + gap + btn("Call", &button));
+
+    // Friends pane: headings, request rows with their action buttons,
+    // friend rows, and the add-friend strip (fixed 130-wide input).
+    w = w.max(text_w("Friends", &heading));
+    w = w.max(text_w("Incoming requests", &button));
+    w = w.max(text_w("Sent requests", &button));
+    let dot = text_w("●", &body);
+    for f in incoming.iter().chain(&friends) {
+        let mut row = dot + gap + text_w(&f.username, &body);
+        row += gap + btn("Accept", &button) + gap + btn("Decline", &button);
+        w = w.max(row);
+    }
+    for f in &outgoing {
+        w = w.max(text_w(&f.username, &body) + gap + btn("cancel", &small));
+    }
+    if !friends.is_empty() {
+        // A friend row also carries the "Message" button (no presence-dot
+        // width difference — same dot either way).
+        w = w.max(dot + gap + text_w(&friends[0].username, &body) + gap + btn("Message", &button));
+    }
+    w = w.max(130.0 + gap + btn("Send request", &button));
+
+    // Panel chrome: default side-panel frame inner margin (8 each side),
+    // the scrollbar the list may show, and slack for stroke rounding.
+    let chrome = 2.0 * 8.0 + style.spacing.scroll.allocated_width() + 8.0;
+    (w + chrome).clamp(140.0, 400.0)
+}
 
 fn middle(
     ui: &mut egui::Ui,
@@ -993,6 +1125,18 @@ const ICON_SEND: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="24"
 /// "Attach file" paper-clip icon, same white-stroke convention as
 /// [`ICON_SEND`].
 const ICON_ATTACH: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><path fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M21.4 11l-9.2 9.2a6 6 0 0 1-8.5-8.5l9.2-9.2a4 4 0 0 1 5.6 5.6l-9.1 9.2a2 2 0 0 1-2.8-2.8l8.4-8.5"/></svg>"##;
+/// "Reply" arrow, for a message row's hover action (same convention as
+/// [`ICON_SEND`]).
+const ICON_REPLY: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><g fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 14 4 9l5-5"/><path d="M20 20v-7a4 4 0 0 0-4-4H4"/></g></svg>"##;
+/// "Delete message" trash can, same convention as [`ICON_SEND`].
+const ICON_TRASH: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><g fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></g></svg>"##;
+
+/// One side of a message row's hover-action gutter: square icon button.
+const MSG_ACTION_SIZE: f32 = 26.0;
+/// Width reserved on the right of EVERY message row (hovered or not) so
+/// the hover-revealed reply/delete buttons appearing there never shift
+/// the content: two [`MSG_ACTION_SIZE`] buttons plus their gap.
+const MSG_GUTTER_W: f32 = 2.0 * MSG_ACTION_SIZE + 8.0;
 
 fn chat(
     ui: &mut egui::Ui,
@@ -1018,6 +1162,15 @@ fn chat(
     // channel switch), so this drains even with no channel selected.
     while let Ok((fch, path)) = mv.attach_rx.try_recv() {
         attachments::add_pending(mv, fch, path);
+    }
+
+    // Stale message-delete confirmations disarm themselves — same TTL
+    // policy as the channel delete control (see [`confirm_delete`]).
+    if mv
+        .msg_delete_confirm
+        .is_some_and(|(_, at)| at.elapsed() > DELETE_CONFIRM_TTL)
+    {
+        mv.msg_delete_confirm = None;
     }
 
     // Status / notice banners.
@@ -1072,8 +1225,6 @@ fn chat(
         // Leaving the chat column forgets the last channel so returning
         // to one re-scrolls to the bottom (see the message list below).
         mv.chat_channel_prev = None;
-        mv.emoji_picker_open = false;
-        ui.heading("bysyc");
         ui.weak("select a channel, a direct message, or Friends");
         return;
     };
@@ -1101,13 +1252,9 @@ fn chat(
     attachments::add_dropped(ui, mv, ch);
 
     // Channel-switch detection for the message list's scroll state (see
-    // the ScrollArea below). A fresh channel also closes the emoji picker
-    // — its insertions belong to the previous conversation's draft.
+    // the ScrollArea below).
     let scroll_reset = mv.chat_channel_prev != Some(ch);
     mv.chat_channel_prev = Some(ch);
-    if scroll_reset {
-        mv.emoji_picker_open = false;
-    }
 
     // Older history. The click remembers the currently-oldest row so the
     // message list can hold the reading position when the older page
@@ -1153,6 +1300,11 @@ fn chat(
         .resizable(false)
         .min_size(52.0)
         .show(ui, |ui| {
+            // Breathing room between the message list and everything the
+            // composer stack renders (the panel's own frame adds only a
+            // hairline separator above this).
+            ui.add_space(8.0);
+
             // Typing indicator (pruned past its TTL). The server echoes our
             // own Typing events back to us; those are suppressed here so
             // the strip lists only the other side — sending itself still
@@ -1214,46 +1366,75 @@ fn chat(
             // Attachment upload progress strip (above the composer).
             attachments::uploads_ui(ui, state);
 
-            // Composer. The TextEdit needs an explicit id: auto ids come
-            // from a per-Ui allocation counter, so the conditional strips
-            // above (typing indicator, reply banner, uploads) appearing or
+            // Composer: [text field][attach][send] — the buttons sit to
+            // the right of the input. Laid out right_to_left: send lands
+            // rightmost, attach beside it, and the field — added last —
+            // fills all remaining width (its INFINITY desired width clamps
+            // to what is left). egui centers each child against the row's
+            // growing height, so the buttons stay level with the text
+            // whether the draft is one row or three.
+            //
+            // The TextEdit needs an explicit id: auto ids come from a
+            // per-Ui allocation counter, so the conditional strips above
+            // (typing indicator, reply banner, uploads) appearing or
             // vanishing shifted the id and silently dropped keyboard focus
-            // mid-typing. The channel id in the salt keeps one cursor state
-            // per conversation (drafts already live in `mv.composer`).
-            // `show` (not `ui.add`) keeps the TextEditOutput around: its
-            // cursor range is where the emoji picker inserts.
+            // mid-typing. The channel id in the salt keeps one cursor
+            // state per conversation (drafts already live in
+            // `mv.composer`).
             let line_height = ui.text_style_height(&egui::TextStyle::Body);
-            let mut output = {
-                let buf = mv.composer.entry(ch).or_default();
-                // The wrapping ScrollArea grows with the text up to
-                // COMPOSER_MAX_ROWS rows and scrolls past that, so a long
-                // draft never pushes the message list away. The TextEdit
-                // itself drives the scroll to keep the caret visible.
-                egui::ScrollArea::vertical()
-                    .id_salt(("composer_scroll", ch))
-                    .auto_shrink([false, true])
-                    .max_height(COMPOSER_MAX_ROWS as f32 * line_height + 2.0 * COMPOSER_MARGIN_Y)
-                    .scroll_bar_visibility(
-                        egui::containers::scroll_area::ScrollBarVisibility::AlwaysHidden,
-                    )
-                    .show(ui, |ui| {
-                        egui::TextEdit::multiline(buf)
-                            .id_salt(("composer", ch))
-                            .hint_text("Message…  (Enter to send, Shift+Enter for a new line)")
-                            .desired_width(f32::INFINITY)
-                            .desired_rows(1)
-                            .show(ui)
-                    })
-                    .inner
+            let (send_clicked, field) = {
+                ui.with_layout(
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        let mut send_clicked = false;
+                        if icon_button(ui, "bytes://send.svg", ICON_SEND, "Send").clicked() {
+                            send_clicked = true;
+                        }
+                        if icon_button(ui, "bytes://attach.svg", ICON_ATTACH, "Attach file")
+                            .clicked()
+                        {
+                            attachments::begin_attach(ctx, mv, ch);
+                        }
+                        let buf = mv.composer.entry(ch).or_default();
+                        // The wrapping ScrollArea grows with the text up
+                        // to COMPOSER_MAX_ROWS rows and scrolls past that,
+                        // so a long draft never pushes the message list
+                        // away. The TextEdit itself drives the scroll to
+                        // keep the caret visible.
+                        let field = egui::ScrollArea::vertical()
+                            .id_salt(("composer_scroll", ch))
+                            .auto_shrink([false, true])
+                            .max_height(
+                                COMPOSER_MAX_ROWS as f32 * line_height + 2.0 * COMPOSER_MARGIN_Y,
+                            )
+                            .scroll_bar_visibility(
+                                egui::containers::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                            )
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::TextEdit::multiline(buf)
+                                        .id_salt(("composer", ch))
+                                        .hint_text(
+                                            "Message…  (Enter to send, Shift+Enter for a new line)",
+                                        )
+                                        .desired_width(f32::INFINITY)
+                                        .desired_rows(1),
+                                )
+                            })
+                            .inner;
+                        (send_clicked, field)
+                    },
+                )
+                .inner
             };
-            if output.response.changed() {
+            if field.changed() {
                 maybe_send_typing(state, mv, ch);
             }
             // Escape cancels a pending reply while the composer holds
             // focus, consuming the key so the call overlay — which only
             // acts when no widget is focused — never sees it (a focused
             // composer wins; the overlay renders after this view).
-            if output.response.has_focus()
+            if field.has_focus()
                 && mv.reply_to.contains_key(&ch)
                 && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
             {
@@ -1262,45 +1443,9 @@ fn chat(
             // Enter (without Shift) sends; Shift+Enter keeps the newline
             // the field just inserted. `has_focus` gates the key so Enter
             // pressed in another field never sends here.
-            let mut send = output.response.has_focus()
-                && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
-            ui.horizontal(|ui| {
-                if icon_button(ui, "bytes://send.svg", ICON_SEND, "Send").clicked() {
-                    send = true;
-                }
-                if icon_button(ui, "bytes://attach.svg", ICON_ATTACH, "Attach file").clicked() {
-                    attachments::begin_attach(ctx, mv, ch);
-                }
-                // Emoji picker (see [`emoji`]): selections insert at the
-                // composer's cursor; the popup stays open for multi-inserts.
-                // The push_id keeps the toggle — and the popup id derived
-                // from it — stable against the conditional strips above.
-                let mut caret = None;
-                {
-                    let cursor =
-                        output.cursor_range.map(|r| usize::from(r.primary.index));
-                    let open = &mut mv.emoji_picker_open;
-                    let draft = mv.composer.entry(ch).or_default();
-                    let on_pick = |emoji: &str| {
-                        caret = Some(emoji::insert_at_cursor(draft, cursor, emoji));
-                    };
-                    ui.push_id(("emoji_picker", ch), |ui| {
-                        emoji::picker(ui, open, on_pick);
-                    });
-                }
-                if let Some(caret) = caret {
-                    // Park the caret after the inserted emoji (the TextEdit
-                    // state still points at the pre-insert position) and
-                    // hand focus back so Enter sends and the next insert
-                    // appends instead of stacking backwards.
-                    output.state.cursor.set_char_range(Some(
-                        egui::text::CCursorRange::one(egui::text::CCursor::new(caret)),
-                    ));
-                    output.state.store(ctx, output.response.id);
-                    maybe_send_typing(state, mv, ch);
-                    output.response.request_focus();
-                }
-            });
+            let send = send_clicked
+                || (field.has_focus()
+                    && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift));
             if send {
                 let text = mv.composer.get(&ch).cloned().unwrap_or_default();
                 // trim() also strips the "\n" the field inserts on the
@@ -1317,7 +1462,7 @@ fn chat(
                 }
                 // A button click moves focus to the button — put it back
                 // so typing continues without a re-click.
-                output.response.request_focus();
+                field.request_focus();
             }
         });
 
@@ -1389,28 +1534,45 @@ fn chat(
         let scrolled = list.show_rows(ui, 18.0, count, |ui, range| {
             // Snapshot the visible slice under the state lock, then read
             // plaintexts from the store after releasing it (lock order
-            // state → store only, never held the other way around).
-            let rows: Vec<(MessageDto, String)> = {
+            // state → store only, never held the other way around). Each
+            // row also carries its grouping verdict: a message groups
+            // under its predecessor when the same sender sent both within
+            // one calendar minute and the message is not itself a reply
+            // (a reply keeps its header so the ↪ tag is never lost).
+            let (my_id, rows): (i64, Vec<(MessageDto, String, bool)>) = {
                 let st = guard(state);
                 let Some(m) = st.main() else { return };
                 let Some(msgs) = m.messages.get(&ch) else {
                     return;
                 };
-                range
+                let my_id = m.account.id;
+                let rows = range
                     .filter_map(|i| {
                         let msg = msgs.get(i)?;
                         if msg.kind == MessageKind::Control {
                             return None;
                         }
-                        Some((msg.clone(), m.account_name(msg.sender_id)))
+                        // The predecessor may sit above the visible range —
+                        // it is still this row's group context.
+                        let grouped = msg.reply_to.is_none()
+                            && msgs[..i]
+                                .iter()
+                                .rposition(|x| x.kind != MessageKind::Control)
+                                .is_some_and(|p| {
+                                    msgs[p].sender_id == msg.sender_id
+                                        && msgs[p].created_at_ms.div_euclid(60_000)
+                                            == msg.created_at_ms.div_euclid(60_000)
+                                });
+                        Some((msg.clone(), m.account_name(msg.sender_id), grouped))
                     })
-                    .collect()
+                    .collect();
+                (my_id, rows)
             };
             let plains: HashMap<i64, String> = {
                 let s = guard(store);
                 rows.iter()
-                    .filter(|(msg, _)| msg.id > 0)
-                    .filter_map(|(msg, _)| s.plaintext(msg.id).map(|p| (msg.id, p)))
+                    .filter(|(msg, _, _)| msg.id > 0)
+                    .filter_map(|(msg, _, _)| s.plaintext(msg.id).map(|p| (msg.id, p)))
                     .collect()
             };
             // Reply prefixes need the replied-to sender's name.
@@ -1422,7 +1584,7 @@ fn chat(
                 match m.messages.get(&ch) {
                     Some(msgs) => rows
                         .iter()
-                        .filter_map(|(msg, _)| msg.reply_to)
+                        .filter_map(|(msg, _, _)| msg.reply_to)
                         .filter_map(|rid| {
                             msgs.iter()
                                 .find(|x| x.id == rid)
@@ -1439,15 +1601,15 @@ fn chat(
                 match st.main() {
                     Some(m) => rows
                         .iter()
-                        .filter(|(msg, _)| msg.attachment.is_some())
-                        .filter_map(|(msg, _)| {
+                        .filter(|(msg, _, _)| msg.attachment.is_some())
+                        .filter_map(|(msg, _, _)| {
                             m.file_meta.get(&msg.id).cloned().map(|fe| (msg.id, fe))
                         })
                         .collect(),
                     None => HashMap::new(),
                 }
             };
-            for (msg, sender) in &rows {
+            for (msg, sender, grouped) in &rows {
                 // Hold the "Load older" reading position: pin the
                 // previously-oldest row to the top of the viewport now
                 // that it is laid out (instant — an animated scroll would
@@ -1465,6 +1627,7 @@ fn chat(
                     );
                     mv.load_anchor = None;
                 }
+                let (msg, sender, grouped) = (msg, sender.as_str(), *grouped);
                 let time = fmt_time(msg.created_at_ms);
                 let reply = msg
                     .reply_to
@@ -1472,26 +1635,113 @@ fn chat(
                     .map(|n| format!("  ↪ [{n}]"))
                     .unwrap_or_default();
                 let header = format!("{time}  {sender}:{reply}");
-                // Attachment rows render from the stashed File envelope;
-                // everything else is the plain text body.
-                if let (Some(att), Some(fe)) = (msg.attachment.as_ref(), file_envs.get(&msg.id)) {
-                    message_header(ui, mv, ch, msg, header);
-                    attachments::attachment_row(ui, state, rt, ctx, mv, att, fe);
-                } else {
-                    let body = if msg.id < 0 {
-                        format!("{} …", msg.content)
-                    } else {
-                        plains
-                            .get(&msg.id)
-                            .cloned()
-                            .unwrap_or_else(|| "[encrypted]".into())
-                    };
-                    message_header(ui, mv, ch, msg, header);
-                    // The body wraps at the full row width: inside a
-                    // horizontal layout the label would take its whole
-                    // unwrapped width and clip at the panel edge.
-                    ui.add(egui::Label::new(body).wrap_mode(egui::TextWrapMode::Wrap));
-                }
+
+                // One message row: content in a fixed-width region (the
+                // full row width minus the action gutter) plus the
+                // constant gutter itself. Because the content width never
+                // changes — hover or not — the reveal of the gutter
+                // buttons can't reflow or shift the text. push_id keeps
+                // the row's interact ids stable against rows appearing
+                // and vanishing around it.
+                ui.push_id(("msg_row", msg.id), |ui| {
+                    ui.horizontal(|ui| {
+                        let content_w = (ui.available_width() - MSG_GUTTER_W).max(60.0);
+                        let content = ui.allocate_ui_with_layout(
+                            egui::Vec2::new(content_w, 0.0),
+                            egui::Layout::top_down(egui::Align::LEFT),
+                            |ui| {
+                                // Group starters keep the full header
+                                // ("time sender: ↪reply"); grouped
+                                // followers render body-only — no repeated
+                                // header, and a tighter gap since the
+                                // fixed row slots hold only the body.
+                                if !grouped {
+                                    ui.label(header);
+                                }
+                                // Attachment rows render from the stashed
+                                // File envelope; everything else is the
+                                // plain text body. The body wraps at the
+                                // content width — at the full row width
+                                // the label would run under the gutter.
+                                if let (Some(att), Some(fe)) =
+                                    (msg.attachment.as_ref(), file_envs.get(&msg.id))
+                                {
+                                    attachments::attachment_row(
+                                        ui, state, rt, ctx, mv, att, fe,
+                                    );
+                                } else {
+                                    let body = if msg.id < 0 {
+                                        format!("{} …", msg.content)
+                                    } else {
+                                        plains
+                                            .get(&msg.id)
+                                            .cloned()
+                                            .unwrap_or_else(|| "[encrypted]".into())
+                                    };
+                                    ui.add(
+                                        egui::Label::new(body)
+                                            .wrap_mode(egui::TextWrapMode::Wrap),
+                                    );
+                                }
+                            },
+                        );
+
+                        // Hover-only actions, pinned to the row's far
+                        // right: reply for real messages, delete to the
+                        // right of it for my own. Hover covers the whole
+                        // row — content plus gutter — via the content
+                        // rect extended to the panel edge. A row with an
+                        // armed delete confirmation keeps its buttons (the
+                        // popup they anchor to must keep rendering).
+                        let armed =
+                            mv.msg_delete_confirm.is_some_and(|(id, _)| id == msg.id);
+                        let row_rect = content
+                            .response
+                            .rect
+                            .with_max_x(ui.max_rect().max.x);
+                        let hovered = ui
+                            .interact(row_rect, ui.id().with("hover"), egui::Sense::hover())
+                            .hovered();
+                        if hovered || armed {
+                            let strip_w = ui.available_width();
+                            ui.allocate_ui_with_layout(
+                                egui::Vec2::new(strip_w, 0.0),
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    // Right-to-left: added first lands
+                                    // rightmost — delete sits right of
+                                    // reply.
+                                    if msg.sender_id == my_id && msg.id > 0 {
+                                        let trash = gutter_button(
+                                            ui,
+                                            "bytes://trash.svg",
+                                            ICON_TRASH,
+                                            "Delete message",
+                                        );
+                                        if trash.clicked() {
+                                            mv.msg_delete_confirm =
+                                                Some((msg.id, Instant::now()));
+                                        }
+                                        msg_delete_confirm_popup(
+                                            mv, state, store, rt, ctx, ch, msg.id, &trash,
+                                        );
+                                    }
+                                    if msg.id > 0
+                                        && gutter_button(
+                                            ui,
+                                            "bytes://reply.svg",
+                                            ICON_REPLY,
+                                            "Reply",
+                                        )
+                                        .clicked()
+                                    {
+                                        mv.reply_to.insert(ch, msg.id);
+                                    }
+                                },
+                            );
+                        }
+                    });
+                });
             }
         });
         // Whether we sit at the bottom gates "Load older" anchoring on the
@@ -1767,15 +2017,101 @@ fn confirm_delete(ui: &mut egui::Ui, mv: &mut MainView, channel_id: i64) -> bool
     }
 }
 
-/// One message's header line — time, sender, reply tag — plus the reply
-/// action. Shared by the plain-text and attachment rows; the body follows
-/// below, wrapping at the full row width.
-fn message_header(ui: &mut egui::Ui, mv: &mut MainView, ch: i64, msg: &MessageDto, header: String) {
-    ui.horizontal(|ui| {
-        ui.label(header);
-        if msg.id > 0 && ui.small_button("reply").clicked() {
-            mv.reply_to.insert(ch, msg.id);
+/// One hover-revealed message-row action: a [`MSG_ACTION_SIZE`] square
+/// icon button, same white-stroke SVG convention as [`icon_button`] (kept
+/// separate because the composer buttons keep their natural size).
+fn gutter_button(
+    ui: &mut egui::Ui,
+    uri: &'static str,
+    svg: &'static [u8],
+    tooltip: &str,
+) -> egui::Response {
+    let tint = ui.visuals().widgets.inactive.fg_stroke.color;
+    ui.add_sized(
+        egui::Vec2::splat(MSG_ACTION_SIZE),
+        egui::Button::image(
+            egui::Image::from_bytes(uri, svg)
+                .fit_to_exact_size(egui::Vec2::splat(14.0))
+                .tint(tint),
+        ),
+    )
+    .on_hover_text(tooltip)
+}
+
+/// Two-step delete confirmation for one message, following the channel
+/// delete control's TTL policy ([`DELETE_CONFIRM_TTL`]) but scoped to a
+/// message: a popup anchored at the row's trash button asks "yes"/"no".
+/// One stray click must not delete a message. "yes" fires the DELETE;
+/// "no", Escape, or a click outside disarms.
+fn msg_delete_confirm_popup(
+    mv: &mut MainView,
+    state: &Arc<Mutex<ClientState>>,
+    store: &Arc<Mutex<Store>>,
+    rt: &tokio::runtime::Handle,
+    ctx: &egui::Context,
+    ch: i64,
+    msg_id: i64,
+    anchor: &egui::Response,
+) {
+    if !mv.msg_delete_confirm.is_some_and(|(id, _)| id == msg_id) {
+        return;
+    }
+    let mut open = true;
+    egui::Popup::from_response(anchor)
+        .id(egui::Id::new("msg_delete_confirm"))
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show(|ui| {
+            ui.label("Delete this message?");
+            ui.horizontal(|ui| {
+                if ui.small_button("yes").clicked() {
+                    open = false;
+                    spawn_delete_message(state, store, rt, ctx, ch, msg_id);
+                }
+                if ui.small_button("no").clicked() {
+                    open = false;
+                }
+            });
+        });
+    // A close by Escape or an outside click writes `open` back false.
+    if !open {
+        mv.msg_delete_confirm = None;
+    }
+}
+
+/// DELETE one of my messages; on success drop it locally right away
+/// (in-memory cache, then SQLite — lock order state → store). The WS
+/// `MessageDeleted` broadcast reaches us too; every removal involved is
+/// idempotent. A failure surfaces as a notice banner.
+fn spawn_delete_message(
+    state: &Arc<Mutex<ClientState>>,
+    store: &Arc<Mutex<Store>>,
+    rt: &tokio::runtime::Handle,
+    ctx: &egui::Context,
+    ch: i64,
+    msg_id: i64,
+) {
+    let Some(h) = net_handle(state) else { return };
+    let state = Arc::clone(state);
+    let store = Arc::clone(store);
+    let ctx = ctx.clone();
+    rt.spawn(async move {
+        match h.net.delete_message(ch, msg_id).await {
+            Ok(()) => {
+                {
+                    let mut st = guard(&state);
+                    if let Some(m) = st.main_mut() {
+                        m.remove_message(ch, msg_id);
+                    }
+                }
+                let _ = guard(&store).delete_message(msg_id);
+            }
+            Err(e) => {
+                if let Some(m) = guard(&state).main_mut() {
+                    m.notice = Some(e);
+                }
+            }
         }
+        ctx.request_repaint();
     });
 }
 

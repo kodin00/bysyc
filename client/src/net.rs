@@ -38,8 +38,10 @@
 //! | `GET /dms` | `Vec<`[`DmChannel`]`>` |
 //! | `POST /dms` | [`OpenDmRequest`] → [`DmChannel`] |
 //! | `POST /channels/{id}/messages` | [`SendMessageRequest`] → [`MessageDto`] |
+//! | `DELETE /channels/{id}/messages/{id}` | delete a message → 204 (every member is told via a WS `MessageDeleted` broadcast) |
 //! | `GET /mailbox` | `Vec<`[`MailboxItem`]`>` |
 //! | `POST /attachments` | [`CreateAttachmentRequest`] → [`CreateAttachmentResponse`] |
+//! | `POST /attachments/image` | raw WebP body → [`ImageUploadResponse`] (server-side images) |
 //! | `GET /turn` | [`TurnInfo`] for C5's calls |
 //!
 //! Errors: every failing REST response is parsed as [`ApiError`] and the
@@ -365,6 +367,19 @@ impl Net {
         .await
     }
 
+    /// Delete one of my messages. The server answers `204` and broadcasts a
+    /// `MessageDeleted` to every member (including us — the local removal
+    /// done at send time just makes it instant, and is idempotent).
+    pub async fn delete_message(&self, channel_id: i64, message_id: i64) -> Result<(), String> {
+        self.exec_empty(
+            self.authed(
+                reqwest::Method::DELETE,
+                &format!("/channels/{channel_id}/messages/{message_id}"),
+            ),
+        )
+        .await
+    }
+
     // -- mailbox (C2 acks) -------------------------------------------------------
 
     pub async fn mailbox(&self) -> Result<Vec<MailboxItem>, String> {
@@ -390,6 +405,24 @@ impl Net {
             reqwest::Method::GET,
             &format!("/attachments/{attachment_id}/download-url"),
         ))
+        .await
+    }
+
+    /// Upload a server-side (NOT client-encrypted) image: the raw WebP
+    /// bytes are the request body — no multipart, no query parameters. The
+    /// server validates the RIFF/WEBP magic bytes, stores the bytes under
+    /// its own random name, and answers with the attachment metadata
+    /// (`encrypted == false`, empty nonce); there is no presigned PUT for
+    /// this path.
+    pub async fn upload_image(
+        &self,
+        webp_bytes: &[u8],
+    ) -> Result<bysyc_common::protocol::ImageUploadResponse, String> {
+        self.exec(
+            self.authed(reqwest::Method::POST, "/attachments/image")
+                .header(reqwest::header::CONTENT_TYPE, "image/webp")
+                .body(webp_bytes.to_vec()),
+        )
         .await
     }
 

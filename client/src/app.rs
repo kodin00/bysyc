@@ -35,9 +35,9 @@ impl BysycApp {
         egui_extras::install_image_loaders(&cc.egui_ctx);
 
         // Current Noto Emoji as the emoji fallback font (the builtin copy
-        // predates Unicode 11); also the basis of the composer's emoji
-        // picker (see [`crate::views::emoji`]).
-        crate::views::emoji::install_fonts(&cc.egui_ctx);
+        // predates Unicode 11) — incoming messages and IME-typed emoji
+        // render through it.
+        install_fonts(&cc.egui_ctx);
 
         let default_url = {
             let s = state::guard(&store);
@@ -154,4 +154,102 @@ impl eframe::App for BysycApp {
             crate::views::login::show(self, ui);
         }
     }
+}
+
+/// Current Noto Emoji (monochrome outline), embedded at compile time.
+/// Variable font; epaint renders the default (Regular) instance.
+const NOTO_EMOJI: &[u8] = include_bytes!("../assets/fonts/NotoEmoji-Regular.ttf");
+
+/// Replace epaint's bundled 2019 `NotoEmoji-Regular` (already a fallback in
+/// both default families) with the current one from [`NOTO_EMOJI`]. Called
+/// once at app creation; `Context::set_fonts` rebuilds the font atlas, so
+/// re-created apps are fine too.
+///
+/// egui/epaint 0.36 rasterize fonts with skrifa and draw flat-color glyph
+/// outlines only — bitmap color-emoji formats (Apple Color Emoji sbix, CBDT,
+/// COLR) have no path, so anything outside the registered font set renders
+/// as tofu. The bundled copy predates Unicode 11 (even 🙂 is missing);
+/// replacing it lets incoming messages and IME-typed emoji render as
+/// theme-tinted monochrome outlines. The font lives in `client/assets/fonts/`
+/// under the SIL OFL 1.1 (`OFL.txt` beside it).
+fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    // Same slot and scale tweak (emoji glyphs run tall) as the builtin, so
+    // both the Proportional and Monospace fallback lists pick it up without
+    // further edits.
+    fonts.font_data.insert(
+        "NotoEmoji-Regular".to_owned(),
+        std::sync::Arc::new(egui::FontData::from_static(NOTO_EMOJI).tweak(
+            egui::FontTweak {
+                scale: 0.81, // Make smaller — matches the builtin entry
+                ..Default::default()
+            },
+        )),
+    );
+    ctx.set_fonts(fonts);
+}
+
+/// The embedded font must be a loadable sfnt (TrueType/OTF): a truncated or
+/// HTML "download" would otherwise fail only at first emoji render.
+#[test]
+fn font_blob_is_sfnt() {
+    assert!(!NOTO_EMOJI.is_empty());
+    let magic: [u8; 4] = NOTO_EMOJI[..4].try_into().unwrap();
+    assert!(
+        magic == [0x00, 0x01, 0x00, 0x00] || magic == *b"OTTO" || magic == *b"true",
+        "unexpected sfnt magic: {magic:?}"
+    );
+}
+
+/// The replacement must register and parse through the real epaint font
+/// pipeline (an unparsable font panics at first use). 🙂 is Unicode 9-era
+/// and 🥲 is Unicode 13 — the builtin 2019 copy has neither, so this also
+/// proves the upgrade actually took.
+///
+/// `Fonts::has_glyphs` cannot verify this: epaint's replacement sentinel
+/// is '◻' (U+25FB), which NotoEmoji itself covers (the builtin copy too),
+/// so every glyph the emoji font owns compares equal to the replacement
+/// face and reports false — even on stock egui. Instead: shaping 🙂 and 🥲
+/// must produce two glyphs with distinct atlas rectangles (tofu would
+/// reuse the one replacement rectangle), and the live
+/// "NotoEmoji-Regular" must be the shipped variable font (the 2019
+/// builtin is static, so it reports no variation axes).
+#[test]
+fn installed_font_covers_modern_emoji() {
+    let ctx = egui::Context::default();
+    install_fonts(&ctx);
+    // Fonts build lazily at the first pass begin (pixels_per_point is
+    // unknown before then); building panics on any unparsable face, so
+    // getting past this point proves our blob loaded.
+    ctx.begin_pass(egui::RawInput::default());
+    let galley = ctx.fonts_mut(|f| {
+        f.layout(
+            "🙂🥲".to_owned(),
+            egui::FontId::proportional(14.0),
+            egui::Color32::WHITE,
+            100.0,
+        )
+    });
+    // Rasterizing glyphs queues an atlas texture delta; drop it cleanly
+    // (dropping it unapplied trips a debug assert in epaint).
+    ctx.end_pass().textures_delta.clear();
+
+    let uvs: Vec<_> = galley
+        .rows
+        .iter()
+        .flat_map(|row| row.row.glyphs.iter().map(|g| g.uv_rect))
+        .collect();
+    assert_eq!(uvs.len(), 2, "expected one glyph per emoji");
+    assert_ne!(
+        uvs[0], uvs[1],
+        "🙂 and 🥲 both resolved to the same (replacement) glyph"
+    );
+
+    let axes = ctx.fonts(|f| {
+        f.definitions().font_data["NotoEmoji-Regular"].variation_axes()
+    });
+    assert!(
+        !axes.is_empty(),
+        "live NotoEmoji-Regular is static — the shipped variable font was not installed"
+    );
 }

@@ -1,19 +1,40 @@
-//! Attachments: E2EE file send/receive (C4).
+//! Attachments: two send flows, one render path (C4).
 //!
-//! Nothing but ciphertext ever leaves the client (ADR 0001): the raw bytes
+//! **E2E-encrypted files** — arbitrary files keep the original C4 posture:
+//! nothing but ciphertext ever leaves the client (ADR 0001). The raw bytes
 //! are AES-GCM-encrypted locally by [`Engine::encrypt_file`], the key and
 //! nonce ride the Megolm-encrypted [`Envelope::File`] alongside the message
 //! row, and the server only ever brokers presigned PUT/GET URLs for the
-//! encrypted blob. There are no server-side thumbnails — image decoding,
-//! downscaling, and display all happen here, after decrypt.
+//! encrypted blob.
+//!
+//! **Server-side images** — png/jpeg/webp/bmp and single-frame gif inputs
+//! are re-encoded locally to lossy WebP ([`WEBP_QUALITY`]; re-encoding
+//! goes through raw pixels, so ALL EXIF/ICC/metadata is dropped — there is
+//! no metadata path into the encoder), renamed to a random
+//! `img_<hex>.webp` (the original filename never leaves the device), and
+//! POSTed as plaintext bytes to `/attachments/image`, which validates the
+//! WebP magic and stores them itself — no presigned PUT. Privacy tradeoff,
+//! deliberate: these images are NOT end-to-end encrypted; the server (and
+//! anyone who can read its object storage) sees them. What stays E2EE is
+//! the message context around them (the [`Envelope::File`] still rides
+//! Megolm — with empty key/nonce — so only channel members learn an image
+//! was sent). Decoding and downscaling still happen here; there are no
+//! server-side thumbnails. Animated GIFs cannot be re-encoded (no animated
+//! WebP encoder), so they keep the encrypted file flow verbatim.
+//!
+//! Both flows persist the decrypted [`Envelope::File`] in the local store
+//! at send/decrypt time, and [`MainState::backfill_plaintexts`] rebuilds
+//! `file_meta` from it after a restart — without that, the chip and
+//! preview would vanish (our own rows can never be re-decrypted: the
+//! engine holds no Megolm self-import).
 //!
 //! Threading contract (the UI thread never blocks on files, dialogs,
 //! crypto, or network):
 //!
 //! - `rfd` native dialogs run on their own `std::thread` (they block).
-//! - `fs::read` + `encrypt_file` run on a dedicated `std::thread` kicked
-//!   off by the composer's send flush (CPU-bound file work off the UI
-//!   thread).
+//! - `fs::read` + WebP re-encode / `encrypt_file` run on a dedicated
+//!   `std::thread` kicked off by the composer's send flush (CPU-bound file
+//!   work off the UI thread).
 //! - Network + `spawn_blocking` decode/decrypt run on the tokio runtime.
 //! - Decoded images cross back to the UI thread through an `mpsc` channel
 //!   drained by [`drain_decoded`]; textures are created only on the UI
@@ -27,9 +48,11 @@
 //!
 //! - RAM keeps only the decoded-and-downscaled (≤ [`MAX_DECODE_PX`] px)
 //!   RGBA thumbnails — never decrypted originals.
-//! - The disk cache under the data dir stores the still-ENCRYPTED bytes
-//!   (one file per attachment id); plaintext is only ever written when the
-//!   user explicitly Saves or Opens.
+//! - The disk cache under the data dir (one file per attachment id) stores
+//!   the bytes exactly as they sit in object storage: still-ENCRYPTED
+//!   ciphertext for E2EE files, the already-server-visible WebP for
+//!   server-side images. Plaintext originals are only ever written when
+//!   the user explicitly Saves or Opens.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -56,6 +79,9 @@ use super::main_view::{MainView, net_handle};
 /// Hard cap on the raw file we will read (the server caps ciphertext at
 /// 50 MiB; AES-GCM adds 28 bytes and the envelope a little more).
 pub const MAX_RAW_FILE_BYTES: usize = 48 * 1024 * 1024;
+/// Lossy WebP quality for the server-side image flow (libwebp's 0–100
+/// scale; 78 sits just under libwebp's default of 75–80 territory).
+pub const WEBP_QUALITY: f32 = 78.0;
 /// Images at or below this decrypted size fetch + decode automatically;
 /// bigger ones wait for an explicit "load image" click.
 pub const AUTO_IMAGE_BYTES: i64 = 2 * 1024 * 1024;
@@ -156,9 +182,10 @@ pub fn pending_ui(ui: &mut egui::Ui, mv: &mut MainView, ch: i64) {
     }
 }
 
-/// Send one queued composer attachment: read + AES-GCM encrypt on a
-/// dedicated `std::thread` (both slow enough to matter for 48 MiB), then
-/// the network half continues on the runtime via [`upload_and_send`].
+/// Send one queued composer attachment: read, then either re-encode to
+/// lossy WebP or AES-GCM encrypt on a dedicated `std::thread` (all slow
+/// enough to matter for 48 MiB), then the network half continues on the
+/// runtime via [`upload_image_and_send`] or [`upload_and_send`].
 /// Progress is tracked in [`MainState::uploads`] keyed by a fresh
 /// [`UPLOAD_SEQ`] id.
 #[allow(clippy::too_many_arguments)]
@@ -233,6 +260,29 @@ pub fn queue_upload(
         }
         if upload_stopped(&state, upload_id, ch, temp) {
             ctx.request_repaint();
+            return;
+        }
+        // Image inputs take the server-side WebP flow: re-encode right here
+        // (CPU-bound, same thread) and hand off to the image upload task.
+        // Non-images and animated GIFs fall through to the encrypted flow.
+        // The re-encode never compares sizes — the WebP is sent even when
+        // it is the larger of the two.
+        if let Some(webp) = maybe_webp(&bytes) {
+            ctx.request_repaint();
+            if upload_stopped(&state, upload_id, ch, temp) {
+                ctx.request_repaint();
+                return;
+            }
+            let job = ImageUploadJob {
+                me,
+                ch,
+                generation,
+                upload_id,
+                temp,
+                name: random_image_name(),
+                webp,
+            };
+            rt.spawn(upload_image_and_send(state, store, ctx, engine, job));
             return;
         }
         let (ciphertext, key_b64, nonce_b64) = match engine.encrypt_file(&bytes) {
@@ -500,6 +550,14 @@ pub async fn encrypt_share_and_send(
         // "[file: …]" placeholder, same as receivers).
         let s = guard(store);
         let _ = s.append_message(&dto);
+        // File envelopes outlive the process: persist the decrypted JSON so
+        // backfill can rebuild file_meta after a restart (our own rows can
+        // never be re-decrypted — the engine holds no Megolm self-import).
+        if matches!(envelope, Envelope::File { .. })
+            && let Ok(json) = envelope.to_json()
+        {
+            let _ = s.set_file_envelope(dto.id, &json);
+        }
         let own_plaintext = match envelope {
             Envelope::Chat { text, .. } => text.clone(),
             Envelope::File { .. } => file_row_text(envelope),
@@ -514,6 +572,200 @@ pub async fn encrypt_share_and_send(
         m.replace_temp(temp, dto.clone());
     }
     Ok(dto)
+}
+
+// ---------------------------------------------------------------------------
+// Server-side image flow: re-encode → plaintext WebP → POST /attachments/image
+// ---------------------------------------------------------------------------
+
+/// Re-encode an image input as lossy WebP, if it qualifies for the
+/// server-side image flow: png / jpeg / webp / bmp and single-frame gif.
+/// Animated GIFs (more than one frame) return `None` — there is no animated
+/// WebP encoder here, so they keep the encrypted file flow. A decode or
+/// re-encode failure also returns `None`, falling back rather than failing
+/// the send.
+fn maybe_webp(bytes: &[u8]) -> Option<Vec<u8>> {
+    use image::ImageFormat::{Bmp, Gif, Jpeg, Png, WebP};
+    match image::guess_format(bytes).ok()? {
+        Png | Jpeg | WebP | Bmp => reencode_webp(bytes),
+        Gif if !is_animated_gif(bytes) => reencode_webp(bytes),
+        _ => None,
+    }
+}
+
+/// GIFs with more than one frame. Conservative on errors: a GIF we cannot
+/// decode is treated as animated (the encrypted flow can always carry it).
+fn is_animated_gif(bytes: &[u8]) -> bool {
+    use image::AnimationDecoder;
+    image::codecs::gif::GifDecoder::new(std::io::Cursor::new(bytes))
+        .map(|dec| dec.into_frames().count() > 1)
+        .unwrap_or(true)
+}
+
+/// Decode to raw pixels and re-encode as lossy WebP at [`WEBP_QUALITY`].
+/// Going through pixels is also the metadata story: EXIF/ICC/text chunks
+/// have no path into this encoder, so none can survive. Alpha is preserved
+/// when present.
+fn reencode_webp(bytes: &[u8]) -> Option<Vec<u8>> {
+    let img = match image::load_from_memory(bytes) {
+        Ok(img) => img,
+        Err(e) => {
+            eprintln!("bysyc: image decode for WebP re-encode failed: {e}");
+            return None;
+        }
+    };
+    let (width, height) = (img.width(), img.height());
+    let encoded = if img.color().has_alpha() {
+        let rgba = img.to_rgba8();
+        webp::Encoder::from_rgba(rgba.as_raw(), width, height).encode(WEBP_QUALITY)
+    } else {
+        let rgb = img.to_rgb8();
+        webp::Encoder::from_rgb(rgb.as_raw(), width, height).encode(WEBP_QUALITY)
+    };
+    Some(encoded.to_vec())
+}
+
+/// Random server-side image name, `img_<16 hex chars>.webp` from 8 random
+/// bytes. The original filename never leaves the device on this flow.
+fn random_image_name() -> String {
+    use rand::Rng;
+    let mut b = [0u8; 8];
+    rand::rng().fill_bytes(&mut b);
+    let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    format!("img_{hex}.webp")
+}
+
+/// Everything `upload_image_and_send` needs: the re-encoded WebP plus its
+/// send context — [`UploadJob`]'s shape minus the crypto fields (there is
+/// nothing to encrypt client-side on this flow).
+struct ImageUploadJob {
+    me: i64,
+    ch: i64,
+    generation: u64,
+    upload_id: u64,
+    temp: i64,
+    /// Random `img_<hex>.webp`, generated at queue time.
+    name: String,
+    webp: Vec<u8>,
+}
+
+/// POST the raw WebP body to `/attachments/image` — the server validates
+/// the WebP magic, assigns its own name, and stores the bytes; no presigned
+/// PUT. Then wrap an empty-key File envelope in Megolm and POST the message
+/// row exactly like the encrypted flow. The envelope still rides Megolm so
+/// only channel members learn an image was sent; the image BYTES are
+/// server-visible by design (see the module doc's privacy tradeoff).
+async fn upload_image_and_send(
+    state: Arc<Mutex<ClientState>>,
+    store: Arc<Mutex<Store>>,
+    ctx: egui::Context,
+    engine: Arc<Engine>,
+    job: ImageUploadJob,
+) {
+    let ImageUploadJob {
+        me,
+        ch,
+        generation,
+        upload_id,
+        temp,
+        name,
+        webp,
+    } = job;
+
+    set_upload(&state, upload_id, |u| u.phase = UploadPhase::Uploading);
+    ctx.request_repaint();
+
+    let Some(h) = net_handle(&state) else {
+        fail_upload(&state, upload_id, "not connected".into());
+        ctx.request_repaint();
+        return;
+    };
+    if upload_stopped(&state, upload_id, ch, temp) {
+        ctx.request_repaint();
+        return;
+    }
+
+    let att = match h.net.upload_image(&webp).await {
+        Ok(r) => r.attachment,
+        Err(e) => {
+            fail_upload(&state, upload_id, format!("image upload: {e}"));
+            ctx.request_repaint();
+            return;
+        }
+    };
+    if upload_stopped(&state, upload_id, ch, temp) {
+        // Cancelled after the store landed: no message ever references the
+        // object, so it is just an orphan the server never exposes.
+        ctx.request_repaint();
+        return;
+    }
+    if !session_alive(&state, generation) {
+        // Logged out mid-send; the whole MainState (temp row included) is
+        // already gone or about to be.
+        drop_upload(&state, upload_id);
+        return;
+    }
+
+    // Empty key/nonce marks "not client-encrypted" — receivers (and we,
+    // after a restart) skip the decrypt step and decode the stored bytes
+    // directly. `size` is what receivers will actually download: the WebP.
+    let envelope = Envelope::File {
+        name: name.clone(),
+        size: webp.len() as i64,
+        nonce: String::new(),
+        key: String::new(),
+        attachment_id: att.id,
+    };
+
+    // Optimistic row, do_send-style: negative temp id, replaced when the
+    // POST lands.
+    {
+        let optimistic = MessageDto {
+            id: temp,
+            channel_id: ch,
+            sender_id: me,
+            kind: MessageKind::Chat,
+            content: file_row_text(&envelope),
+            reply_to: None,
+            attachment: Some(att.clone()),
+            created_at_ms: now_ms(),
+        };
+        let mut st = guard(&state);
+        if let Some(m) = st.main_mut() {
+            m.messages.entry(ch).or_default().push(optimistic);
+        }
+    }
+
+    set_upload(&state, upload_id, |u| u.phase = UploadPhase::Sending);
+    ctx.request_repaint();
+    match encrypt_share_and_send(
+        &state,
+        &store,
+        &h.net,
+        &engine,
+        ch,
+        &envelope,
+        temp,
+        Some(att.id),
+    )
+    .await
+    {
+        Ok(dto) => {
+            let mut st = guard(&state);
+            if let Some(m) = st.main_mut() {
+                // Same self-decrypt fiction as the encrypted flow: receivers
+                // would have this envelope in file_meta, so we do too.
+                m.file_meta.insert(dto.id, envelope);
+                set_upload_on(m, upload_id, |u| u.phase = UploadPhase::Done);
+            }
+            clear_upload_cancel(upload_id);
+        }
+        Err(e) => {
+            remove_temp(&state, ch, temp);
+            fail_upload(&state, upload_id, e);
+        }
+    }
+    ctx.request_repaint();
 }
 
 // ---------------------------------------------------------------------------
@@ -571,7 +823,7 @@ async fn get_presigned(url: &str) -> Result<Vec<u8>, String> {
 }
 
 // ---------------------------------------------------------------------------
-// Encrypted-bytes disk cache (filename = attachment id; ciphertext only)
+// Attachment-bytes disk cache (filename = attachment id; bytes as stored)
 // ---------------------------------------------------------------------------
 
 fn cache_dir() -> Option<PathBuf> {
@@ -586,10 +838,11 @@ fn cache_path(attachment_id: i64) -> Option<PathBuf> {
     cache_dir().map(|d| d.join(attachment_id.to_string()))
 }
 
-/// The encrypted bytes for an attachment: disk cache first, else a fresh
-/// presigned GET (URLs expire, so never cache the URL) which then populates
-/// the cache.
-async fn ensure_encrypted_bytes(net: &Net, attachment_id: i64) -> Result<Vec<u8>, String> {
+/// The bytes of an attachment exactly as they sit in object storage —
+/// still-encrypted ciphertext for E2EE files, the server-visible WebP for
+/// server-side images: disk cache first, else a fresh presigned GET (URLs
+/// expire, so never cache the URL) which then populates the cache.
+async fn ensure_bytes(net: &Net, attachment_id: i64) -> Result<Vec<u8>, String> {
     if let Some(p) = cache_path(attachment_id) {
         if let Ok(bytes) = std::fs::read(&p) {
             return Ok(bytes);
@@ -604,22 +857,28 @@ async fn ensure_encrypted_bytes(net: &Net, attachment_id: i64) -> Result<Vec<u8>
     Ok(bytes)
 }
 
-/// Decrypt the attachment end-to-end for an export row: cache/download →
-/// AES-GCM decrypt on a blocking thread, moving the row through its
-/// Downloading/Decrypting phases as it goes. Returns the ORIGINAL plaintext
-/// bytes (kept only in this task's scope — never in long-lived state).
+/// Produce the exportable bytes for an export row: cache/download → (E2EE
+/// attachments only) AES-GCM decrypt on a blocking thread, moving the row
+/// through its Downloading/Decrypting phases as it goes. Server-side images
+/// (`encrypted == false`) return the stored WebP as-is — nothing to
+/// decrypt. Returns the ORIGINAL plaintext bytes (kept only in this task's
+/// scope — never in long-lived state).
 async fn materialize(
     ctx: &egui::Context,
     op_id: u64,
     state: &Arc<Mutex<ClientState>>,
     attachment_id: i64,
+    encrypted: bool,
     key_b64: &str,
     nonce_b64: &str,
 ) -> Result<Vec<u8>, String> {
     let h = net_handle(state).ok_or("not connected")?;
     set_file_op_phase(op_id, FileOpPhase::Downloading);
     ctx.request_repaint();
-    let encrypted = ensure_encrypted_bytes(&h.net, attachment_id).await?;
+    let stored = ensure_bytes(&h.net, attachment_id).await?;
+    if !encrypted {
+        return Ok(stored);
+    }
     let Some(engine) = guard(state).main().and_then(|m| m.engine.clone()) else {
         return Err("crypto engine unavailable".into());
     };
@@ -628,7 +887,7 @@ async fn materialize(
     ctx.request_repaint();
     tokio::task::spawn_blocking(move || {
         engine
-            .decrypt_file(&encrypted, &key, &nonce)
+            .decrypt_file(&stored, &key, &nonce)
             .map_err(|e| format!("decrypt: {e}"))
     })
     .await
@@ -659,7 +918,13 @@ fn decode_thumbnail(
     let plain = engine
         .decrypt_file(encrypted, key_b64, nonce_b64)
         .map_err(|e| format!("decrypt: {e}"))?;
-    let img = image::load_from_memory(&plain).map_err(|e| format!("decode: {e}"))?;
+    decode_thumbnail_bytes(&plain, attachment_id)
+}
+
+/// Decode + downscale already-plaintext image bytes (the server-side WebP
+/// flow skips the decrypt step entirely).
+fn decode_thumbnail_bytes(plain: &[u8], attachment_id: i64) -> Result<DecodedImage, String> {
+    let img = image::load_from_memory(plain).map_err(|e| format!("decode: {e}"))?;
     let thumb = img.thumbnail(MAX_DECODE_PX, MAX_DECODE_PX);
     let rgba = thumb.to_rgba8();
     let (width, height) = rgba.dimensions();
@@ -683,10 +948,16 @@ pub fn fetch_image(
     nonce_b64: &str,
 ) {
     // Gather handle + engine BEFORE the inflight guard, so an early bail
-    // cannot strand a permanent inflight marker.
+    // cannot strand a permanent inflight marker. The engine is only needed
+    // for E2EE attachments; server-side images decode without it.
     let Some(h) = net_handle(state) else { return };
-    let Some(engine) = guard(state).main().and_then(|m| m.engine.clone()) else {
-        return;
+    let engine = if att.encrypted {
+        let Some(e) = guard(state).main().and_then(|m| m.engine.clone()) else {
+            return;
+        };
+        Some(e)
+    } else {
+        None
     };
     let att_id = att.id;
     let tx = mv.image_tx.clone();
@@ -702,15 +973,22 @@ pub fn fetch_image(
 
     let state = Arc::clone(state);
     let (key, nonce) = (key_b64.to_string(), nonce_b64.to_string());
+    let encrypted = att.encrypted;
     rt.spawn(async move {
-        let result = match ensure_encrypted_bytes(&h.net, att_id).await {
-            Ok(encrypted) => {
+        let result = match ensure_bytes(&h.net, att_id).await {
+            Ok(stored) => {
                 // spawn_blocking owns its inputs.
-                let engine = Arc::clone(&engine);
+                let engine = engine.clone();
                 let key = key.clone();
                 let nonce = nonce.clone();
                 tokio::task::spawn_blocking(move || {
-                    decode_thumbnail(&engine, &encrypted, &key, &nonce, att_id)
+                    if encrypted {
+                        let engine = engine.as_deref().ok_or("crypto engine unavailable")?;
+                        decode_thumbnail(engine, &stored, &key, &nonce, att_id)
+                    } else {
+                        // Server-side image: the stored bytes ARE the image.
+                        decode_thumbnail_bytes(&stored, att_id)
+                    }
                 })
                 .await
                 .map_err(|e| format!("worker: {e}"))
@@ -780,7 +1058,7 @@ fn upload_rows(ui: &mut egui::Ui, state: &Arc<Mutex<ClientState>>) {
         }
         for u in &m.uploads {
             let line = match &u.phase {
-                UploadPhase::Encrypting => format!("{} — encrypting…", u.name),
+                UploadPhase::Encrypting => format!("{} — preparing…", u.name),
                 UploadPhase::Uploading => format!("{} — uploading…", u.name),
                 UploadPhase::Sending => format!("{} — sending…", u.name),
                 UploadPhase::Done => format!("{} — done", u.name),
@@ -836,16 +1114,35 @@ pub fn attachment_row(
         return;
     };
     let (key, nonce) = (key.clone(), nonce.clone());
+    let encrypted = att.encrypted;
     let shown = format!("📎 {name} ({})", human_size(*size));
 
     // Chip line: icon, name, size, actions — always.
     ui.horizontal(|ui| {
         ui.strong(shown);
         if ui.small_button("Save").clicked() {
-            save_attachment(state, rt, ctx, att.id, att.name.clone(), &key, &nonce);
+            save_attachment(
+                state,
+                rt,
+                ctx,
+                att.id,
+                att.name.clone(),
+                encrypted,
+                &key,
+                &nonce,
+            );
         }
         if ui.small_button("Open").clicked() {
-            open_attachment(state, rt, ctx, att.id, att.name.clone(), &key, &nonce);
+            open_attachment(
+                state,
+                rt,
+                ctx,
+                att.id,
+                att.name.clone(),
+                encrypted,
+                &key,
+                &nonce,
+            );
         }
     });
 
@@ -878,7 +1175,7 @@ pub fn attachment_row(
     if inflight {
         ui.horizontal(|ui| {
             ui.add(egui::Spinner::new());
-            ui.weak("decrypting…");
+            ui.weak("loading…");
         });
         return;
     }
@@ -896,7 +1193,7 @@ pub fn attachment_row(
         fetch_image(state, rt, mv, ctx, att, &key, &nonce);
         ui.horizontal(|ui| {
             ui.add(egui::Spinner::new());
-            ui.weak("decrypting…");
+            ui.weak("loading…");
         });
     } else if ui.button("load image").clicked() {
         fetch_image(state, rt, mv, ctx, att, &key, &nonce);
@@ -929,8 +1226,10 @@ pub fn image_popup(
         mv.image_popup = None; // envelope gone (restarted before decrypt?)
         return;
     };
-    let (key, nonce) = match &fe {
-        Envelope::File { key, nonce, .. } => (key.clone(), nonce.clone()),
+    // Empty key in the envelope marks the server-side image flow (nothing
+    // to decrypt — see upload_image_and_send).
+    let (key, nonce, encrypted) = match &fe {
+        Envelope::File { key, nonce, .. } => (key.clone(), nonce.clone(), !key.is_empty()),
         _ => return,
     };
     // Synthetic meta for fetch/save/open (only the id drives them).
@@ -939,6 +1238,7 @@ pub fn image_popup(
         name: name.clone(),
         size: 0,
         nonce: String::new(),
+        encrypted,
     };
 
     let mut open = true;
@@ -964,7 +1264,7 @@ pub fn image_popup(
                 if inflight {
                     ui.horizontal(|ui| {
                         ui.add(egui::Spinner::new());
-                        ui.weak("decrypting…");
+                        ui.weak("loading…");
                     });
                 } else if failed {
                     ui.weak("image unavailable");
@@ -978,10 +1278,28 @@ pub fn image_popup(
             }
             ui.horizontal(|ui| {
                 if ui.button("Save").clicked() {
-                    save_attachment(state, rt, ui.ctx(), att_id, name.clone(), &key, &nonce);
+                    save_attachment(
+                        state,
+                        rt,
+                        ui.ctx(),
+                        att_id,
+                        name.clone(),
+                        encrypted,
+                        &key,
+                        &nonce,
+                    );
                 }
                 if ui.button("Open").clicked() {
-                    open_attachment(state, rt, ui.ctx(), att_id, name.clone(), &key, &nonce);
+                    open_attachment(
+                        state,
+                        rt,
+                        ui.ctx(),
+                        att_id,
+                        name.clone(),
+                        encrypted,
+                        &key,
+                        &nonce,
+                    );
                 }
             });
         });
@@ -1142,9 +1460,9 @@ fn file_ops_ui(ui: &mut egui::Ui) {
 // writes decrypted bytes to disk; every phase is a strip row)
 // ---------------------------------------------------------------------------
 
-/// Save dialog (std thread — it blocks), then download + decrypt + write,
-/// reported as a strip row: spinner through each phase, then the
-/// "saved to …" confirmation or the failure.
+/// Save dialog (std thread — it blocks), then download + (E2EE only)
+/// decrypt + write, reported as a strip row: spinner through each phase,
+/// then the "saved to …" confirmation or the failure.
 #[allow(clippy::too_many_arguments)]
 fn save_attachment(
     state: &Arc<Mutex<ClientState>>,
@@ -1152,6 +1470,7 @@ fn save_attachment(
     ctx: &egui::Context,
     attachment_id: i64,
     name: String,
+    encrypted: bool,
     key_b64: &str,
     nonce_b64: &str,
 ) {
@@ -1168,7 +1487,17 @@ fn save_attachment(
         };
         ctx.request_repaint();
         rt.spawn(async move {
-            let result = match materialize(&ctx, op_id, &state, attachment_id, &key, &nonce).await {
+            let result = match materialize(
+                &ctx,
+                op_id,
+                &state,
+                attachment_id,
+                encrypted,
+                &key,
+                &nonce,
+            )
+            .await
+            {
                 Ok(bytes) => {
                     set_file_op_phase(op_id, FileOpPhase::Saving);
                     ctx.request_repaint();
@@ -1194,14 +1523,16 @@ fn save_attachment(
     });
 }
 
-/// Download + decrypt to a temp path and hand it to the OS opener — every
-/// phase, including the opener's own verdict, is a strip row.
+/// Download + (E2EE only) decrypt to a temp path and hand it to the OS
+/// opener — every phase, including the opener's own verdict, is a strip
+/// row.
 fn open_attachment(
     state: &Arc<Mutex<ClientState>>,
     rt: &tokio::runtime::Handle,
     ctx: &egui::Context,
     attachment_id: i64,
     name: String,
+    encrypted: bool,
     key_b64: &str,
     nonce_b64: &str,
 ) {
@@ -1211,23 +1542,24 @@ fn open_attachment(
     let (key, nonce) = (key_b64.to_string(), nonce_b64.to_string());
     let op_id = push_file_op(&name, FileOpPhase::Downloading);
     rt.spawn(async move {
-        let result = match materialize(&ctx, op_id, &state, attachment_id, &key, &nonce).await {
-            Ok(bytes) => {
-                set_file_op_phase(op_id, FileOpPhase::Opening);
-                ctx.request_repaint();
-                match tokio::task::spawn_blocking(move || {
-                    std::fs::write(&path, &bytes)
-                        .map_err(|e| format!("write: {e}"))
-                        .and_then(|()| open_with_os(&path))
-                })
-                .await
-                {
-                    Ok(r) => r,
-                    Err(e) => Err(format!("worker: {e}")),
+        let result =
+            match materialize(&ctx, op_id, &state, attachment_id, encrypted, &key, &nonce).await {
+                Ok(bytes) => {
+                    set_file_op_phase(op_id, FileOpPhase::Opening);
+                    ctx.request_repaint();
+                    match tokio::task::spawn_blocking(move || {
+                        std::fs::write(&path, &bytes)
+                            .map_err(|e| format!("write: {e}"))
+                            .and_then(|()| open_with_os(&path))
+                    })
+                    .await
+                    {
+                        Ok(r) => r,
+                        Err(e) => Err(format!("worker: {e}")),
+                    }
                 }
-            }
-            Err(e) => Err(e),
-        };
+                Err(e) => Err(e),
+            };
         match result {
             Ok(()) => finish_file_op(op_id, "opened".into()),
             Err(e) => fail_file_op(&state, op_id, "open failed", e),
@@ -1476,5 +1808,74 @@ mod tests {
         assert!(upload_cancelled(id));
         clear_upload_cancel(id);
         assert!(!upload_cancelled(id));
+    }
+
+    #[test]
+    fn random_image_names_are_opaque_webp() {
+        let a = random_image_name();
+        let b = random_image_name();
+        assert_ne!(a, b, "8 random bytes must not repeat");
+        for n in [a, b] {
+            let hex = n
+                .strip_prefix("img_")
+                .unwrap()
+                .strip_suffix(".webp")
+                .unwrap();
+            assert_eq!(hex.len(), 16, "16 hex chars: {n}");
+            assert!(
+                hex.chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+                "lowercase hex only: {n}"
+            );
+        }
+    }
+
+    #[test]
+    fn pngs_reencode_to_webp_and_non_images_do_not() {
+        use image::ImageEncoder;
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            4,
+            4,
+            image::Rgb([200u8, 10, 10]),
+        ));
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(img.as_bytes(), 4, 4, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        let webp_bytes = maybe_webp(&png).expect("png qualifies for the image flow");
+        // RIFF container header at 0..4, WEBP magic at 8..12 — what the
+        // server will validate on POST /attachments/image.
+        assert_eq!(&webp_bytes[0..4], b"RIFF");
+        assert_eq!(&webp_bytes[8..12], b"WEBP");
+        // (WebP may legitimately exceed the PNG for tiny inputs; the
+        // contract sends the WebP regardless of relative size.)
+        assert!(maybe_webp(b"definitely not an image").is_none());
+    }
+
+    #[test]
+    fn animated_gifs_keep_the_encrypted_flow_but_single_frames_convert() {
+        let frame = |r: u8| {
+            image::Frame::new(image::RgbaImage::from_pixel(
+                4,
+                4,
+                image::Rgba([r, 0, 0, 255]),
+            ))
+        };
+        let mut animated = Vec::new();
+        image::codecs::gif::GifEncoder::new(&mut animated)
+            .encode_frames(vec![frame(40), frame(200)])
+            .unwrap();
+        assert!(is_animated_gif(&animated));
+        assert!(
+            maybe_webp(&animated).is_none(),
+            "animated gif falls back to the E2EE flow"
+        );
+
+        let mut single = Vec::new();
+        image::codecs::gif::GifEncoder::new(&mut single)
+            .encode_frames(vec![frame(200)])
+            .unwrap();
+        assert!(!is_animated_gif(&single));
+        assert!(maybe_webp(&single).is_some(), "single-frame gif converts");
     }
 }
