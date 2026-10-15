@@ -1313,9 +1313,6 @@ fn friends_panel(
 /// grows with its content, past it the field scrolls internally instead of
 /// pushing the message list away.
 const COMPOSER_MAX_ROWS: usize = 3;
-/// Vertical margin of the default `TextEdit` frame (egui 0.36 default
-/// `Margin::symmetric(4, 2)`); folded into the composer's height cap.
-const COMPOSER_MARGIN_Y: f32 = 2.0;
 /// Notice banner lifetime: the single notice slot auto-clears after this,
 /// so a stale banner can neither sit forever nor mask a later one.
 const NOTICE_TTL: Duration = Duration::from_secs(8);
@@ -1344,12 +1341,15 @@ const IMAGE_CACHE_CAP: usize = 48;
 /// sides, absorbing estimate error in unmeasured rows so the seams stay
 /// covered while scrolling.
 const ROW_OVERDRAW_PX: f32 = 96.0;
-/// One side of a message row's hover-action gutter: square icon button.
+/// One side of a message row's hover-action gutter: largest the bare hover
+/// icons get; rows shorter than this shrink the icons to fit.
 const MSG_ACTION_SIZE: f32 = 26.0;
 /// Width reserved on the right of EVERY message row (hovered or not) so
 /// the hover-revealed reply/delete buttons appearing there never shift
 /// the content: two [`MSG_ACTION_SIZE`] buttons plus their gap.
 const MSG_GUTTER_W: f32 = 2.0 * MSG_ACTION_SIZE + 8.0;
+/// Breathing room kept under the newest message row.
+const LIST_BOTTOM_PX: f32 = 8.0;
 
 fn chat(
     ui: &mut egui::Ui,
@@ -1595,9 +1595,9 @@ fn chat(
             // Attachment upload progress strip (above the composer).
             attachments::uploads_ui(ui, state);
 
-            // Composer: [text field][attach][send] — the buttons sit to
-            // the right of the input. Laid out right_to_left: send lands
-            // rightmost, attach beside it, and the field — added last —
+            // Composer: [text field][send][attach] — the buttons sit to
+            // the right of the input. Laid out right_to_left: attach lands
+            // rightmost, send beside it, and the field — added last —
             // fills all remaining width (its INFINITY desired width clamps
             // to what is left). egui centers each child against the row's
             // growing height, so the buttons stay level with the text
@@ -1616,13 +1616,13 @@ fn chat(
                     egui::Layout::right_to_left(egui::Align::Center),
                     |ui| {
                         let mut send_clicked = false;
-                        if icon_button(ui, "bytes://send.svg", ICON_SEND, "Send").clicked() {
-                            send_clicked = true;
-                        }
                         if icon_button(ui, "bytes://attach.svg", ICON_ATTACH, "Attach file")
                             .clicked()
                         {
                             attachments::begin_attach(ctx, mv, ch);
+                        }
+                        if icon_button(ui, "bytes://send.svg", ICON_SEND, "Send").clicked() {
+                            send_clicked = true;
                         }
                         let buf = mv.composer.entry(ch).or_default();
                         // The wrapping ScrollArea grows with the text up
@@ -1633,9 +1633,7 @@ fn chat(
                         let field = egui::ScrollArea::vertical()
                             .id_salt(("composer_scroll", ch))
                             .auto_shrink([false, true])
-                            .max_height(
-                                COMPOSER_MAX_ROWS as f32 * line_height + 2.0 * COMPOSER_MARGIN_Y,
-                            )
+                            .max_height(COMPOSER_MAX_ROWS as f32 * line_height)
                             .scroll_bar_visibility(
                                 egui::containers::scroll_area::ScrollBarVisibility::AlwaysHidden,
                             )
@@ -1647,7 +1645,11 @@ fn chat(
                                             "Message…  (Enter to send, Shift+Enter for a new line)",
                                         )
                                         .desired_width(f32::INFINITY)
-                                        .desired_rows(1),
+                                        .desired_rows(1)
+                                        // Keep only the horizontal inset:
+                                        // no vertical padding, the field
+                                        // hugs its lines exactly.
+                                        .margin(egui::Margin::symmetric(4, 0)),
                                 )
                             })
                             .inner;
@@ -1901,8 +1903,8 @@ fn chat(
                     cursor += h + spacing;
                     prev = Some((msg.sender_id, msg.created_at_ms.div_euclid(60_000)));
                 }
-                // No trailing space under the last row.
-                total = (cursor - spacing).max(0.0);
+                // A small breathing gap under the newest row.
+                total = (cursor - spacing + LIST_BOTTOM_PX).max(0.0);
                 rows = vis;
             }
             // Cache-miss fallback: one store pass for the few genuinely
@@ -2168,53 +2170,63 @@ fn message_row(
             // Hover-only actions, pinned to the row's far right: reply
             // for real messages, delete to the right of it for my own.
             // Hover covers the whole row — content plus gutter — via the
-            // content rect extended to the panel edge. A row with an
-            // armed delete confirmation keeps its buttons (the popup
-            // they anchor to must keep rendering).
+            // content rect extended to the panel edge. The buttons are
+            // PLACED into the reserved gutter (ui.put), not laid out, so
+            // they contribute no height — hovering never shifts the text —
+            // and they render as bare tinted icons with no button frame.
+            // A row with an armed delete confirmation keeps its buttons
+            // (the popup they anchor to must keep rendering).
             let armed = mv.msg_delete_confirm.is_some_and(|(id, _)| id == row.id);
             let row_rect = content.response.rect.with_max_x(ui.max_rect().max.x);
             let hovered = ui
                 .interact(row_rect, ui.id().with("hover"), egui::Sense::hover())
                 .hovered();
             if hovered || armed {
-                let strip_w = ui.available_width();
-                ui.allocate_ui_with_layout(
-                    egui::Vec2::new(strip_w, 0.0),
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| {
-                        // Right-to-left: added first lands rightmost —
-                        // delete sits right of reply.
-                        if row.is_mine && row.id > 0 {
-                            let trash = gutter_button(
-                                ui,
-                                "bytes://trash.svg",
-                                ICON_TRASH,
-                                "Delete message",
-                            );
-                            if trash.clicked() {
-                                mv.msg_delete_confirm = Some((row.id, Instant::now()));
-                            }
-                            msg_delete_confirm_popup(
-                                mv, state, store, rt, ctx, ch, row.id, &trash,
-                            );
-                        }
-                        if row.id > 0
-                            && gutter_button(ui, "bytes://reply.svg", ICON_REPLY, "Reply")
-                                .clicked()
-                        {
-                            // Arm the reply and resolve its banner here,
-                            // once — the snippet comes from the already-
-                            // cached plaintext.
-                            mv.reply_to.insert(ch, row.id);
-                            let snippet = mv
-                                .plaintexts
-                                .get(&row.id)
-                                .map(|p| truncate_preview(p))
-                                .unwrap_or_else(|| "[encrypted]".into());
-                            mv.reply_banner.insert(ch, (row.sender.clone(), snippet));
-                        }
-                    },
-                );
+                let size = egui::Vec2::splat(row_rect.height().min(MSG_ACTION_SIZE));
+                let cy = row_rect.center().y;
+                let mut right = row_rect.right() - 2.0;
+                let place = |right: &mut f32| {
+                    let rect =
+                        egui::Rect::from_center_size(egui::pos2(*right - size.x * 0.5, cy), size);
+                    *right -= size.x + 4.0;
+                    rect
+                };
+                if row.is_mine && row.id > 0 {
+                    // Placed first from the right edge, so delete sits
+                    // right of reply.
+                    let trash = gutter_button(
+                        ui,
+                        place(&mut right),
+                        "bytes://trash.svg",
+                        ICON_TRASH,
+                        "Delete message",
+                    );
+                    if trash.clicked() {
+                        mv.msg_delete_confirm = Some((row.id, Instant::now()));
+                    }
+                    msg_delete_confirm_popup(mv, state, store, rt, ctx, ch, row.id, &trash);
+                }
+                if row.id > 0 {
+                    let reply = gutter_button(
+                        ui,
+                        place(&mut right),
+                        "bytes://reply.svg",
+                        ICON_REPLY,
+                        "Reply",
+                    );
+                    if reply.clicked() {
+                        // Arm the reply and resolve its banner here,
+                        // once — the snippet comes from the already-
+                        // cached plaintext.
+                        mv.reply_to.insert(ch, row.id);
+                        let snippet = mv
+                            .plaintexts
+                            .get(&row.id)
+                            .map(|p| truncate_preview(p))
+                            .unwrap_or_else(|| "[encrypted]".into());
+                        mv.reply_banner.insert(ch, (row.sender.clone(), snippet));
+                    }
+                }
             }
         });
     });
@@ -2474,24 +2486,25 @@ fn confirm_delete(ui: &mut egui::Ui, mv: &mut MainView, channel_id: i64) -> bool
     }
 }
 
-/// One hover-revealed message-row action: a [`MSG_ACTION_SIZE`] square
-/// icon button, same white-stroke SVG convention as [`icon_button`] (kept
-/// separate because the composer buttons keep their natural size).
+/// One hover-revealed message-row action: a bare tinted SVG icon placed
+/// into `rect` — no button frame, and placed (not laid out) so it never
+/// contributes height to the row. Same white-stroke SVG convention as
+/// [`icon_button`].
 fn gutter_button(
     ui: &mut egui::Ui,
+    rect: egui::Rect,
     uri: &'static str,
     svg: &'static [u8],
     tooltip: &str,
 ) -> egui::Response {
     let tint = ui.visuals().widgets.inactive.fg_stroke.color;
-    ui.add_sized(
-        egui::Vec2::splat(MSG_ACTION_SIZE),
-        egui::Button::image(
-            egui::Image::from_bytes(uri, svg)
-                .fit_to_exact_size(egui::Vec2::splat(14.0))
-                .tint(tint),
-        ),
+    ui.put(
+        rect,
+        egui::Image::from_bytes(uri, svg)
+            .tint(tint)
+            .sense(egui::Sense::click()),
     )
+    .on_hover_cursor(egui::CursorIcon::PointingHand)
     .on_hover_text(tooltip)
 }
 
