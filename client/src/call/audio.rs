@@ -5,23 +5,29 @@
 //!
 //! * **Capture**: the cpal input callback downmixes to mono and resamples to
 //!   48 kHz (naive linear interpolation — fine for speech) into a shared
-//!   [`SpscRing`]. The session thread drains it, cuts 20 ms (960-sample)
-//!   frames and Opus-encodes each frame once for all peers. Mute stops the
-//!   capture push at the source (the encoder is simply not fed).
+//!   [`SpscRing`], entirely through preallocated scratch — once warmed up
+//!   neither cpal callback locks or allocates. The session thread drains the
+//!   ring, cuts 20 ms (960-sample) frames and Opus-encodes each frame once
+//!   for all peers. Mute stops the capture push at the source (the encoder
+//!   is simply not fed).
 //! * **Playback**: every peer owns a [`PeerSink`] (an SPSC ring the session
-//!   thread fills with decoded frames). The cpal output callback mixes all
-//!   started sinks with saturation, so the mixer cost is O(peers) per sample
-//!   and runs without taking any session lock.
+//!   thread fills with decoded frames). The session thread publishes the
+//!   peer list as an immutable snapshot (`arc-swap`); the cpal output
+//!   callback takes one lock-free snapshot load, bulk-pops every started
+//!   sink into per-peer scratch and mixes with saturation.
 //!
-//! The rings are single-producer/single-consumer with `SeqCst` indices —
-//! deliberately the obviously-correct variant over a clever one. Per-peer
-//! prebuffering (32 ms) keeps a new stream from crackling before it has
-//! jitter margin; overflow drops the oldest samples to bound latency.
+//! The rings are single-producer/single-consumer with Acquire/Release
+//! indices — the weakest obviously-correct ordering for SPSC (the producer
+//! publishes samples with a Release tail store, the consumer publishes
+//! reads with a Release head store). Per-peer prebuffering (32 ms) keeps a
+//! new stream from crackling before it has jitter margin; overflow drops
+//! the oldest samples to bound latency.
 
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 /// Samples per 20 ms frame at 48 kHz (Opus voip frame size).
@@ -52,8 +58,8 @@ pub struct SpscRing {
 }
 
 // Safety: the buffer is only ever touched through positions guarded by the
-// SeqCst head/tail atomics (producer writes below tail, consumer reads below
-// head), the classic SPSC arrangement.
+// Release/Acquire head/tail atomics (producer writes below tail, consumer
+// reads below head), the classic SPSC arrangement.
 unsafe impl Sync for SpscRing {}
 
 impl SpscRing {
@@ -70,8 +76,8 @@ impl SpscRing {
     }
 
     pub fn len(&self) -> usize {
-        let t = self.tail.load(Ordering::SeqCst);
-        let h = self.head.load(Ordering::SeqCst);
+        let t = self.tail.load(Ordering::Acquire);
+        let h = self.head.load(Ordering::Relaxed);
         (t - h) as usize
     }
 
@@ -81,23 +87,23 @@ impl SpscRing {
 
     /// Samples dropped because the ring was full.
     pub fn overflow_count(&self) -> u64 {
-        self.overflowed.load(Ordering::SeqCst)
+        self.overflowed.load(Ordering::Relaxed)
     }
 
     /// Reads that asked for more than was buffered.
     pub fn underflow_count(&self) -> u64 {
-        self.underflowed.load(Ordering::SeqCst)
+        self.underflowed.load(Ordering::Relaxed)
     }
 
     /// Producer side: append `samples`, dropping the oldest on overflow.
     pub fn push_slice(&self, samples: &[f32]) {
-        let mut tail = self.tail.load(Ordering::SeqCst);
-        let head = self.head.load(Ordering::SeqCst);
+        let mut tail = self.tail.load(Ordering::Relaxed); // producer-owned
+        let head = self.head.load(Ordering::Acquire);
         let used = (tail - head) as usize;
         if samples.len() + used > RING_SAMPLES {
             let drop_n = samples.len() + used - RING_SAMPLES;
-            self.head.store(head + drop_n as u64, Ordering::SeqCst);
-            self.overflowed.fetch_add(drop_n as u64, Ordering::SeqCst);
+            self.head.store(head + drop_n as u64, Ordering::Release);
+            self.overflowed.fetch_add(drop_n as u64, Ordering::Relaxed);
         }
         // Safety: producer-only region; consumer reads only below `head`.
         let buf = unsafe { &mut *self.buf.get() };
@@ -105,19 +111,19 @@ impl SpscRing {
             buf[(tail & self.mask as u64) as usize] = s;
             tail += 1;
         }
-        self.tail.store(tail, Ordering::SeqCst);
+        self.tail.store(tail, Ordering::Release); // publish the new samples
     }
 
     /// Consumer side: pop up to `out.len()` samples, returning how many
     /// were filled. The remainder is left untouched.
     pub fn pop_into(&self, out: &mut [f32]) -> usize {
-        let head = self.head.load(Ordering::SeqCst);
-        let tail = self.tail.load(Ordering::SeqCst);
+        let head = self.head.load(Ordering::Relaxed); // consumer-owned
+        let tail = self.tail.load(Ordering::Acquire);
         let avail = (tail - head) as usize;
         let n = avail.min(out.len());
         if n < out.len() {
             self.underflowed
-                .fetch_add((out.len() - n) as u64, Ordering::SeqCst);
+                .fetch_add((out.len() - n) as u64, Ordering::Relaxed);
         }
         // Safety: consumer-only region; producer writes only above `tail`.
         let buf = unsafe { &*self.buf.get() };
@@ -127,14 +133,14 @@ impl SpscRing {
             head += 1;
         }
         // Publish the read position only after the copies are done.
-        self.head.store(head, Ordering::SeqCst);
+        self.head.store(head, Ordering::Release);
         n
     }
 
     /// Drop everything; used when a peer leaves so stale audio cannot play.
     pub fn clear(&self) {
-        let tail = self.tail.load(Ordering::SeqCst);
-        self.head.store(tail, Ordering::SeqCst);
+        let tail = self.tail.load(Ordering::Acquire);
+        self.head.store(tail, Ordering::Release);
     }
 }
 
@@ -198,17 +204,26 @@ pub struct LinearResampler {
 }
 
 impl LinearResampler {
-    /// `input` is mono at `from_rate`; returns resampled samples at 48 kHz.
-    pub fn process(&mut self, input: &[f32], from_rate: u32) -> Vec<f32> {
+    /// `input` is mono at `from_rate`. Resampled 48 kHz samples are appended
+    /// to `out` (caller-owned scratch, so nothing allocates once warm) and
+    /// the slice to push is returned. On passthrough (`from_rate` is already
+    /// 48 kHz) the input is borrowed directly — no copy at all.
+    pub fn process_into<'a>(
+        &mut self,
+        input: &'a [f32],
+        from_rate: u32,
+        out: &'a mut Vec<f32>,
+    ) -> &'a [f32] {
         if input.is_empty() {
-            return Vec::new();
+            return input;
         }
         if from_rate == SAMPLE_RATE {
             self.last = *input.last().unwrap();
-            return input.to_vec();
+            return input;
         }
         let step = from_rate as f32 / SAMPLE_RATE as f32;
-        let mut out = Vec::with_capacity((input.len() as f32 / step).ceil() as usize + 1);
+        out.clear();
+        out.reserve((input.len() as f32 / step).ceil() as usize + 1);
         let mut pos = self.frac; // position (in samples) relative to input[0]
         while pos < input.len() as f32 {
             let i = pos.floor() as usize;
@@ -224,15 +239,18 @@ impl LinearResampler {
     }
 }
 
-/// Average interleaved channels down to mono.
-pub fn downmix_to_mono(input: &[f32], channels: usize) -> Vec<f32> {
+/// Average interleaved channels down to mono, appending to `out` (caller
+/// scratch; capacity is reused across calls so the input callback never
+/// allocates once warm).
+pub fn downmix_into(input: &[f32], channels: usize, out: &mut Vec<f32>) {
     if channels <= 1 {
-        return input.to_vec();
+        out.extend_from_slice(input);
+        return;
     }
-    input
-        .chunks(channels)
-        .map(|c| c.iter().sum::<f32>() / channels as f32)
-        .collect()
+    out.reserve(input.len() / channels);
+    for c in input.chunks(channels) {
+        out.push(c.iter().sum::<f32>() / channels as f32);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -245,6 +263,9 @@ pub fn downmix_to_mono(input: &[f32], channels: usize) -> Vec<f32> {
 /// SSRC/seq/clock.
 pub struct MicEncoder {
     enc: opus::Encoder,
+    /// Reused max-packet-size (1275 B) output scratch; Opus overwrites
+    /// `[..n]`, only the right-sized packet is copied out.
+    buf: Vec<u8>,
     /// Bytes of the last encoded frame (for tests/statistics).
     pub last_len: usize,
 }
@@ -256,16 +277,32 @@ impl MicEncoder {
         let _ = enc.set_bitrate(opus::Bitrate::Bits(24_000));
         let _ = enc.set_inband_fec(true);
         let _ = enc.set_packet_loss_perc(15);
-        Ok(MicEncoder { enc, last_len: 0 })
+        Ok(MicEncoder {
+            enc,
+            buf: vec![0u8; 1275], // max Opus packet size, allocated once
+            last_len: 0,
+        })
     }
 
     /// Encode one 960-sample frame into Opus bytes.
     pub fn encode_frame(&mut self, frame: &[f32]) -> Result<Vec<u8>, opus::Error> {
-        let mut buf = vec![0u8; 1275];
-        let n = self.enc.encode_float(frame, &mut buf)?;
-        buf.truncate(n);
+        let n = self.enc.encode_float(frame, &mut self.buf)?;
         self.last_len = n;
-        Ok(buf)
+        Ok(self.buf[..n].to_vec())
+    }
+
+    /// Encode into a caller-owned buffer — zero steady-state allocation on
+    /// the send path; the caller reuses one Vec across frames.
+    pub fn encode_frame_into(
+        &mut self,
+        frame: &[f32],
+        out: &mut Vec<u8>,
+    ) -> Result<usize, opus::Error> {
+        let n = self.enc.encode_float(frame, &mut self.buf)?;
+        self.last_len = n;
+        out.clear();
+        out.extend_from_slice(&self.buf[..n]);
+        Ok(n)
     }
 }
 
@@ -273,6 +310,10 @@ impl MicEncoder {
 pub struct PeerDecoder {
     dec: opus::Decoder,
     sink: Arc<PeerSink>,
+    /// Reused decode scratch (60 ms headroom), allocated once. Opus fills
+    /// `[..n]`; stale samples beyond `n` are never read, so it is never
+    /// re-zeroed.
+    pcm: Vec<f32>,
 }
 
 impl PeerDecoder {
@@ -280,6 +321,7 @@ impl PeerDecoder {
         Ok(PeerDecoder {
             dec: opus::Decoder::new(SAMPLE_RATE, opus::Channels::Mono)?,
             sink,
+            pcm: vec![0f32; FRAME_SAMPLES * 3], // headroom for 60 ms frames
         })
     }
 
@@ -290,17 +332,12 @@ impl PeerDecoder {
     /// Decode one RTP payload into the sink. An empty payload runs packet
     /// loss concealment (PLC), which we also use on visible jitter gaps.
     pub fn decode(&mut self, payload: &[u8]) {
-        let mut pcm = vec![0f32; FRAME_SAMPLES * 3]; // headroom for 60 ms frames
-        match self.dec.decode_float(payload, &mut pcm, false) {
-            Ok(n) => {
-                pcm.truncate(n);
-                self.sink.push_samples(&pcm);
-            }
+        match self.dec.decode_float(payload, &mut self.pcm, false) {
+            Ok(n) => self.sink.push_samples(&self.pcm[..n]),
             Err(_) => {
                 // Corrupt packet: conceal one frame rather than glitch.
-                if let Ok(n) = self.dec.decode_float(&[], &mut pcm, false) {
-                    pcm.truncate(n);
-                    self.sink.push_samples(&pcm);
+                if let Ok(n) = self.dec.decode_float(&[], &mut self.pcm, false) {
+                    self.sink.push_samples(&self.pcm[..n]);
                 }
             }
         }
@@ -308,10 +345,8 @@ impl PeerDecoder {
 
     /// Fill one concealment frame (used when nothing arrived this pump).
     pub fn conceal(&mut self) {
-        let mut pcm = vec![0f32; FRAME_SAMPLES];
-        if let Ok(n) = self.dec.decode_float(&[], &mut pcm, false) {
-            pcm.truncate(n);
-            self.sink.push_samples(&pcm);
+        if let Ok(n) = self.dec.decode_float(&[], &mut self.pcm, false) {
+            self.sink.push_samples(&self.pcm[..n]);
         }
     }
 }
@@ -328,8 +363,11 @@ impl PeerDecoder {
 pub struct AudioIo {
     /// Mono 48 kHz microphone samples (empty while muted).
     pub mic: Arc<SpscRing>,
-    /// Registered peer sinks; the output callback mixes all of them.
-    pub sinks: Arc<Mutex<Vec<Arc<PeerSink>>>>,
+    /// Registered peer sinks behind a lock-free snapshot: the session
+    /// thread publishes a fresh immutable list on membership change, the
+    /// output callback takes a single `load_full`. (`ArcSwap<Vec<..>>`
+    /// rather than `Arc<[..]>` — arc-swap cannot hold unsized pointees.)
+    pub sinks: Arc<ArcSwap<Vec<Arc<PeerSink>>>>,
     pub mute: Arc<AtomicBool>,
     /// Device description for status text.
     pub device_note: String,
@@ -371,6 +409,7 @@ impl AudioIo {
         let mute_in = mute.clone();
         let mut resampler = LinearResampler::default();
         let mut mono_scratch: Vec<f32> = Vec::new();
+        let mut resampled_scratch: Vec<f32> = Vec::new();
         let input = in_dev
             .build_input_stream(
                 in_config,
@@ -378,10 +417,14 @@ impl AudioIo {
                     if mute_in.load(Ordering::Relaxed) {
                         return; // muted: capture nothing at the source
                     }
+                    // Everything runs through closure-owned scratch: after
+                    // the first few callbacks this path neither locks nor
+                    // allocates.
                     mono_scratch.clear();
-                    mono_scratch.extend(downmix_to_mono(data, in_channels));
-                    let resampled = resampler.process(&mono_scratch, in_rate);
-                    mic_in.push_slice(&resampled);
+                    downmix_into(data, in_channels, &mut mono_scratch);
+                    let to_push =
+                        resampler.process_into(&mono_scratch, in_rate, &mut resampled_scratch);
+                    mic_in.push_slice(to_push);
                 },
                 |err| {
                     // Device errors surface through the ring's health; a
@@ -414,38 +457,51 @@ impl AudioIo {
         };
         let out_channels = out_config.channels as usize;
         let out_rate = out_config.sample_rate; // captured before the move below
-        let sinks: Arc<Mutex<Vec<Arc<PeerSink>>>> = Arc::new(Mutex::new(Vec::new()));
+        let sinks = Arc::new(ArcSwap::from_pointee(Vec::<Arc<PeerSink>>::new()));
         let sinks_out = sinks.clone();
         let mut mix_scratch: Vec<f32> = Vec::new();
+        let mut peer_scratch: Vec<Vec<f32>> = Vec::new();
         let output = out_dev
             .build_output_stream(
                 out_config,
                 move |data: &mut [f32], _info: &cpal::OutputCallbackInfo| {
-                    let peers = sinks_out.lock().unwrap_or_else(|p| p.into_inner());
+                    // One lock-free snapshot load; membership changes on the
+                    // session thread publish a fresh immutable list.
+                    let peers = sinks_out.load_full();
                     let frames = data.len() / out_channels;
+                    // Grow-only scratch: nothing allocates here once the
+                    // peer count and device buffer size have settled.
+                    if peer_scratch.len() < peers.len() {
+                        peer_scratch.resize(peers.len(), Vec::new());
+                    }
                     mix_scratch.clear();
                     mix_scratch.resize(frames, 0.0);
-                    let mut one = [0f32; 1];
-                    for slot in mix_scratch.iter_mut() {
-                        let mut sum = 0.0f32;
-                        for peer in peers.iter() {
-                            if !peer.started.load(Ordering::Relaxed)
-                                && peer.ring.len() >= PREBUFFER_SAMPLES
-                            {
-                                peer.started.store(true, Ordering::Relaxed);
-                            }
-                            if peer.started.load(Ordering::Relaxed) {
-                                let n = peer.ring.pop_into(&mut one);
-                                if n > 0 {
-                                    sum += one[0];
-                                }
-                            }
+                    for (i, peer) in peers.iter().enumerate() {
+                        if !peer.started.load(Ordering::Relaxed)
+                            && peer.ring.len() >= PREBUFFER_SAMPLES
+                        {
+                            peer.started.store(true, Ordering::Relaxed);
                         }
-                        *slot = sum.clamp(-1.0, 1.0);
+                        if !peer.started.load(Ordering::Relaxed) {
+                            continue;
+                        }
+                        let scratch = &mut peer_scratch[i];
+                        if scratch.len() != frames {
+                            scratch.clear();
+                            scratch.resize(frames, 0.0);
+                        }
+                        // Bulk-pop this peer's frames once, then mix from
+                        // the local buffer — two ring atomics per peer per
+                        // callback instead of two per sample.
+                        let n = peer.ring.pop_into(scratch);
+                        for (slot, s) in mix_scratch.iter_mut().zip(scratch.iter()).take(n) {
+                            *slot += *s;
+                        }
                     }
                     for (frame, s) in data.chunks_exact_mut(out_channels).zip(mix_scratch.iter()) {
+                        let s = s.clamp(-1.0, 1.0);
                         for ch in frame.iter_mut() {
-                            *ch = *s;
+                            *ch = s;
                         }
                     }
                 },
@@ -472,19 +528,25 @@ impl AudioIo {
         })
     }
 
+    /// Session thread only: publish a new snapshot with the sink appended.
     pub fn add_sink(&self, sink: Arc<PeerSink>) {
-        self.sinks
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .push(sink);
+        let cur = self.sinks.load_full();
+        let mut next = Vec::with_capacity(cur.len() + 1);
+        next.extend(cur.iter().cloned());
+        next.push(sink);
+        self.sinks.store(Arc::new(next));
     }
 
+    /// Session thread only: publish a new snapshot without the sink.
     pub fn remove_sink(&self, sink: &Arc<PeerSink>) {
         sink.reset();
-        self.sinks
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .retain(|s| !Arc::ptr_eq(s, sink));
+        let cur = self.sinks.load_full();
+        let next: Vec<Arc<PeerSink>> = cur
+            .iter()
+            .filter(|s| !Arc::ptr_eq(s, sink))
+            .cloned()
+            .collect();
+        self.sinks.store(Arc::new(next));
     }
 }
 
@@ -585,15 +647,22 @@ mod tests {
 
     #[test]
     fn downmix_averages_channels() {
-        assert_eq!(downmix_to_mono(&[1.0, 3.0, 2.0, 4.0], 2), vec![2.0, 3.0]);
-        assert_eq!(downmix_to_mono(&[1.0, 2.0], 1), vec![1.0, 2.0]);
+        let mut mono = Vec::new();
+        downmix_into(&[1.0, 3.0, 2.0, 4.0], 2, &mut mono);
+        assert_eq!(mono, vec![2.0, 3.0]);
+        mono.clear();
+        downmix_into(&[1.0, 2.0], 1, &mut mono);
+        assert_eq!(mono, vec![1.0, 2.0]);
     }
 
     #[test]
     fn resampler_preserves_sample_count_at_same_rate() {
         let mut r = LinearResampler::default();
-        let out = r.process(&[0.1, 0.2, 0.3], SAMPLE_RATE);
-        assert_eq!(out, vec![0.1, 0.2, 0.3]);
+        let mut out = Vec::new();
+        // Passthrough must borrow the input untouched (no copy).
+        let res = r.process_into(&[0.1, 0.2, 0.3], SAMPLE_RATE, &mut out);
+        assert_eq!(res, &[0.1, 0.2, 0.3]);
+        assert!(out.is_empty());
     }
 
     #[test]
@@ -607,7 +676,8 @@ mod tests {
             .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / from as f32).sin())
             .collect();
         let mut r = LinearResampler::default();
-        let out = r.process(&input, from);
+        let mut out = Vec::new();
+        r.process_into(&input, from, &mut out);
         let crossings = out
             .windows(2)
             .filter(|w| (w[0] < 0.0) != (w[1] < 0.0))

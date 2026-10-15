@@ -27,6 +27,19 @@ pub trait KeyStore: Send + Sync {
     fn put(&self, scope: &str, blob: &[u8]);
     /// Remove the blob under `scope`, if present.
     fn delete(&self, scope: &str);
+    /// Store several scope/blob pairs in one atomic write — one transaction
+    /// and a single commit where the backing store supports it (SQLite does).
+    ///
+    /// The engine pickles per-table and calls this once per persist with only
+    /// the tables an operation actually changed. The default loops over
+    /// [`KeyStore::put`], so stores without a batch facility (and the test
+    /// doubles) keep working; production stores should override it so a
+    /// multi-table persist commits once.
+    fn put_batch(&self, puts: &[(&str, &[u8])]) {
+        for (scope, blob) in puts {
+            self.put(scope, blob);
+        }
+    }
 }
 
 /// Trivial in-memory [`KeyStore`], used by the engine's unit tests and handy

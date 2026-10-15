@@ -82,9 +82,29 @@ use olm::{
     session_to_record,
 };
 
+/// Dirty-table bits for [`EngineInner::dirty`]: each operation marks exactly
+/// the persisted tables it changed, and [`Engine::persist`] re-pickles and
+/// rewrites only those (one batched store write) instead of the whole state.
+mod dirty {
+    /// Pickled Olm account (OTKs generated or consumed, identity replaced).
+    pub(crate) const OLM_ACCOUNT: u8 = 1 << 0;
+    /// Table of pickled Olm peer sessions (ratchet advanced, session added).
+    pub(crate) const OLM_SESSIONS: u8 = 1 << 1;
+    /// Table of pickled outbound Megolm sessions.
+    pub(crate) const MEGOLM_OUT: u8 = 1 << 2;
+    /// Table of pickled inbound Megolm sessions.
+    pub(crate) const MEGOLM_IN: u8 = 1 << 3;
+    /// Queued Megolm session shares not yet mailed out.
+    pub(crate) const PENDING_SHARES: u8 = 1 << 4;
+    /// Everything — what [`Engine::new`] persists up front.
+    pub(crate) const ALL: u8 =
+        OLM_ACCOUNT | OLM_SESSIONS | MEGOLM_OUT | MEGOLM_IN | PENDING_SHARES;
+}
+
 /// The E2EE engine. Interior-mutable and thread-safe (`Send + Sync`);
-/// every operation picks a lock, mutates the live vodozemac state, and
-/// re-pickles into the [`KeyStore`] before returning.
+/// every operation picks a lock, mutates the live vodozemac state, marks the
+/// persisted tables it touched dirty, and re-pickles only those into the
+/// [`KeyStore`] before returning.
 pub struct Engine {
     store: Arc<dyn KeyStore>,
     pickle_key: [u8; 32],
@@ -101,6 +121,15 @@ struct EngineInner {
     megolm_in: HashMap<(i64, i64, String), InboundGroupSession>,
     /// Megolm session keys created/rotated but not yet mailed to peers.
     pending_shares: Vec<PendingShare>,
+    /// Bitset of `dirty::*` tables changed since the last successful
+    /// [`Engine::persist`]. Bits survive a failed persist so the next
+    /// operation retries the write.
+    dirty: u8,
+    /// Session id that last decrypted a message per (channel, sender), tried
+    /// first when [`Engine::megolm_decrypt`] is called without a session id.
+    /// An in-memory fast path only — never persisted, never authoritative;
+    /// a miss simply falls back to the full session scan.
+    megolm_hint: HashMap<(i64, i64), String>,
 }
 
 impl Engine {
@@ -195,14 +224,16 @@ impl Engine {
                 megolm_out,
                 megolm_in,
                 pending_shares,
+                dirty: dirty::ALL,
+                megolm_hint: HashMap::new(),
             }),
         };
         // Persist immediately so a fresh account survives even if the app
         // dies before the first real operation.
         {
-            let inner = engine.lock();
+            let mut inner = engine.lock();
             engine
-                .persist(&inner)
+                .persist(&mut inner)
                 .context("persisting fresh engine state")?;
         }
         Ok(engine)
@@ -242,9 +273,10 @@ impl Engine {
             .collect();
         wire.sort();
         inner.account.mark_keys_as_published();
+        inner.dirty |= dirty::OLM_ACCOUNT;
         // Persisting is best-effort: the keys still work unpickled even if
         // this write fails, since the private halves live in the account.
-        if let Err(e) = self.persist(&inner) {
+        if let Err(e) = self.persist(&mut inner) {
             eprintln!("bysyc crypto: failed to persist account after OTK upload: {e}");
         }
         wire
@@ -277,7 +309,7 @@ impl Engine {
             peer_otk.as_ref(),
             plaintext,
         )?;
-        self.persist(&inner)
+        self.persist(&mut inner)
             .context("persisting olm state after encrypt")?;
         olm_message_to_b64(&message)
     }
@@ -299,7 +331,7 @@ impl Engine {
         let mut inner = self.lock();
         let message = olm_message_from_b64(ciphertext_b64)?;
         let plaintext = olm_decrypt(&mut inner, peer_id, peer_identity, &message)?;
-        self.persist(&inner)
+        self.persist(&mut inner)
             .context("persisting olm state after decrypt")?;
         String::from_utf8(plaintext).context("olm plaintext is not utf-8")
     }
@@ -326,6 +358,7 @@ impl Engine {
             let fresh = OutboundSession::new(now);
             inner.pending_shares.push(fresh.pending_share(channel_id));
             inner.megolm_out.insert(channel_id, fresh);
+            inner.dirty |= dirty::MEGOLM_OUT | dirty::PENDING_SHARES;
         }
         let out = inner
             .megolm_out
@@ -334,7 +367,8 @@ impl Engine {
         let session_id = out.session.session_id();
         let message = out.session.encrypt(plaintext);
         out.message_count += 1;
-        self.persist(&inner)
+        inner.dirty |= dirty::MEGOLM_OUT;
+        self.persist(&mut inner)
             .context("persisting megolm outbound after encrypt")?;
         Ok((session_id, message.to_base64()))
     }
@@ -366,13 +400,15 @@ impl Engine {
                 // than the incoming one → replace to widen history.
                 if matches!(existing.compare(&mut incoming), SessionOrdering::Worse) {
                     inner.megolm_in.insert(key, incoming);
+                    inner.dirty |= dirty::MEGOLM_IN;
                 }
             }
             None => {
                 inner.megolm_in.insert(key, incoming);
+                inner.dirty |= dirty::MEGOLM_IN;
             }
         }
-        self.persist(&inner)
+        self.persist(&mut inner)
             .context("persisting megolm inbound after import")
     }
 
@@ -389,7 +425,11 @@ impl Engine {
         session_id: &str,
         ciphertext_b64: &str,
     ) -> anyhow::Result<String> {
-        let mut inner = self.lock();
+        let mut guard = self.lock();
+        // A plain `&mut EngineInner` reborrow (instead of going through the
+        // guard's Deref everywhere) lets borrowck split borrows per field, so
+        // the scan below can hold `&mut` sessions while the hint updates.
+        let inner = &mut *guard;
         let message = megolm_message_from_b64(ciphertext_b64)?;
 
         let decrypt_one =
@@ -411,21 +451,43 @@ impl Engine {
                      sender {sender_id}"
                 )
             })?;
-            return decrypt_one(session_id, session);
+            let text = decrypt_one(session_id, session)?;
+            inner
+                .megolm_hint
+                .insert((channel_id, sender_id), session_id.to_string());
+            return Ok(text);
         }
 
-        let mut candidates: Vec<&mut InboundGroupSession> = inner
+        // No session id given (the app passes "" on every message): try the
+        // sender's most recently successful session first — steady state is
+        // the same session as the previous message — then fall back to a
+        // linear scan over every session imported from that sender.
+        if let Some(hint) = inner.megolm_hint.get(&(channel_id, sender_id)).cloned() {
+            let key = (channel_id, sender_id, hint.clone());
+            let hinted = inner
+                .megolm_in
+                .get_mut(&key)
+                .and_then(|session| decrypt_one(&hint, session).ok());
+            if let Some(text) = hinted {
+                return Ok(text);
+            }
+        }
+
+        let mut candidates: Vec<(String, &mut InboundGroupSession)> = inner
             .megolm_in
             .iter_mut()
             .filter(|((ch, sender, _), _)| *ch == channel_id && *sender == sender_id)
-            .map(|(_, session)| session)
+            .map(|((_, _, sid), session)| (sid.clone(), session))
             .collect();
         let mut last_err = anyhow::anyhow!(
             "no megolm session imported for channel {channel_id} sender {sender_id}"
         );
-        for session in candidates.iter_mut() {
-            match decrypt_one("", session) {
-                Ok(text) => return Ok(text),
+        for (sid, session) in candidates.iter_mut() {
+            match decrypt_one(sid, session) {
+                Ok(text) => {
+                    inner.megolm_hint.insert((channel_id, sender_id), sid.clone());
+                    return Ok(text);
+                }
                 Err(e) => last_err = e,
             }
         }
@@ -458,19 +520,22 @@ impl Engine {
         peers: &[(i64, String, Option<(String, String)>)],
     ) -> Vec<(i64, String)> {
         let mut inner = self.lock();
-        inner
-            .megolm_out
-            .entry(channel_id)
-            .or_insert_with(|| OutboundSession::new(now_ms()));
+        use std::collections::hash_map::Entry;
+        if let Entry::Vacant(slot) = inner.megolm_out.entry(channel_id) {
+            slot.insert(OutboundSession::new(now_ms()));
+            inner.dirty |= dirty::MEGOLM_OUT;
+        }
         let Some(out) = inner.megolm_out.get(&channel_id) else {
             return Vec::new();
         };
         let current_sid = out.session.session_id();
-        let share = inner
+        let queued = inner
             .pending_shares
             .iter()
             .find(|p| p.channel_id == channel_id && p.session_id == current_sid)
-            .cloned()
+            .cloned();
+        let share = queued
+            .clone()
             .unwrap_or_else(|| out.pending_share(channel_id));
         let json = match (Envelope::SessionShare {
             channel_id: share.channel_id,
@@ -503,12 +568,13 @@ impl Engine {
         // a later `share_envelopes` for a newcomer regenerates at the current
         // index (join point) instead of re-sending the index-0 key. If
         // nobody could be reached, keep it queued for a retry.
-        if !out_vec.is_empty() {
+        if !out_vec.is_empty() && queued.is_some() {
             inner
                 .pending_shares
                 .retain(|p| !(p.channel_id == channel_id && p.session_id == current_sid));
+            inner.dirty |= dirty::PENDING_SHARES;
         }
-        if let Err(e) = self.persist(&inner) {
+        if let Err(e) = self.persist(&mut inner) {
             eprintln!("bysyc crypto: persisting after share failed: {e}");
         }
         out_vec
@@ -525,7 +591,10 @@ impl Engine {
     pub fn drain_pending_shares(&self) -> Vec<PendingShare> {
         let mut inner = self.lock();
         let drained = std::mem::take(&mut inner.pending_shares);
-        if let Err(e) = self.persist(&inner) {
+        if !drained.is_empty() {
+            inner.dirty |= dirty::PENDING_SHARES;
+        }
+        if let Err(e) = self.persist(&mut inner) {
             eprintln!("bysyc crypto: persisting drained shares failed: {e}");
         }
         drained
@@ -614,50 +683,76 @@ impl Engine {
         let mut inner = self.lock();
         inner.account = account;
         inner.olm_sessions.clear();
-        self.persist(&inner).context("persisting imported identity")
+        inner.dirty |= dirty::OLM_ACCOUNT | dirty::OLM_SESSIONS;
+        self.persist(&mut inner).context("persisting imported identity")
     }
 
-    /// Pickle all engine state into the [`KeyStore`].
-    fn persist(&self, inner: &EngineInner) -> anyhow::Result<()> {
-        self.store.put(
-            SCOPE_OLM_ACCOUNT,
-            inner.account.pickle().encrypt(&self.pickle_key).as_bytes(),
-        );
+    /// Pickle exactly the state tables operations marked dirty (bitset in
+    /// `inner.dirty`) into the [`KeyStore`], as one batched write — a single
+    /// transaction/commit where the store supports it. Untouched tables are
+    /// neither re-pickled nor rewritten, so a steady-state encrypt or decrypt
+    /// costs one table write instead of the whole state. The dirty bits are
+    /// cleared only after the batch goes through, so a failed persist is
+    /// retried by the next operation. The on-disk format (one blob per scope,
+    /// same record shapes) is unchanged.
+    fn persist(&self, inner: &mut EngineInner) -> anyhow::Result<()> {
+        let dirty = inner.dirty;
+        if dirty == 0 {
+            return Ok(());
+        }
 
-        let olm: Vec<OlmSessionRecord> = inner
-            .olm_sessions
+        let mut writes: Vec<(&'static str, Vec<u8>)> = Vec::new();
+        if dirty & dirty::OLM_ACCOUNT != 0 {
+            let blob = inner.account.pickle().encrypt(&self.pickle_key).into_bytes();
+            writes.push((SCOPE_OLM_ACCOUNT, blob));
+        }
+        if dirty & dirty::OLM_SESSIONS != 0 {
+            let olm: Vec<OlmSessionRecord> = inner
+                .olm_sessions
+                .iter()
+                .flat_map(|(peer_id, sessions)| {
+                    sessions
+                        .iter()
+                        .map(|s| session_to_record(*peer_id, s, &self.pickle_key))
+                })
+                .collect();
+            writes.push((SCOPE_OLM_SESSIONS, json_blob(&olm)?));
+        }
+        if dirty & dirty::MEGOLM_OUT != 0 {
+            let out: Vec<OutboundSessionRecord> = inner
+                .megolm_out
+                .iter()
+                .map(|(channel_id, out)| out.to_record(*channel_id, &self.pickle_key))
+                .collect();
+            writes.push((SCOPE_MEGOLM_OUT, json_blob(&out)?));
+        }
+        if dirty & dirty::MEGOLM_IN != 0 {
+            let inb: Vec<InboundSessionRecord> = inner
+                .megolm_in
+                .iter()
+                .map(|((channel_id, sender_id, _), session)| {
+                    inbound_to_record(*channel_id, *sender_id, session, &self.pickle_key)
+                })
+                .collect();
+            writes.push((SCOPE_MEGOLM_IN, json_blob(&inb)?));
+        }
+        if dirty & dirty::PENDING_SHARES != 0 {
+            writes.push((SCOPE_PENDING_SHARES, json_blob(&inner.pending_shares)?));
+        }
+
+        let batch: Vec<(&str, &[u8])> = writes
             .iter()
-            .flat_map(|(peer_id, sessions)| {
-                sessions
-                    .iter()
-                    .map(|s| session_to_record(*peer_id, s, &self.pickle_key))
-            })
+            .map(|(scope, blob)| (*scope, blob.as_slice()))
             .collect();
-        put_json(&*self.store, SCOPE_OLM_SESSIONS, &olm)?;
-
-        let out: Vec<OutboundSessionRecord> = inner
-            .megolm_out
-            .iter()
-            .map(|(channel_id, out)| out.to_record(*channel_id, &self.pickle_key))
-            .collect();
-        put_json(&*self.store, SCOPE_MEGOLM_OUT, &out)?;
-
-        let inb: Vec<InboundSessionRecord> = inner
-            .megolm_in
-            .iter()
-            .map(|((channel_id, sender_id, _), session)| {
-                inbound_to_record(*channel_id, *sender_id, session, &self.pickle_key)
-            })
-            .collect();
-        put_json(&*self.store, SCOPE_MEGOLM_IN, &inb)?;
-
-        put_json(&*self.store, SCOPE_PENDING_SHARES, &inner.pending_shares)?;
+        self.store.put_batch(&batch);
+        inner.dirty &= !dirty;
         Ok(())
     }
 }
 
 /// Core Olm encrypt used by [`Engine::olm_encrypt_to`] and
-/// [`Engine::share_envelopes`]; mutates `inner` so callers must persist.
+/// [`Engine::share_envelopes`]; mutates `inner` (marking the session table
+/// dirty) so callers must persist.
 fn olm_encrypt(
     inner: &mut EngineInner,
     peer_id: i64,
@@ -670,9 +765,11 @@ fn olm_encrypt(
         .get_mut(&peer_id)
         .and_then(|v| v.last_mut())
     {
-        return session
+        let message = session
             .encrypt(plaintext)
-            .map_err(|e| anyhow::anyhow!("olm encrypt failed: {e}"));
+            .map_err(|e| anyhow::anyhow!("olm encrypt failed: {e}"))?;
+        inner.dirty |= dirty::OLM_SESSIONS;
+        return Ok(message);
     }
 
     // No session yet: bootstrap one. vodozemac's 3DH requires the peer's
@@ -694,10 +791,12 @@ fn olm_encrypt(
         .encrypt(plaintext)
         .map_err(|e| anyhow::anyhow!("olm encrypt failed: {e}"))?;
     inner.olm_sessions.entry(peer_id).or_default().push(session);
+    inner.dirty |= dirty::OLM_SESSIONS;
     Ok(message)
 }
 
-/// Core Olm decrypt used by [`Engine::olm_decrypt_from`].
+/// Core Olm decrypt used by [`Engine::olm_decrypt_from`]; mutates `inner`
+/// (marking what changed dirty) so callers must persist.
 fn olm_decrypt(
     inner: &mut EngineInner,
     peer_id: i64,
@@ -708,6 +807,7 @@ fn olm_decrypt(
     if let Some(sessions) = inner.olm_sessions.get_mut(&peer_id) {
         for session in sessions.iter_mut().rev() {
             if let Ok(plaintext) = session.decrypt(message) {
+                inner.dirty |= dirty::OLM_SESSIONS;
                 return Ok(plaintext);
             }
         }
@@ -726,6 +826,8 @@ fn olm_decrypt(
         let sessions = inner.olm_sessions.entry(peer_id).or_default();
         sessions.retain(|s| s.session_id() != session_id);
         sessions.push(created.session);
+        // The account consumed the claimed one-time key; a session was added.
+        inner.dirty |= dirty::OLM_ACCOUNT | dirty::OLM_SESSIONS;
         return Ok(created.plaintext);
     }
 
@@ -748,14 +850,8 @@ fn load_vec<T: serde::de::DeserializeOwned>(
     }
 }
 
-fn put_json<T: serde::Serialize>(
-    store: &dyn KeyStore,
-    scope: &str,
-    value: &T,
-) -> anyhow::Result<()> {
-    let blob = serde_json::to_vec(value).context("serializing engine state")?;
-    store.put(scope, &blob);
-    Ok(())
+fn json_blob<T: serde::Serialize>(value: &T) -> anyhow::Result<Vec<u8>> {
+    serde_json::to_vec(value).context("serializing engine state")
 }
 
 // ---------------------------------------------------------------------------
@@ -785,6 +881,34 @@ mod tests {
                 bob: Engine::new(Arc::new(MemKeyStore::default()), PASS.into()).unwrap(),
                 carol: Engine::new(Arc::new(MemKeyStore::default()), PASS.into()).unwrap(),
             }
+        }
+
+        /// Share alice's current outbound session for `channel` with
+        /// `recipient` over the real Olm path and import it there.
+        fn share_current(&self, channel: i64, recipient: &Engine, recipient_id: i64) {
+            let key = recipient.identity_key();
+            let otk = recipient.uploadable_otks(1).pop().unwrap();
+            let (id, otk_key) = otk.split_once(':').unwrap();
+            let shared = self.alice.share_envelopes(
+                channel,
+                &[(recipient_id, key, Some((id.into(), otk_key.into())))],
+            );
+            assert_eq!(shared.len(), 1, "the recipient must be shared with");
+            let (_, ct) = &shared[0];
+            let json = recipient
+                .olm_decrypt_from(ALICE, &self.alice.identity_key(), ct)
+                .unwrap();
+            let Envelope::SessionShare {
+                channel_id,
+                session_id,
+                session_key,
+            } = Envelope::from_json(&json).unwrap()
+            else {
+                panic!("expected a SessionShare envelope, got {json}");
+            };
+            recipient
+                .megolm_import(channel_id, ALICE, &session_id, &session_key)
+                .unwrap();
         }
     }
 
@@ -1145,6 +1269,152 @@ mod tests {
         );
         assert_eq!(pending[0].session_id, sid_second);
         assert_eq!(pending[0].channel_id, 7);
+    }
+
+    /// (dirty) persist rewrites only the tables an operation touched: an olm
+    /// bootstrap/decrypt never rewrites megolm state, a megolm encrypt never
+    /// rewrites the account, and a megolm decrypt writes nothing at all
+    /// (the inbound ratchet position is a cache, not durable state).
+    #[test]
+    fn persist_writes_only_dirty_tables() {
+        struct Recording {
+            mem: MemKeyStore,
+            writes: Mutex<Vec<String>>,
+        }
+        impl KeyStore for Recording {
+            fn get(&self, scope: &str) -> Option<Vec<u8>> {
+                self.mem.get(scope)
+            }
+            fn put(&self, scope: &str, blob: &[u8]) {
+                self.writes.lock().unwrap().push(scope.to_string());
+                self.mem.put(scope, blob);
+            }
+            fn delete(&self, scope: &str) {
+                self.mem.delete(scope);
+            }
+        }
+
+        let alice_store = Arc::new(Recording {
+            mem: MemKeyStore::default(),
+            writes: Mutex::new(Vec::new()),
+        });
+        let bob_store = Arc::new(Recording {
+            mem: MemKeyStore::default(),
+            writes: Mutex::new(Vec::new()),
+        });
+        let wrote = |store: &Arc<Recording>| std::mem::take(&mut *store.writes.lock().unwrap());
+
+        let alice = Engine::new(alice_store.clone(), PASS.into()).unwrap();
+        let bob = Engine::new(bob_store.clone(), PASS.into()).unwrap();
+        // Startup persists the whole state once.
+        assert_eq!(
+            wrote(&alice_store),
+            [
+                "olm_account",
+                "olm_sessions",
+                "megolm_out",
+                "megolm_in",
+                "pending_shares"
+            ]
+        );
+
+        let alice_key = alice.identity_key();
+        let bob_key = bob.identity_key();
+
+        // OTK generation touches only the account.
+        wrote(&alice_store);
+        wrote(&bob_store);
+        let otk = bob.uploadable_otks(1).pop().unwrap();
+        let (id, key) = otk.split_once(':').unwrap();
+        assert_eq!(wrote(&bob_store), ["olm_account"]);
+        assert!(wrote(&alice_store).is_empty());
+
+        // Olm bootstrap encrypt touches only the session table (creating an
+        // outbound session does not consume any of our own keys).
+        let ct = alice
+            .olm_encrypt_to(BOB, &bob_key, Some((id.into(), key.into())), "hi")
+            .unwrap();
+        assert_eq!(wrote(&alice_store), ["olm_sessions"]);
+
+        // Prekey decrypt consumes an account OTK and stores the new session.
+        assert_eq!(bob.olm_decrypt_from(ALICE, &alice_key, &ct).unwrap(), "hi");
+        assert_eq!(wrote(&bob_store), ["olm_account", "olm_sessions"]);
+
+        // Steady-state olm: one session-table write per direction.
+        let reply = bob
+            .olm_encrypt_to(ALICE, &alice_key, None, "yo")
+            .unwrap();
+        assert_eq!(wrote(&bob_store), ["olm_sessions"]);
+        assert!(alice.olm_decrypt_from(BOB, &bob_key, &reply).is_ok());
+        assert_eq!(wrote(&alice_store), ["olm_sessions"]);
+
+        // Megolm creation writes the outbound table plus the queued share.
+        wrote(&alice_store);
+        let (sid, ct0) = alice
+            .megolm_encrypt(7, r#"{"chat":{"text":"m","reply_to":null}}"#)
+            .unwrap();
+        assert_eq!(wrote(&alice_store), ["megolm_out", "pending_shares"]);
+
+        // Steady-state megolm encrypt: exactly one table.
+        let (_, ct1) = alice
+            .megolm_encrypt(7, r#"{"chat":{"text":"m2","reply_to":null}}"#)
+            .unwrap();
+        assert_eq!(wrote(&alice_store), ["megolm_out"]);
+
+        // Import and decrypt on bob: one table for the import, nothing for
+        // either decrypt.
+        let share = alice.drain_pending_shares().pop().unwrap();
+        assert_eq!(wrote(&alice_store), ["pending_shares"]);
+        bob.megolm_import(7, ALICE, &share.session_id, &share.session_key)
+            .unwrap();
+        assert_eq!(wrote(&bob_store), ["megolm_in"]);
+        wrote(&bob_store);
+        assert!(bob.megolm_decrypt(7, ALICE, &sid, &ct0).unwrap().contains("m\""));
+        assert!(bob.megolm_decrypt(7, ALICE, "", &ct1).unwrap().contains("m2"));
+        assert!(wrote(&bob_store).is_empty());
+    }
+
+    /// (hint) Empty-id decrypts try the last successful session first and
+    /// still fall back to the full scan when the hint is stale (a rotation
+    /// happened between messages), so history stays readable.
+    #[test]
+    fn megolm_decrypt_hint_falls_back_across_rotation() {
+        let world = World::new();
+        const CHANNEL: i64 = 11;
+        let chat = r#"{"chat":{"text":"m","reply_to":null}}"#;
+
+        let (_, ct0) = world.alice.megolm_encrypt(CHANNEL, chat).unwrap();
+        world.share_current(CHANNEL, &world.bob, BOB);
+
+        // A successful empty-id decrypt seeds the hint with the winner.
+        assert!(world.bob.megolm_decrypt(CHANNEL, ALICE, "", &ct0).is_ok());
+        let sid0 = world
+            .bob
+            .lock()
+            .megolm_hint
+            .get(&(CHANNEL, ALICE))
+            .cloned()
+            .expect("empty-id decrypt seeds the hint");
+
+        // Fill the session to the message cap; the next send rotates.
+        for _ in 0..99 {
+            world.alice.megolm_encrypt(CHANNEL, chat).unwrap();
+        }
+        let (sid1, ct_new) = world.alice.megolm_encrypt(CHANNEL, chat).unwrap();
+        assert_ne!(sid0, sid1);
+        world.share_current(CHANNEL, &world.bob, BOB);
+
+        // The hint names sid0, so the new session's message goes hint-miss →
+        // scan, and the hint moves to the winner.
+        assert!(world.bob.megolm_decrypt(CHANNEL, ALICE, "", &ct_new).is_ok());
+        assert_eq!(
+            world.bob.lock().megolm_hint.get(&(CHANNEL, ALICE)),
+            Some(&sid1)
+        );
+
+        // A stale hint never blocks history: ct0 belongs to sid0 but the
+        // hint names sid1 — the fallback scan still finds the old session.
+        assert!(world.bob.megolm_decrypt(CHANNEL, ALICE, "", &ct0).is_ok());
     }
 
     /// File encryption roundtrip and tamper detection.

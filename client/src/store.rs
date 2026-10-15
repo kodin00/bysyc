@@ -95,6 +95,11 @@ impl Store {
     /// Open (and migrate) the store at an explicit path.
     pub fn open(path: &Path) -> Result<Self, String> {
         let conn = Connection::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        // WAL lets UI-thread reads run off the write lock, and NORMAL sync
+        // under WAL trades a crash's very last commits for far faster
+        // writes — fine for a cache (secrets live in their own file).
+        // Best-effort: a filesystem that cannot do WAL still works as before.
+        let _ = conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;");
         conn.execute_batch(SCHEMA)
             .map_err(|e| format!("migrate {}: {e}", path.display()))?;
         // `CREATE TABLE IF NOT EXISTS` does not extend an existing table with
@@ -110,11 +115,8 @@ impl Store {
 
     pub fn setting(&self, key: &str) -> Option<String> {
         self.conn
-            .query_row(
-                "SELECT value FROM settings WHERE key = ?1",
-                params![key],
-                |r| r.get(0),
-            )
+            .prepare_cached("SELECT value FROM settings WHERE key = ?1")
+            .and_then(|mut stmt| stmt.query_row(params![key], |r| r.get(0)))
             .optional()
             .ok()
             .flatten()
@@ -122,18 +124,19 @@ impl Store {
 
     pub fn set_setting(&self, key: &str, value: &str) -> Result<(), String> {
         self.conn
-            .execute(
+            .prepare_cached(
                 "INSERT INTO settings(key, value) VALUES(?1, ?2)
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                params![key, value],
             )
+            .and_then(|mut stmt| stmt.execute(params![key, value]))
             .map_err(|e| format!("settings: {e}"))?;
         Ok(())
     }
 
     pub fn del_setting(&self, key: &str) -> Result<(), String> {
         self.conn
-            .execute("DELETE FROM settings WHERE key = ?1", params![key])
+            .prepare_cached("DELETE FROM settings WHERE key = ?1")
+            .and_then(|mut stmt| stmt.execute(params![key]))
             .map_err(|e| format!("settings: {e}"))?;
         Ok(())
     }
@@ -144,11 +147,8 @@ impl Store {
     /// pickle name C2 chooses).
     pub fn pickle(&self, scope: &str) -> Option<Vec<u8>> {
         self.conn
-            .query_row(
-                "SELECT pickle FROM keys WHERE scope = ?1",
-                params![scope],
-                |r| r.get(0),
-            )
+            .prepare_cached("SELECT pickle FROM keys WHERE scope = ?1")
+            .and_then(|mut stmt| stmt.query_row(params![scope], |r| r.get(0)))
             .optional()
             .ok()
             .flatten()
@@ -156,18 +156,38 @@ impl Store {
 
     pub fn put_pickle(&self, scope: &str, pickle: &[u8]) -> Result<(), String> {
         self.conn
-            .execute(
+            .prepare_cached(
                 "INSERT INTO keys(scope, pickle) VALUES(?1, ?2)
                  ON CONFLICT(scope) DO UPDATE SET pickle = excluded.pickle",
-                params![scope, pickle],
             )
+            .and_then(|mut stmt| stmt.execute(params![scope, pickle]))
             .map_err(|e| format!("keys: {e}"))?;
         Ok(())
     }
 
+    /// Persist several pickles in one transaction — the crypto engine's
+    /// multi-table persist pays one WAL fsync instead of one per scope.
+    pub fn put_pickle_batch(&self, puts: &[(&str, &[u8])]) -> Result<(), String> {
+        let run = || -> rusqlite::Result<()> {
+            let tx = self.conn.unchecked_transaction()?;
+            {
+                let mut stmt = self.conn.prepare_cached(
+                    "INSERT INTO keys(scope, pickle) VALUES(?1, ?2)
+                     ON CONFLICT(scope) DO UPDATE SET pickle = excluded.pickle",
+                )?;
+                for (scope, pickle) in puts {
+                    stmt.execute(params![scope, pickle])?;
+                }
+            }
+            tx.commit()
+        };
+        run().map_err(|e| format!("keys: {e}"))
+    }
+
     pub fn del_pickle(&self, scope: &str) -> Result<(), String> {
         self.conn
-            .execute("DELETE FROM keys WHERE scope = ?1", params![scope])
+            .prepare_cached("DELETE FROM keys WHERE scope = ?1")
+            .and_then(|mut stmt| stmt.execute(params![scope]))
             .map_err(|e| format!("keys: {e}"))?;
         Ok(())
     }
@@ -185,20 +205,35 @@ impl Store {
 
     // -- messages --------------------------------------------------------------
 
+    /// Row insert shared by [`Store::append_message`] and every row of
+    /// [`Store::insert_message_page`] (bound once via `prepare_cached`).
+    const INSERT_MESSAGE: &str = "INSERT OR IGNORE INTO messages(
+                    id, channel_id, sender_id, kind, content, reply_to,
+                    attachment_json, created_at_ms, plaintext)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,NULL)";
+
     /// Persist a server-confirmed message (optimistic temps are never
     /// persisted). Re-inserting the same id is a no-op.
     pub fn append_message(&self, m: &MessageDto) -> Result<(), String> {
-        let attachment_json = match &m.attachment {
-            Some(a) => Some(serde_json::to_string(a).unwrap_or_default()),
-            None => None,
-        };
-        self.conn
-            .execute(
-                "INSERT OR IGNORE INTO messages(
-                    id, channel_id, sender_id, kind, content, reply_to,
-                    attachment_json, created_at_ms, plaintext)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,NULL)",
-                params![
+        self.insert_message_page(std::slice::from_ref(m))
+            .map(|_| ())
+            .map_err(|e| format!("messages: {e}"))
+    }
+
+    /// Insert a batch of messages in one transaction (a WS drain burst, a
+    /// REST history page): per-message autocommit would pay a WAL fsync per
+    /// row. Re-inserting an existing id is a no-op, like
+    /// [`Store::append_message`].
+    pub fn insert_message_page(&self, dtos: &[MessageDto]) -> rusqlite::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = self.conn.prepare_cached(Self::INSERT_MESSAGE)?;
+            for m in dtos {
+                let attachment_json = match &m.attachment {
+                    Some(a) => Some(serde_json::to_string(a).unwrap_or_default()),
+                    None => None,
+                };
+                stmt.execute(params![
                     m.id,
                     m.channel_id,
                     m.sender_id,
@@ -207,10 +242,10 @@ impl Store {
                     m.reply_to,
                     attachment_json,
                     m.created_at_ms,
-                ],
-            )
-            .map_err(|e| format!("messages: {e}"))?;
-        Ok(())
+                ])?;
+            }
+        }
+        tx.commit()
     }
 
     /// One page of cached history, newest last. `before` pages older than
@@ -221,7 +256,7 @@ impl Store {
         before: Option<i64>,
         limit: u32,
     ) -> Vec<MessageDto> {
-        let mut stmt = match self.conn.prepare(
+        let mut stmt = match self.conn.prepare_cached(
             "SELECT id, channel_id, sender_id, kind, content, reply_to,
                     attachment_json, created_at_ms
              FROM messages
@@ -258,10 +293,8 @@ impl Store {
     /// Fill in the decrypted plaintext for a message (C2/C3 call this).
     pub fn set_plaintext(&self, msg_id: i64, text: &str) -> Result<(), String> {
         self.conn
-            .execute(
-                "UPDATE messages SET plaintext = ?2 WHERE id = ?1",
-                params![msg_id, text],
-            )
+            .prepare_cached("UPDATE messages SET plaintext = ?2 WHERE id = ?1")
+            .and_then(|mut stmt| stmt.execute(params![msg_id, text]))
             .map_err(|e| format!("messages: {e}"))?;
         Ok(())
     }
@@ -269,11 +302,10 @@ impl Store {
     /// The decrypted plaintext of a message, if any (C3 renders from this).
     pub fn plaintext(&self, msg_id: i64) -> Option<String> {
         self.conn
-            .query_row(
-                "SELECT plaintext FROM messages WHERE id = ?1",
-                params![msg_id],
-                |r| r.get::<_, Option<String>>(0),
-            )
+            .prepare_cached("SELECT plaintext FROM messages WHERE id = ?1")
+            .and_then(|mut stmt| {
+                stmt.query_row(params![msg_id], |r| r.get::<_, Option<String>>(0))
+            })
             .optional()
             .ok()
             .flatten()
@@ -285,10 +317,8 @@ impl Store {
     /// stays for audit.
     pub fn delete_message(&self, msg_id: i64) -> Result<(), String> {
         self.conn
-            .execute(
-                "UPDATE messages SET deleted = 1 WHERE id = ?1",
-                params![msg_id],
-            )
+            .prepare_cached("UPDATE messages SET deleted = 1 WHERE id = ?1")
+            .and_then(|mut stmt| stmt.execute(params![msg_id]))
             .map_err(|e| format!("messages: {e}"))?;
         Ok(())
     }
@@ -297,7 +327,7 @@ impl Store {
     /// have no decrypted plaintext — the retry set for history backfill once
     /// a Megolm session share arrives.
     pub fn undecrypted(&self, channel_id: i64) -> Vec<(i64, i64, String)> {
-        let Ok(mut stmt) = self.conn.prepare(
+        let Ok(mut stmt) = self.conn.prepare_cached(
             "SELECT id, sender_id, content FROM messages
              WHERE channel_id = ?1 AND deleted = 0 AND plaintext IS NULL
              ORDER BY id",
@@ -322,11 +352,11 @@ impl Store {
     /// no Megolm self-import).
     pub fn set_file_envelope(&self, msg_id: i64, envelope: &str) -> Result<(), String> {
         self.conn
-            .execute(
+            .prepare_cached(
                 "INSERT INTO file_envelopes(message_id, envelope) VALUES(?1, ?2)
                  ON CONFLICT(message_id) DO UPDATE SET envelope = excluded.envelope",
-                params![msg_id, envelope],
             )
+            .and_then(|mut stmt| stmt.execute(params![msg_id, envelope]))
             .map_err(|e| format!("file_envelopes: {e}"))?;
         Ok(())
     }
@@ -335,7 +365,7 @@ impl Store {
     /// in a channel that has a persisted File envelope — the rebuild set
     /// for [`crate::state::MainState::file_meta`] after a restart.
     pub fn file_envelopes(&self, channel_id: i64) -> Vec<(i64, String)> {
-        let Ok(mut stmt) = self.conn.prepare(
+        let Ok(mut stmt) = self.conn.prepare_cached(
             "SELECT fe.message_id, fe.envelope FROM file_envelopes fe
              JOIN messages m ON m.id = fe.message_id
              WHERE m.channel_id = ?1 AND m.deleted = 0",
@@ -371,23 +401,34 @@ impl Store {
     // -- world cache ---------------------------------------------------------------
 
     pub fn upsert_friends(&self, friends: &[AccountBrief]) -> Result<(), String> {
-        for f in friends {
-            self.conn
-                .execute(
+        // One transaction for the whole list: per-row autocommit would pay
+        // a WAL fsync per friend. `unchecked_transaction` is the `&self`
+        // form (the Store is shared behind a Mutex, never `&mut`).
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("friends: {e}"))?;
+        {
+            let mut stmt = self
+                .conn
+                .prepare_cached(
                     "INSERT INTO friends(id, username, identity_key) VALUES(?1,?2,?3)
                      ON CONFLICT(id) DO UPDATE SET username = excluded.username,
                          identity_key = excluded.identity_key",
-                    params![f.id, f.username, f.identity_key],
                 )
                 .map_err(|e| format!("friends: {e}"))?;
+            for f in friends {
+                stmt.execute(params![f.id, f.username, f.identity_key])
+                    .map_err(|e| format!("friends: {e}"))?;
+            }
         }
-        Ok(())
+        tx.commit().map_err(|e| format!("friends: {e}"))
     }
 
     pub fn friends(&self) -> Vec<AccountBrief> {
         let Ok(mut stmt) = self
             .conn
-            .prepare("SELECT id, username, identity_key FROM friends ORDER BY username")
+            .prepare_cached("SELECT id, username, identity_key FROM friends ORDER BY username")
         else {
             return Vec::new();
         };
@@ -405,34 +446,48 @@ impl Store {
     }
 
     pub fn upsert_guilds(&self, guilds: &[GuildInfo]) -> Result<(), String> {
-        for g in guilds {
-            self.conn
-                .execute(
+        // One transaction across every guild and channel row (see
+        // [`Store::upsert_friends`]).
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("guilds: {e}"))?;
+        {
+            let mut guild_stmt = self
+                .conn
+                .prepare_cached(
                     "INSERT INTO guilds(id, name, owner_id) VALUES(?1,?2,?3)
                      ON CONFLICT(id) DO UPDATE SET name = excluded.name,
                          owner_id = excluded.owner_id",
-                    params![g.id, g.name, g.owner_id],
                 )
                 .map_err(|e| format!("guilds: {e}"))?;
-            for c in &g.channels {
-                self.conn
-                    .execute(
-                        "INSERT INTO channels(id, guild_id, kind, name) VALUES(?1,?2,?3,?4)
-                         ON CONFLICT(id) DO UPDATE SET guild_id = excluded.guild_id,
-                             kind = excluded.kind, name = excluded.name",
-                        params![c.id, g.id, kind_str_channel(&c.kind), c.name],
-                    )
-                    .map_err(|e| format!("channels: {e}"))?;
+            let mut channel_stmt = self
+                .conn
+                .prepare_cached(
+                    "INSERT INTO channels(id, guild_id, kind, name) VALUES(?1,?2,?3,?4)
+                     ON CONFLICT(id) DO UPDATE SET guild_id = excluded.guild_id,
+                         kind = excluded.kind, name = excluded.name",
+                )
+                .map_err(|e| format!("channels: {e}"))?;
+            for g in guilds {
+                guild_stmt
+                    .execute(params![g.id, g.name, g.owner_id])
+                    .map_err(|e| format!("guilds: {e}"))?;
+                for c in &g.channels {
+                    channel_stmt
+                        .execute(params![c.id, g.id, kind_str_channel(&c.kind), c.name])
+                        .map_err(|e| format!("channels: {e}"))?;
+                }
             }
         }
-        Ok(())
+        tx.commit().map_err(|e| format!("guilds: {e}"))
     }
 
     pub fn guilds(&self) -> Vec<GuildInfo> {
         let mut out: Vec<GuildInfo> = Vec::new();
         let Ok(mut stmt) = self
             .conn
-            .prepare("SELECT id, name, owner_id FROM guilds ORDER BY name")
+            .prepare_cached("SELECT id, name, owner_id FROM guilds ORDER BY name")
         else {
             return out;
         };
@@ -451,7 +506,7 @@ impl Store {
         }
         if let Ok(mut stmt) = self
             .conn
-            .prepare("SELECT id, guild_id, kind, name FROM channels ORDER BY name")
+            .prepare_cached("SELECT id, guild_id, kind, name FROM channels ORDER BY name")
         {
             if let Ok(rows) = stmt.query_map([], |r| {
                 Ok((
@@ -478,11 +533,11 @@ impl Store {
 
     pub fn upsert_dm(&self, dm: &DmChannel) -> Result<(), String> {
         self.conn
-            .execute(
+            .prepare_cached(
                 "INSERT INTO dm(channel_id, peer_id) VALUES(?1,?2)
                  ON CONFLICT(channel_id) DO UPDATE SET peer_id = excluded.peer_id",
-                params![dm.channel.id, dm.peer.id],
             )
+            .and_then(|mut stmt| stmt.execute(params![dm.channel.id, dm.peer.id]))
             .map_err(|e| format!("dm: {e}"))?;
         Ok(())
     }
@@ -593,6 +648,12 @@ impl crate::crypto::KeyStore for KeyStoreImpl {
     fn put(&self, scope: &str, blob: &[u8]) {
         if let Err(e) = lock_store(&self.0).put_pickle(scope, blob) {
             eprintln!("[bysyc] pickle write failed ({scope}): {e}");
+        }
+    }
+
+    fn put_batch(&self, puts: &[(&str, &[u8])]) {
+        if let Err(e) = lock_store(&self.0).put_pickle_batch(puts) {
+            eprintln!("[bysyc] pickle batch write failed: {e}");
         }
     }
 
@@ -756,6 +817,21 @@ mod tests {
         s.delete_message(2).unwrap();
         let visible: Vec<i64> = s.messages_for(10, None, 50).iter().map(|m| m.id).collect();
         assert_eq!(visible, vec![1]);
+    }
+
+    #[test]
+    fn insert_message_page_batches_are_idempotent() {
+        let s = tmp_store("page");
+        let batch: Vec<MessageDto> = (1..=5).map(|i| msg(i, 10)).collect();
+        s.insert_message_page(&batch).unwrap();
+        // Re-inserting (a WS replay, a refetched history page) is a no-op.
+        s.insert_message_page(&batch).unwrap();
+        s.append_message(&msg(2, 10)).unwrap();
+        let ids: Vec<i64> = s.messages_for(10, None, 50).iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec![1, 2, 3, 4, 5]);
+        // The single-message path and the batch path write the same rows.
+        s.insert_message_page(&[msg(6, 10)]).unwrap();
+        assert_eq!(s.messages_for(10, None, 50).len(), 6);
     }
 
     #[test]

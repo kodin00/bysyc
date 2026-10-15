@@ -2,8 +2,9 @@
 //!
 //! [`SessionCore`] holds all call state (one str0m [`Rtc`] per remote
 //! participant, offer/answer bookkeeping, trickle candidates, the TURN
-//! candidate set) and is deliberately free of I/O: commands in, signals and
-//! datagrams out. The engine thread ([`spawn_session`]) owns the UDP socket,
+//! candidate set) and is deliberately free of I/O: commands in, signals
+//! out, datagrams handed to a caller-provided sink one at a time. The
+//! engine thread ([`spawn_session`]) owns the UDP socket,
 //! the cpal streams and the TURN client, and drives the core.
 //!
 //! Signaling travels over the account WebSocket as
@@ -34,6 +35,7 @@
 //!   `.ext_vals(ExtensionValues)` (builder; the field itself is private)
 //! - `Rtc::is_alive()` (the `RtcState` enum is private in 0.24)
 
+use std::cell::Cell;
 use std::io::ErrorKind;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -55,6 +57,14 @@ use crate::net::{NetHandle, next_msg_id};
 pub const MAX_PARTICIPANTS: usize = 6;
 /// Main loop cadence floor; also the audio pump period (20 ms frames).
 const TICK: Duration = Duration::from_millis(20);
+/// Datagrams pulled off the socket per tick body: one blocking receive
+/// waits out the tick budget, then the burst queued behind it is drained
+/// without blocking (capped) so the tick body — drive, TURN, pump, UI —
+/// runs once per batch instead of once per datagram.
+const RECV_BATCH: usize = 64;
+/// Roster/status refresh cadence. The overlay repaints at 100 ms, so
+/// rebuilding it faster is invisible work.
+const UI_REFRESH: Duration = Duration::from_millis(100);
 /// How long an outgoing private call rings with nobody picking up before
 /// the session ends with "no answer" (the callee's prompt auto-declines at
 /// the same duration).
@@ -178,14 +188,6 @@ pub struct OutSignal {
     pub kind: CallSignalKind,
 }
 
-/// Dataplane datagram the core produced. `source` may be the TURN relay
-/// address when ICE selected the relayed candidate.
-pub struct OutDatagram {
-    pub source: SocketAddr,
-    pub destination: SocketAddr,
-    pub bytes: Vec<u8>,
-}
-
 // ---------------------------------------------------------------------------
 // Session core (I/O-free; unit-testable headlessly)
 // ---------------------------------------------------------------------------
@@ -211,8 +213,10 @@ struct Peer {
     remote_candidates: Vec<String>,
 }
 
-/// The call state machine. All methods append to caller-provided vectors
-/// instead of performing I/O, so tests can loop two cores together.
+/// The call state machine. Transmits are handed to a caller-provided
+/// sink one datagram at a time (the bytes need only live for the call),
+/// and signals append to caller-provided vectors — no I/O in here, so
+/// tests can loop two cores together with collecting sinks.
 pub struct SessionCore {
     me_id: i64,
     kind: CallKind,
@@ -228,6 +232,8 @@ pub struct SessionCore {
     turn_mapped: Option<SocketAddr>,
     encoder: Option<MicEncoder>,
     frame_acc: Vec<f32>,
+    /// Reused Opus packet buffer for the send path (encode_frame_into).
+    tx_packet: Vec<u8>,
     /// Sinks created since the last take (engine registers them for mixing).
     new_sinks: Vec<Arc<PeerSink>>,
     /// Sinks removed since the last take (engine unsubscribes them).
@@ -257,6 +263,7 @@ impl SessionCore {
             turn_mapped: None,
             encoder: MicEncoder::new().ok(),
             frame_acc: Vec::new(),
+            tx_packet: Vec::new(),
             new_sinks: Vec::new(),
             dropped_sinks: Vec::new(),
             awaiting_answer: false,
@@ -623,13 +630,14 @@ impl SessionCore {
     }
 
     /// Feed one datagram from the network to whichever peers accept it.
-    /// Events are handled inline; transmits land in `sends`.
+    /// Events are handled inline; transmits are handed to `send` as they
+    /// are polled.
     pub fn deliver_packet(
         &mut self,
         now: Instant,
         source: SocketAddr,
         data: &[u8],
-        sends: &mut Vec<OutDatagram>,
+        send: &mut dyn FnMut(SocketAddr, SocketAddr, &[u8]),
     ) {
         let dest = self.local_addr.unwrap_or(source);
         let mut deadline = None;
@@ -642,18 +650,23 @@ impl SessionCore {
                 if peer.rtc.handle_input(input).is_err() {
                     continue;
                 }
-                SessionCore::drive_peer(peer, now, sends, &mut deadline);
+                SessionCore::drive_peer(peer, now, send, &mut deadline);
             }
         }
     }
 
-    /// Advance time on every peer and collect events/transmits. Returns the
-    /// earliest next-timeout across peers.
-    pub fn drive(&mut self, now: Instant, sends: &mut Vec<OutDatagram>) -> Option<Instant> {
+    /// Advance time on every peer, handling events inline and handing
+    /// transmits to `send`. Returns the earliest next-timeout across
+    /// peers.
+    pub fn drive(
+        &mut self,
+        now: Instant,
+        send: &mut dyn FnMut(SocketAddr, SocketAddr, &[u8]),
+    ) -> Option<Instant> {
         let mut deadline: Option<Instant> = None;
         for peer in &mut self.peers {
             let _ = peer.rtc.handle_input(Input::Timeout(now));
-            SessionCore::drive_peer(peer, now, sends, &mut deadline);
+            SessionCore::drive_peer(peer, now, send, &mut deadline);
         }
         self.prune_dead(now);
         deadline
@@ -661,10 +674,14 @@ impl SessionCore {
 
     /// Poll one peer to completion, handling events inline. Associated fn
     /// (no `&mut self`) so it can run while `self.peers` is iterated.
+    /// Transmits are handed to `send` one at a time — the datagram bytes
+    /// (str0m's `DatagramSend` derefs to a slice) need only live for the
+    /// call, so the sink can push them straight out a socket with no
+    /// per-packet copy or queue.
     fn drive_peer(
         peer: &mut Peer,
         now: Instant,
-        sends: &mut Vec<OutDatagram>,
+        send: &mut dyn FnMut(SocketAddr, SocketAddr, &[u8]),
         deadline: &mut Option<Instant>,
     ) {
         loop {
@@ -676,11 +693,7 @@ impl SessionCore {
                     });
                     break;
                 }
-                Ok(Output::Transmit(t)) => sends.push(OutDatagram {
-                    source: t.source,
-                    destination: t.destination,
-                    bytes: t.contents.to_vec(),
-                }),
+                Ok(Output::Transmit(t)) => send(t.source, t.destination, &t.contents),
                 Ok(Output::Event(ev)) => SessionCore::handle_event(peer, now, ev),
                 Err(_) => break,
             }
@@ -831,12 +844,25 @@ impl SessionCore {
             self.frame_acc.clear();
             return;
         }
-        while self.frame_acc.len() >= FRAME_SAMPLES {
-            let frame: Vec<f32> = self.frame_acc.drain(..FRAME_SAMPLES).collect();
-            let packet = match self.encoder.as_mut().unwrap().encode_frame(&frame) {
-                Ok(p) => p,
-                Err(_) => return,
-            };
+        // Cut frames through a stack buffer: copy the head out, then drop
+        // it from the accumulator — no fresh Vec per 20 ms frame. The Opus
+        // packet scratch is reused across frames; str0m's RtpWrite takes an
+        // owned Vec per peer, so that per-peer clone stays.
+        let mut frame = [0f32; FRAME_SAMPLES];
+        let mut packet = std::mem::take(&mut self.tx_packet);
+        let mut enc_failed = false;
+        while self.frame_acc.len() >= FRAME_SAMPLES && !enc_failed {
+            frame.copy_from_slice(&self.frame_acc[..FRAME_SAMPLES]);
+            self.frame_acc.drain(..FRAME_SAMPLES);
+            if self
+                .encoder
+                .as_mut()
+                .unwrap()
+                .encode_frame_into(&frame, &mut packet)
+                .is_err()
+            {
+                break;
+            }
             for peer in &mut self.peers {
                 if !peer.connected {
                     continue;
@@ -858,6 +884,7 @@ impl SessionCore {
                 }
             }
         }
+        self.tx_packet = packet;
     }
 
     /// Peer playback sinks created since the last call; the engine
@@ -1006,6 +1033,30 @@ fn local_ips() -> Vec<std::net::IpAddr> {
     ips
 }
 
+/// Route one datagram the core produced: straight to the destination, or
+/// wrapped for the TURN relay when the relayed candidate is the source
+/// (`source` may be the relay address when ICE selected it). The direct
+/// path sends the polled bytes as-is; the TURN wrap allocates inside
+/// `TurnClient::wrap_outgoing`, which is not ours to change.
+fn send_datagram(
+    socket: &UdpSocket,
+    turn: Option<&mut TurnClient>,
+    relay: Option<SocketAddr>,
+    source: SocketAddr,
+    destination: SocketAddr,
+    contents: &[u8],
+) {
+    let via_relay = turn.is_some() && relay == Some(source);
+    if via_relay {
+        if let Some(t) = turn {
+            let wrapped = t.wrap_outgoing(destination, contents);
+            let _ = socket.send_to(&wrapped, t.server());
+        }
+    } else {
+        let _ = socket.send_to(contents, destination);
+    }
+}
+
 fn run(cfg: SessionConfig, rx: std::sync::mpsc::Receiver<SessionCmd>, ui: Arc<UiState>) {
     // Publishes `finished` on every exit path below (including this
     // function's early returns and any panic unwind).
@@ -1067,6 +1118,18 @@ fn run(cfg: SessionConfig, rx: std::sync::mpsc::Receiver<SessionCmd>, ui: Arc<Ui
     let mut turn: Option<TurnClient> = None;
     let mut next_pump = Instant::now();
     let mut buf = vec![0u8; 2048];
+    // Last read timeout programmed into the socket (ZERO = none yet);
+    // setting it is a syscall, so only do so when the wait budget moved.
+    let mut read_timeout = Duration::ZERO;
+    // str0m's earliest next-timeout, carried from the previous tick body
+    // to size the blocking socket wait below.
+    let mut deadline: Option<Instant> = None;
+    // Mirror of the core's relay address, for the transmit sink: it is
+    // read mid-drive while the core is mutably borrowed, so its own
+    // `relay_addr()` is unreachable there.
+    let relay_addr = Cell::new(None::<SocketAddr>);
+    let mut next_ui = Instant::now();
+    let mut status_key: Option<StatusKey> = None;
 
     loop {
         let now = Instant::now();
@@ -1102,12 +1165,11 @@ fn run(cfg: SessionConfig, rx: std::sync::mpsc::Receiver<SessionCmd>, ui: Arc<Ui
             turn = init_turn(res, &socket, &ui);
         }
 
-        // --- time advance ---
-        let mut sends: Vec<OutDatagram> = Vec::new();
-        let deadline = core.drive(now, &mut sends);
         if leave || channel_dead || core.ended() {
             break;
         }
+
+        // --- socket wait + drain ---
         let mut wait = TICK;
         if let Some(d) = deadline {
             wait = if d > now {
@@ -1116,62 +1178,94 @@ fn run(cfg: SessionConfig, rx: std::sync::mpsc::Receiver<SessionCmd>, ui: Arc<Ui
                 Duration::from_millis(1)
             };
         }
-
-        // --- socket wait ---
-        let _ = socket.set_read_timeout(Some(wait.max(Duration::from_millis(1))));
-        match socket.recv_from(&mut buf) {
-            Ok((n, from)) => {
-                let data = &buf[..n];
-                let mut from_turn = false;
-                if let Some(t) = turn.as_mut() {
-                    if from == t.server() {
-                        from_turn = true;
-                        if let Some(pkt) = t.handle_input(data) {
-                            core.deliver_packet(now, pkt.from, &pkt.payload, &mut sends);
-                        }
-                        // Allocation may have just completed.
-                        if t.ready() && core.relay_addr().is_none() {
-                            let mut out = Vec::new();
-                            core.turn_ready(t.relay_addr().unwrap(), t.mapped_addr(), &mut out);
-                            ui.relayed.store(true, Ordering::Relaxed);
-                            signals.extend(out);
-                        }
+        let wait = wait.max(Duration::from_millis(1));
+        if wait != read_timeout {
+            let _ = socket.set_read_timeout(Some(wait));
+            read_timeout = wait;
+        }
+        // Hand one received datagram to the TURN client (server traffic)
+        // or the peers, routing whatever transmits it provokes straight
+        // onto the socket.
+        let mut receive = |from: SocketAddr, data: &[u8]| {
+            let mut from_turn = false;
+            if let Some(t) = turn.as_mut() {
+                if from == t.server() {
+                    from_turn = true;
+                    // Gather everything from `t` first so its borrow of
+                    // `turn` ends: the send sink below re-borrows `turn`
+                    // per datagram.
+                    let unwrapped = t.handle_input(data).map(|p| (p.from, p.payload));
+                    let allocated = t.ready() && core.relay_addr().is_none();
+                    let (relay, mapped) = if allocated {
+                        (t.relay_addr(), t.mapped_addr())
+                    } else {
+                        (None, None)
+                    };
+                    if let Some((peer_from, payload)) = unwrapped {
+                        core.deliver_packet(now, peer_from, &payload, &mut |s, d, c| {
+                            send_datagram(&socket, turn.as_mut(), relay_addr.get(), s, d, c);
+                        });
+                    }
+                    if allocated {
+                        // The allocation may have just completed.
+                        let mut out = Vec::new();
+                        core.turn_ready(relay.unwrap(), mapped, &mut out);
+                        relay_addr.set(relay);
+                        ui.relayed.store(true, Ordering::Relaxed);
+                        signals.extend(out);
                     }
                 }
-                if !from_turn {
-                    core.deliver_packet(now, from, data, &mut sends);
+            }
+            if !from_turn {
+                core.deliver_packet(now, from, data, &mut |s, d, c| {
+                    send_datagram(&socket, turn.as_mut(), relay_addr.get(), s, d, c);
+                });
+            }
+        };
+        match socket.recv_from(&mut buf) {
+            Ok((n, from)) => {
+                receive(from, &buf[..n]);
+                // Drain the burst queued behind the first datagram without
+                // blocking, so one tick body handles the whole batch.
+                let _ = socket.set_nonblocking(true);
+                for _ in 0..RECV_BATCH {
+                    match socket.recv_from(&mut buf) {
+                        Ok((n, from)) => receive(from, &buf[..n]),
+                        // WouldBlock: the burst is drained; any other error
+                        // is transient. Both mean "back to the tick body".
+                        Err(_) => break,
+                    }
                 }
+                let _ = socket.set_nonblocking(false);
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {}
             Err(_) => {} // transient; keep going
         }
 
-        // --- TURN timers / retransmits ---
+        // --- tick body (once per batch) ---
+        // TURN timers / retransmits.
         if let Some(t) = turn.as_mut() {
             t.tick(now);
         }
 
-        // --- audio pump + subsequent drive (pump writes RTP, drive sends) ---
+        // Audio pump, then drive: pump writes RTP into the peers' streams
+        // and drive turns it (and any due timers) into transmits, sent
+        // inline. `deadline` sizes the next socket wait.
         if let Some(a) = audio.as_ref() {
             if now >= next_pump {
                 core.pump_audio(now, &a.mic);
                 next_pump = now + TICK;
             }
         }
-        core.drive(now, &mut sends);
-
-        // --- route datagrams (direct or via TURN) ---
-        for dgram in sends {
-            let via_relay = turn.is_some() && core.relay_addr() == Some(dgram.source);
-            if via_relay {
-                if let Some(t) = turn.as_mut() {
-                    let wrapped = t.wrap_outgoing(dgram.destination, &dgram.bytes);
-                    let _ = socket.send_to(&wrapped, t.server());
-                }
-            } else {
-                let _ = socket.send_to(&dgram.bytes, dgram.destination);
-            }
+        deadline = core.drive(now, &mut |s, d, c| {
+            send_datagram(&socket, turn.as_mut(), relay_addr.get(), s, d, c);
+        });
+        if core.ended() {
+            break;
         }
+
+        // --- TURN outbox (retransmits / permissions / binds queued this
+        // tick) ---
         if let Some(t) = turn.as_mut() {
             for b in t.take_sends() {
                 let _ = socket.send_to(&b, t.server());
@@ -1193,12 +1287,19 @@ fn run(cfg: SessionConfig, rx: std::sync::mpsc::Receiver<SessionCmd>, ui: Arc<Ui
 
         flush_signals(&cfg.net, cfg.call_id, &signals);
         signals.clear();
-        refresh_ui(
-            &core,
-            &ui,
-            turn.as_ref().is_some_and(|t| t.ready()),
-            audio.is_some(),
-        );
+        // Roster rebuilds clone every username and the status line is a
+        // fresh String; the overlay only repaints every UI_REFRESH, so
+        // gate the whole refresh on the same cadence.
+        if now >= next_ui {
+            next_ui = now + UI_REFRESH;
+            refresh_ui(
+                &core,
+                &ui,
+                turn.as_ref().is_some_and(|t| t.ready()),
+                audio.is_some(),
+                &mut status_key,
+            );
+        }
     }
 
     // Graceful teardown: hangup signals to everyone, stop audio.
@@ -1209,34 +1310,64 @@ fn run(cfg: SessionConfig, rx: std::sync::mpsc::Receiver<SessionCmd>, ui: Arc<Ui
     ui.set_status(core.end_status.unwrap_or("call ended"));
 }
 
+/// Inputs the status line is a pure function of; when none of them move
+/// the standing string is still truthful and is left untouched.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct StatusKey {
+    have_audio: bool,
+    relay: bool,
+    peers: usize,
+    connected: usize,
+}
+
+/// The status line for a [`StatusKey`] (see [`refresh_ui`]).
+fn status_line(k: &StatusKey) -> String {
+    let status = if !k.have_audio {
+        "no audio device — text only".to_string()
+    } else if k.peers == 0 {
+        String::new()
+    } else if k.connected == 0 {
+        "connecting…".to_string()
+    } else {
+        format!("{} connected", k.connected)
+    };
+    // Decorate only a non-empty status: alone means nothing to report,
+    // not even the relay note.
+    if k.relay && !status.is_empty() {
+        format!("{status} · relay")
+    } else {
+        status
+    }
+}
+
 /// Push the peer roster and a single truthful status line to the UI.
 /// With no peers at all there is nothing to connect to, so the status is
 /// empty — the roster placeholder in the call window ("waiting for
 /// participants…") already covers that case. With peers it is
 /// "connecting…" while ICE is in flight and "N connected" once up; a
 /// missing capture device always reports "no audio device — text only".
-fn refresh_ui(core: &SessionCore, ui: &UiState, relay: bool, have_audio: bool) {
+/// The roster (speaking flags move constantly) is rebuilt every call;
+/// the status string only when its inputs changed since `last_key`.
+fn refresh_ui(
+    core: &SessionCore,
+    ui: &UiState,
+    relay: bool,
+    have_audio: bool,
+    last_key: &mut Option<StatusKey>,
+) {
     let parts = core.participants_ui();
-    let connected = parts.iter().filter(|p| p.connected).count();
-    let alone = parts.is_empty();
+    let key = StatusKey {
+        have_audio,
+        relay,
+        peers: parts.len(),
+        connected: parts.iter().filter(|p| p.connected).count(),
+    };
     *ui.participants.lock().unwrap_or_else(|p| p.into_inner()) = parts;
-    let status = if !have_audio {
-        "no audio device — text only".to_string()
-    } else if alone {
-        String::new()
-    } else if connected == 0 {
-        "connecting…".to_string()
-    } else {
-        format!("{connected} connected")
-    };
-    // Decorate only a non-empty status: alone means nothing to report,
-    // not even the relay note.
-    let status = if relay && !status.is_empty() {
-        format!("{status} · relay")
-    } else {
-        status
-    };
-    ui.set_status(status);
+    if *last_key == Some(key) {
+        return;
+    }
+    ui.set_status(status_line(&key));
+    *last_key = Some(key);
 }
 
 fn flush_signals(net: &NetHandle, call_id: i64, signals: &[OutSignal]) {
@@ -1366,14 +1497,15 @@ mod tests {
         /// One exchange round at the next simulated millisecond; returns
         /// whether both sides report connected.
         fn round(&mut self) -> bool {
+            type Dgram = (SocketAddr, SocketAddr, Vec<u8>);
             let step = self.step;
             self.step += 1;
             let now = self.now(step);
             let mut sig_b = Vec::new();
-            let mut sends_a = Vec::new();
-            let mut sends_b = Vec::new();
-            self.a.drive(now, &mut sends_a);
-            self.b.drive(now, &mut sends_b);
+            let mut sends_a: Vec<Dgram> = Vec::new();
+            let mut sends_b: Vec<Dgram> = Vec::new();
+            self.a.drive(now, &mut |s, d, b| sends_a.push((s, d, b.to_vec())));
+            self.b.drive(now, &mut |s, d, b| sends_b.push((s, d, b.to_vec())));
             // Datagrams both ways, cascading: handling a packet (e.g. a STUN
             // connectivity check) produces replies that must flow back in the
             // same round, not get dropped on the floor.
@@ -1382,18 +1514,20 @@ mod tests {
             let mut guard = 0;
             while guard < 32 && !(to_b.is_empty() && to_a.is_empty()) {
                 guard += 1;
-                let mut resp_a = Vec::new();
-                for d in std::mem::take(&mut to_b) {
-                    if d.source == self.addr_a && d.destination == self.addr_b {
-                        self.b
-                            .deliver_packet(now, self.addr_a, &d.bytes, &mut resp_a);
+                let mut resp_a: Vec<Dgram> = Vec::new();
+                for (src, dst, bytes) in std::mem::take(&mut to_b) {
+                    if src == self.addr_a && dst == self.addr_b {
+                        self.b.deliver_packet(now, src, &bytes, &mut |s, d, b| {
+                            resp_a.push((s, d, b.to_vec()));
+                        });
                     }
                 }
-                let mut resp_b = Vec::new();
-                for d in std::mem::take(&mut to_a) {
-                    if d.source == self.addr_b && d.destination == self.addr_a {
-                        self.a
-                            .deliver_packet(now, self.addr_b, &d.bytes, &mut resp_b);
+                let mut resp_b: Vec<Dgram> = Vec::new();
+                for (src, dst, bytes) in std::mem::take(&mut to_a) {
+                    if src == self.addr_b && dst == self.addr_a {
+                        self.a.deliver_packet(now, src, &bytes, &mut |s, d, b| {
+                            resp_b.push((s, d, b.to_vec()));
+                        });
                     }
                 }
                 to_b = resp_b; // transmits from A are destined for B
@@ -1468,11 +1602,11 @@ mod tests {
         let mut core = SessionCore::new(1, CallKind::Private, t0);
         core.set_local(&["127.0.0.1:47001".parse().unwrap()], &mut Vec::new());
         core.start_private(&peer, true, &mut Vec::new()); // we dialed
-        core.drive(t0 + Duration::from_secs(5), &mut Vec::new());
+        core.drive(t0 + Duration::from_secs(5), &mut |_, _, _| {});
         assert!(!core.ended());
         core.drive(
             t0 + NO_ANSWER_TIMEOUT + Duration::from_secs(1),
-            &mut Vec::new(),
+            &mut |_, _, _| {},
         );
         assert!(core.ended());
         assert_eq!(core.end_status, Some("no answer"));
@@ -1488,7 +1622,7 @@ mod tests {
         core.start_private(&peer, false, &mut Vec::new());
         core.drive(
             t0 + NO_ANSWER_TIMEOUT + Duration::from_secs(1),
-            &mut Vec::new(),
+            &mut |_, _, _| {},
         );
         assert!(!core.ended());
         assert_eq!(core.end_status, None);
@@ -1502,10 +1636,9 @@ mod tests {
         p.begin_private(&me_a, &me_b);
         p.connect();
         // Long past the ring window the caller is still in the call.
-        let mut sends = Vec::new();
         p.a.drive(
             p.t0 + NO_ANSWER_TIMEOUT + Duration::from_secs(5),
-            &mut sends,
+            &mut |_, _, _| {},
         );
         assert!(!p.a.ended());
         assert_eq!(p.a.end_status, None);
@@ -1722,9 +1855,10 @@ mod tests {
         // Alone in the channel: no peers, nothing to connect to — the
         // status stays empty even when the relay is ready, so the roster
         // placeholder ("waiting for participants…") speaks alone.
-        refresh_ui(&core, &ui, false, true);
+        let mut key = None;
+        refresh_ui(&core, &ui, false, true, &mut key);
         assert_eq!(status_of(&ui), "");
-        refresh_ui(&core, &ui, true, true);
+        refresh_ui(&core, &ui, true, true, &mut key);
         assert_eq!(status_of(&ui), "");
 
         // A peer arrives but ICE is still in flight.
@@ -1732,11 +1866,11 @@ mod tests {
             &[account(10, "a"), account(20, "b")],
             &mut Vec::new(),
         );
-        refresh_ui(&core, &ui, false, true);
+        refresh_ui(&core, &ui, false, true, &mut key);
         assert_eq!(status_of(&ui), "connecting…");
 
         // A missing capture device outranks the peer states, as before.
-        refresh_ui(&core, &ui, false, false);
+        refresh_ui(&core, &ui, false, false, &mut key);
         assert_eq!(status_of(&ui), "no audio device — text only");
 
         // Once connected: the count, plus the relay decoration.
@@ -1746,9 +1880,15 @@ mod tests {
         p.begin_private(&me_a, &me_b);
         p.connect();
         let ui_a = UiState::new(2, CallKind::Private);
-        refresh_ui(&p.a, &ui_a, false, true);
+        let mut key_a = None;
+        refresh_ui(&p.a, &ui_a, false, true, &mut key_a);
         assert_eq!(status_of(&ui_a), "1 connected");
-        refresh_ui(&p.a, &ui_a, true, true);
+        refresh_ui(&p.a, &ui_a, true, true, &mut key_a);
         assert_eq!(status_of(&ui_a), "1 connected · relay");
+
+        // Same inputs again: the standing status line is left untouched.
+        ui_a.set_status("sentinel");
+        refresh_ui(&p.a, &ui_a, true, true, &mut key_a);
+        assert_eq!(status_of(&ui_a), "sentinel");
     }
 }

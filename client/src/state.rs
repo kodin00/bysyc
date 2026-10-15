@@ -7,14 +7,20 @@
 //! `apply_server_msg` is the single entry point through which every
 //! server-pushed [`WsServerMsg`] mutates the world — the WS loop in
 //! [`crate::net`] calls it, nothing else touches these fields ad hoc.
+//! It only performs cheap mutations under the lock: the expensive tail of
+//! each event (Megolm/Olm decrypt, engine bootstrap, SQLite plaintext and
+//! message-row writes) is staged onto the crypto queue and run by one
+//! worker thread holding no lock, which re-locks briefly to publish its
+//! results. The single FIFO queue keeps per-channel decrypt order
+//! identical to arrival order.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use bysyc_common::protocol::{
     AccountBrief, AccountInfo, CallSignalKind, ChannelKind, DmChannel, FriendList, GuildInfo,
-    MailboxItem, MessageDto, MessageKind, WsServerBody, WsServerMsg,
+    MailboxItem, MessageDto, MessageKind, WsClientBody, WsClientMsg, WsServerBody, WsServerMsg,
 };
 use eframe::egui::Context;
 
@@ -43,6 +49,25 @@ pub const TYPING_TTL_SECS: u64 = 6;
 /// rotates at 100 messages / 1 week), so they cannot unlock anything the
 /// user still sees.
 pub const MAILBOX_STALE_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+
+/// Caps for the producer→consumer queues the WS path pushes and other
+/// subsystems drain per frame or per socket tick
+/// ([`MainState::pending_signals`], [`MainState::pending_newcomers`],
+/// [`MainState::outbox_acks`]): a flooding server must not grow client
+/// memory without bound. Pushes past a cap drop the OLDEST entry.
+const MAX_PENDING_SIGNALS: usize = 128;
+const MAX_PENDING_NEWCOMERS: usize = 128;
+const MAX_OUTBOX_ACKS: usize = 1024;
+
+/// Push `item` onto `v`, evicting the oldest entry once `cap` is reached
+/// (the drains consume whatever survived; a dropped head is treated as
+/// consumed rather than queued forever).
+fn push_capped<T>(v: &mut Vec<T>, item: T, cap: usize) {
+    if v.len() >= cap {
+        v.remove(0);
+    }
+    v.push(item);
+}
 
 // ---------------------------------------------------------------------------
 // Phases
@@ -123,6 +148,12 @@ pub struct MainState {
     /// Per-channel message cache, oldest first, newest last. Pending
     /// optimistic sends carry negative ids and stay at the tail.
     pub messages: HashMap<i64, Vec<MessageDto>>,
+    /// Per-channel set of the message ids held in `messages` — the dedup
+    /// index for `append_message`/`merge_messages`, kept in lockstep with
+    /// the vec so dedup is a hash lookup instead of a linear scan per row.
+    /// Optimistic temps (negative ids, pushed raw by the composer) are
+    /// never tracked and never deduped.
+    known_ids: HashMap<i64, HashSet<i64>>,
     /// Per-channel: who is typing and when their last event arrived.
     pub typing: HashMap<i64, (i64, Instant)>,
     /// Account ids currently holding a WS connection (from Ready + Presence).
@@ -214,6 +245,7 @@ impl MainState {
             dms,
             selected: Selection::Friends,
             messages: HashMap::new(),
+            known_ids: HashMap::new(),
             typing: HashMap::new(),
             online,
             net: None, // stamped by the WS task right after Ready is applied
@@ -306,9 +338,8 @@ impl MainState {
     /// Append a server-confirmed message, deduplicating by id (the same dto
     /// can arrive via both the REST response and the WS echo).
     pub fn append_message(&mut self, dto: MessageDto) {
-        let v = self.messages.entry(dto.channel_id).or_default();
-        if !v.iter().any(|m| m.id == dto.id) {
-            v.push(dto);
+        if self.known_ids.entry(dto.channel_id).or_default().insert(dto.id) {
+            self.messages.entry(dto.channel_id).or_default().push(dto);
         }
     }
 
@@ -327,12 +358,20 @@ impl MainState {
         if incoming.is_empty() {
             return;
         }
-        let v = self.messages.entry(channel_id).or_default();
-        for dto in incoming {
-            if !v.iter().any(|m| m.id == dto.id) {
-                v.push(dto);
+        let mut fresh = Vec::with_capacity(incoming.len());
+        {
+            let ids = self.known_ids.entry(channel_id).or_default();
+            for dto in incoming {
+                if ids.insert(dto.id) {
+                    fresh.push(dto);
+                }
             }
         }
+        if fresh.is_empty() {
+            return;
+        }
+        let v = self.messages.entry(channel_id).or_default();
+        v.extend(fresh);
         sort_messages(v);
     }
 
@@ -436,107 +475,8 @@ impl MainState {
         if let Some(v) = self.messages.get_mut(&channel_id) {
             v.retain(|m| m.id != target);
         }
-    }
-
-    /// Decrypt one incoming chat message (Megolm) and persist its plaintext.
-    /// Returns `false` when the message must not render at all — the carrier
-    /// of a Delete envelope. Our own sends skip decryption: the send task
-    /// already stored the plaintext from the REST response, and the engine
-    /// deliberately holds no self-import. Undecryptable rows get a terminal
-    /// "[undecryptable]" marker; with no engine the row stays NULL and
-    /// renders as "[encrypted]" until backfill can retry it.
-    fn apply_chat_message(&mut self, store: &Arc<Mutex<Store>>, dto: &MessageDto) -> bool {
-        if dto.sender_id == self.account.id {
-            return true;
-        }
-        let Some(engine) = self.engine.clone() else {
-            return true;
-        };
-        // Engine call first, store write after: the engine pickles into the
-        // store while we hold no store lock (lock order state→engine→store).
-        let plain = decrypt_envelope_text(&engine, dto.channel_id, dto.sender_id, &dto.content);
-        match plain {
-            Decrypted::Text(text) => {
-                guard(store).set_plaintext(dto.id, &text).ok();
-            }
-            Decrypted::File(fe) => {
-                // The attachment's key/nonce live only in this envelope:
-                // stash it (C4's UI renders from `file_meta`), persist it
-                // so the row survives a restart, then store the placeholder
-                // text like any other row.
-                let line = file_row_text(&fe);
-                persist_file_envelope(store, dto.id, &fe);
-                self.file_meta.insert(dto.id, fe);
-                guard(store).set_plaintext(dto.id, &line).ok();
-            }
-            Decrypted::Deleted(target) => {
-                self.remove_message(dto.channel_id, target);
-                let s = guard(store);
-                let _ = s.delete_message(target);
-                let _ = s.delete_message(dto.id); // carrier never renders again
-                return false;
-            }
-            Decrypted::Failed => {
-                guard(store).set_plaintext(dto.id, "[undecryptable]").ok();
-            }
-        }
-        true
-    }
-
-    /// Decrypt + apply every mailbox item we can: Olm-decrypt the transport,
-    /// expect an [`Envelope::SessionShare`], import the Megolm key. Items
-    /// whose sender identity is not known yet are kept (not acked) for a
-    /// later retry; stale items (older than [`MAILBOX_STALE_MS`]) and
-    /// undecryptable/malformed ones are acked and dropped — the mailbox must
-    /// never block. Acks queue in [`MainState::outbox_acks`] for the WS loop
-    /// to flush (there is no socket handle at the first Ready yet).
-    fn process_mailbox(&mut self, store: &Arc<Mutex<Store>>) {
-        let Some(engine) = self.engine.clone() else {
-            return; // no engine: keep everything, retry after bootstrap
-        };
-        let now = now_ms();
-        let mut keep = Vec::new();
-        let mut acks = Vec::new();
-        let mut imported: Vec<i64> = Vec::new();
-        for item in std::mem::take(&mut self.mailbox) {
-            if now.saturating_sub(item.created_at_ms) > MAILBOX_STALE_MS {
-                acks.push(item.id);
-                continue;
-            }
-            let Some(identity) = self.identities.get(&item.sender_id).cloned() else {
-                keep.push(item); // identity unknown yet; retry once learned
-                continue;
-            };
-            match engine.olm_decrypt_from(item.sender_id, &identity, &item.content) {
-                Ok(plaintext) => match serde_json::from_str::<Envelope>(&plaintext) {
-                    Ok(Envelope::SessionShare {
-                        channel_id,
-                        session_id,
-                        session_key,
-                    }) => {
-                        match engine.megolm_import(
-                            channel_id,
-                            item.sender_id,
-                            &session_id,
-                            &session_key,
-                        ) {
-                            Ok(()) => imported.push(channel_id),
-                            Err(e) => {
-                                eprintln!("bysyc: megolm import failed (channel {channel_id}): {e}")
-                            }
-                        }
-                        acks.push(item.id);
-                    }
-                    _ => acks.push(item.id), // not a share → malformed for us: skip
-                },
-                Err(_) => acks.push(item.id), // undecryptable: ack + skip
-            }
-        }
-        self.mailbox = keep;
-        self.outbox_acks.extend(acks);
-        // A freshly imported session may unlock history we already cached.
-        for ch in imported {
-            self.backfill_plaintexts(store, ch);
+        if let Some(ids) = self.known_ids.get_mut(&channel_id) {
+            ids.remove(&target);
         }
     }
 
@@ -546,43 +486,21 @@ impl MainState {
     /// attachment rows from earlier runs already carry their placeholder
     /// plaintext, so the retry loop below would never visit them again (and
     /// our own sent rows are outside it by design: the engine holds no
-    /// self-import). Store writes happen strictly after the engine calls —
-    /// never under the store lock — for the same lock-order reason as
-    /// [`MainState::apply_chat_message`].
+    /// self-import). The heavy lifting lives in [`retry_undecrypted`] /
+    /// [`load_file_envelopes`], which touch engine and store only — the WS
+    /// `Ready` path runs them on the crypto worker; this method remains for
+    /// callers that already hold the world (history pagination).
     pub fn backfill_plaintexts(&mut self, store: &Arc<Mutex<Store>>, channel_id: i64) {
-        for (id, json) in guard(store).file_envelopes(channel_id) {
-            if !self.file_meta.contains_key(&id) {
-                if let Ok(fe) = Envelope::from_json(&json) {
-                    self.file_meta.insert(id, fe);
-                }
-            }
+        let known: HashSet<i64> = self.file_meta.keys().copied().collect();
+        for (id, fe) in load_file_envelopes(store, channel_id, &known) {
+            self.file_meta.insert(id, fe);
         }
         let Some(engine) = self.engine.clone() else {
             return;
         };
-        let rows = guard(store).undecrypted(channel_id);
-        let mut decrypted: Vec<(i64, String)> = Vec::new();
-        for (id, sender, content) in rows {
-            if sender == self.account.id {
-                continue; // own rows get their plaintext from the send task
-            }
-            match decrypt_envelope_text(&engine, channel_id, sender, &content) {
-                Decrypted::Text(text) => decrypted.push((id, text)),
-                Decrypted::File(fe) => {
-                    let line = file_row_text(&fe);
-                    persist_file_envelope(store, id, &fe);
-                    self.file_meta.insert(id, fe);
-                    decrypted.push((id, line));
-                }
-                Decrypted::Deleted(_) | Decrypted::Failed => {}
-            }
-        }
-        if decrypted.is_empty() {
-            return;
-        }
-        let s = guard(store);
-        for (id, text) in decrypted {
-            let _ = s.set_plaintext(id, &text);
+        let (_, files) = retry_undecrypted(&engine, self.account.id, store, channel_id);
+        for (id, fe) in files {
+            self.file_meta.insert(id, fe);
         }
     }
 }
@@ -626,6 +544,67 @@ fn persist_file_envelope(store: &Arc<Mutex<Store>>, msg_id: i64, fe: &Envelope) 
             eprintln!("bysyc: persisting file envelope for message {msg_id} failed: {e}");
         }
     }
+}
+
+/// File envelopes persisted for `channel_id` whose message row has no chip
+/// stashed yet (`known` = the ids already in `file_meta`). The restart half
+/// of [`MainState::backfill_plaintexts`]: persisted envelopes are the only
+/// thing that can bring a chip back once the row carries its placeholder
+/// plaintext. Store reads only — no state access.
+fn load_file_envelopes(
+    store: &Arc<Mutex<Store>>,
+    channel_id: i64,
+    known: &HashSet<i64>,
+) -> Vec<(i64, Envelope)> {
+    let mut out = Vec::new();
+    for (id, json) in guard(store).file_envelopes(channel_id) {
+        if !known.contains(&id) {
+            if let Ok(fe) = Envelope::from_json(&json) {
+                out.push((id, fe));
+            }
+        }
+    }
+    out
+}
+
+/// Retry decryption for every still-NULL row of `channel_id` (rows cached
+/// before the session share arrived), persisting plaintexts and file
+/// envelopes as they land. Engine calls first, store writes batched after —
+/// the engine pickles into the store while we hold no store lock (lock
+/// order state → engine → store). Returns the plaintexts written and the
+/// File envelopes stashed, for the caller to publish into `file_meta`.
+/// Touches engine and store only — safe to run with no state lock held.
+fn retry_undecrypted(
+    engine: &Engine,
+    own_id: i64,
+    store: &Arc<Mutex<Store>>,
+    channel_id: i64,
+) -> (Vec<(i64, String)>, Vec<(i64, Envelope)>) {
+    let rows = guard(store).undecrypted(channel_id);
+    let mut texts: Vec<(i64, String)> = Vec::new();
+    let mut files: Vec<(i64, Envelope)> = Vec::new();
+    for (id, sender, content) in rows {
+        if sender == own_id {
+            continue; // own rows get their plaintext from the send task
+        }
+        match decrypt_envelope_text(engine, channel_id, sender, &content) {
+            Decrypted::Text(text) => texts.push((id, text)),
+            Decrypted::File(fe) => {
+                let line = file_row_text(&fe);
+                persist_file_envelope(store, id, &fe);
+                files.push((id, fe));
+                texts.push((id, line));
+            }
+            Decrypted::Deleted(_) | Decrypted::Failed => {}
+        }
+    }
+    if !texts.is_empty() {
+        let s = guard(store);
+        for (id, text) in &texts {
+            let _ = s.set_plaintext(*id, text);
+        }
+    }
+    (texts, files)
 }
 
 /// One-liner shown for a File envelope row (also stored as the message
@@ -986,6 +965,10 @@ pub struct ClientState {
     pub login_error: Option<String>,
     /// Engine staged by login/restore, consumed by the first WS `Ready`.
     pub pending_engine: Option<EngineBoot>,
+    /// Deferred crypto/store work drained by the crypto worker
+    /// (see [`stage_crypto_job`]); owned here so each session has its own
+    /// worker lifecycle and stale jobs die with the generation.
+    jobs: Arc<CryptoQueue>,
 }
 
 impl ClientState {
@@ -995,6 +978,7 @@ impl ClientState {
             ws_generation: 0,
             login_error: None,
             pending_engine: None,
+            jobs: Arc::new(CryptoQueue::default()),
         }
     }
 
@@ -1030,24 +1014,492 @@ impl ClientState {
 }
 
 // ---------------------------------------------------------------------------
+// Crypto worker
+// ---------------------------------------------------------------------------
+
+/// Deferred crypto/store work: everything the WS receive path used to run
+/// while holding the state mutex — Megolm/Olm decrypt, engine bootstrap
+/// (1024-round KDF), plaintext and message-row writes. Jobs are staged in
+/// arrival order, executed sequentially by one worker thread holding no
+/// locks, and published back under a brief state lock; the single FIFO
+/// keeps decrypt order per channel identical to arrival order.
+enum CryptoJob {
+    /// Megolm-decrypt one incoming chat message, persist its plaintext (or
+    /// apply its Delete envelope), then insert the row into the live cache.
+    Chat { generation: u64, dto: MessageDto },
+    /// Hide a deleted message in the store and live cache. Queued (not
+    /// applied inline) so it lands after any still-pending decrypt of the
+    /// same row; both removals are idempotent.
+    Deleted {
+        generation: u64,
+        channel_id: i64,
+        message_id: i64,
+    },
+    /// Olm-decrypt + import a batch of mailbox items, ack what was consumed
+    /// and retry-decrypt every channel a fresh share unlocked.
+    Mailbox { generation: u64, items: Vec<MailboxItem> },
+    /// Bootstrap the engine from the local store when login staged none
+    /// (crash between WS connect and login task). The KDF plus unpickling
+    /// of every session is far too slow for the state lock the UI needs
+    /// every frame.
+    EnsureEngine { generation: u64, username: String },
+    /// Retry decryption for one loaded channel's cached rows and rebuild
+    /// its attachment chips from persisted envelopes.
+    Backfill { generation: u64, channel_id: i64 },
+}
+
+/// The staging queue plus a one-worker latch. Locking is leaf-level:
+/// staging happens while the state lock may be held (order state → queue);
+/// the worker takes the queue lock only to pop or to stage a follow-up,
+/// never while holding anything else, so the two locks never nest the
+/// other way around.
+#[derive(Default)]
+struct CryptoQueue {
+    inner: Mutex<CryptoQueueInner>,
+}
+
+#[derive(Default)]
+struct CryptoQueueInner {
+    queue: VecDeque<CryptoJob>,
+    /// Whether a worker thread currently exists. Set under `inner` before
+    /// spawning; cleared by the worker when it observes the queue empty
+    /// under the same lock — so a job staged in any interleaving either
+    /// reaches the running worker or spawns a fresh one.
+    worker_alive: bool,
+}
+
+/// Append `job` and make sure exactly one worker thread is draining the
+/// queue (see [`CryptoWorker::run`] for the empty-exit protocol).
+fn stage_crypto_job(
+    q: &Arc<CryptoQueue>,
+    job: CryptoJob,
+    state: &Arc<Mutex<ClientState>>,
+    store: &Arc<Mutex<Store>>,
+    ctx: &Context,
+) {
+    let spawn = {
+        let mut inner = guard(&q.inner);
+        inner.queue.push_back(job);
+        if inner.worker_alive {
+            false
+        } else {
+            inner.worker_alive = true;
+            true
+        }
+    };
+    if spawn {
+        let q = Arc::clone(q);
+        let state = Arc::clone(state);
+        let store = Arc::clone(store);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || CryptoWorker { q, state, store, ctx }.run());
+    }
+}
+
+/// Everything a worker thread needs: the queue (for the follow-up jobs it
+/// stages itself) plus the world handles it gathers from and publishes to.
+struct CryptoWorker {
+    q: Arc<CryptoQueue>,
+    state: Arc<Mutex<ClientState>>,
+    store: Arc<Mutex<Store>>,
+    ctx: Context,
+}
+
+impl CryptoWorker {
+    /// Pop and run jobs until the queue is empty, then exit (the latch
+    /// clears under the queue lock, atomically with the empty check, so an
+    /// idle session holds no thread and nothing staged can be stranded).
+    /// A panicking job is caught and logged rather than killing the worker:
+    /// the latch would otherwise strand every job staged behind it.
+    fn run(&self) {
+        loop {
+            let job = {
+                let mut inner = guard(&self.q.inner);
+                match inner.queue.pop_front() {
+                    Some(job) => job,
+                    None => {
+                        inner.worker_alive = false;
+                        return;
+                    }
+                }
+            };
+            if let Err(p) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.job(job)))
+            {
+                eprintln!("bysyc: crypto worker job panicked: {p:?}");
+            }
+        }
+    }
+
+    /// Dispatch one job. Every handler re-checks the generation under its
+    /// gather lock and drops stale work before touching the engine or
+    /// store (sign-out bumped the generation) — except `deleted`, whose
+    /// idempotent store write always applies, exactly as this branch's
+    /// store delete ran unconditionally before the worker existed.
+    fn job(&self, job: CryptoJob) {
+        match job {
+            CryptoJob::Chat { generation, dto } => self.chat(generation, dto),
+            CryptoJob::Deleted {
+                generation,
+                channel_id,
+                message_id,
+            } => self.deleted(generation, channel_id, message_id),
+            CryptoJob::Mailbox { generation, items } => self.mailbox(generation, items),
+            CryptoJob::EnsureEngine { generation, username } => {
+                self.ensure_engine(generation, username)
+            }
+            CryptoJob::Backfill { generation, channel_id } => {
+                self.backfill(generation, channel_id)
+            }
+        }
+    }
+
+    /// What `apply_chat_message` used to do under the state lock, now with
+    /// the decrypt outside it: Megolm-decrypt, persist the plaintext (or
+    /// apply the Delete), then a brief re-lock to publish the row (or the
+    /// delete's effect) and the file chip, plus a repaint. Our own sends
+    /// skip decryption: the send task already stored the plaintext from
+    /// the REST response, and the engine deliberately holds no
+    /// self-import. Undecryptable rows get a terminal "[undecryptable]"
+    /// marker; with no engine the row stays NULL and renders as
+    /// "[encrypted]" until backfill can retry it.
+    fn chat(&self, generation: u64, dto: MessageDto) {
+        let msg_id = dto.id;
+        let channel_id = dto.channel_id;
+        let (engine, own_id) = {
+            let st = guard(&self.state);
+            if st.ws_generation != generation {
+                return;
+            }
+            let Some(m) = st.main() else { return };
+            (m.engine.clone(), m.account.id)
+        };
+        let mut file = None;
+        let mut deleted = None;
+        let show = if dto.sender_id == own_id {
+            true
+        } else if let Some(engine) = engine {
+            match decrypt_envelope_text(&engine, channel_id, dto.sender_id, &dto.content) {
+                Decrypted::Text(text) => {
+                    guard(&self.store).set_plaintext(msg_id, &text).ok();
+                    true
+                }
+                Decrypted::File(fe) => {
+                    // The attachment's key/nonce live only in this
+                    // envelope: stash it (C4's UI renders from
+                    // `file_meta`), persist it so the row survives a
+                    // restart, then store the placeholder text like any
+                    // other row.
+                    let line = file_row_text(&fe);
+                    persist_file_envelope(&self.store, msg_id, &fe);
+                    guard(&self.store).set_plaintext(msg_id, &line).ok();
+                    file = Some(fe);
+                    true
+                }
+                Decrypted::Deleted(target) => {
+                    let s = guard(&self.store);
+                    let _ = s.delete_message(target);
+                    let _ = s.delete_message(msg_id); // carrier never renders again
+                    deleted = Some(target);
+                    false
+                }
+                Decrypted::Failed => {
+                    guard(&self.store).set_plaintext(msg_id, "[undecryptable]").ok();
+                    true
+                }
+            }
+        } else {
+            true // no engine yet: row stays NULL, renders "[encrypted]"
+        };
+        let repaint = {
+            let mut st = guard(&self.state);
+            if st.ws_generation != generation {
+                return;
+            }
+            match st.main_mut() {
+                Some(m) => {
+                    if let Some(target) = deleted {
+                        m.remove_message(channel_id, target);
+                    }
+                    if show {
+                        m.append_message(dto);
+                        if !m.is_selected_channel(channel_id) {
+                            m.unread.insert(channel_id);
+                        }
+                    }
+                    if let Some(fe) = file {
+                        m.file_meta.insert(msg_id, fe);
+                    }
+                    true
+                }
+                None => false,
+            }
+        };
+        if repaint {
+            self.ctx.request_repaint();
+        }
+    }
+
+    /// Hide a deleted message: the store write first (idempotent), then a
+    /// brief re-lock to drop the live row. The queue guarantees this runs
+    /// after any still-pending decrypt of the same row.
+    fn deleted(&self, generation: u64, channel_id: i64, message_id: i64) {
+        let _ = guard(&self.store).delete_message(message_id);
+        let repaint = {
+            let mut st = guard(&self.state);
+            if st.ws_generation != generation {
+                return;
+            }
+            match st.main_mut() {
+                Some(m) => {
+                    m.remove_message(channel_id, message_id);
+                    true
+                }
+                None => false,
+            }
+        };
+        if repaint {
+            self.ctx.request_repaint();
+        }
+    }
+
+    /// What `process_mailbox` used to do under the state lock, now with the
+    /// Olm work outside it: Olm-decrypt each item, expect an
+    /// [`Envelope::SessionShare`], import the Megolm key. Items whose
+    /// sender identity is not known yet are kept (not acked) for a later
+    /// retry; stale items (older than [`MAILBOX_STALE_MS`]) and
+    /// undecryptable/malformed ones are acked and dropped — the mailbox
+    /// must never block. Publish re-locks briefly to return the keeps; acks
+    /// flush straight out when the socket handle exists, else they queue
+    /// in [`MainState::outbox_acks`] for the WS loop's follow-up drain
+    /// (there is no handle at the first Ready yet).
+    fn mailbox(&self, generation: u64, items: Vec<MailboxItem>) {
+        let (engine, identities) = {
+            let st = guard(&self.state);
+            if st.ws_generation != generation {
+                return;
+            }
+            let Some(m) = st.main() else { return };
+            let mut identities = HashMap::with_capacity(items.len());
+            for it in &items {
+                if let Some(key) = m.identities.get(&it.sender_id) {
+                    identities.insert(it.sender_id, key.clone());
+                }
+            }
+            (m.engine.clone(), identities)
+        };
+        let mut keep = Vec::new();
+        let mut acks: Vec<i64> = Vec::new();
+        let mut imported: Vec<i64> = Vec::new();
+        if let Some(engine) = engine {
+            let now = now_ms();
+            for item in items {
+                if now.saturating_sub(item.created_at_ms) > MAILBOX_STALE_MS {
+                    acks.push(item.id);
+                    continue;
+                }
+                let Some(identity) = identities.get(&item.sender_id) else {
+                    keep.push(item); // identity unknown yet; retry once learned
+                    continue;
+                };
+                match engine.olm_decrypt_from(item.sender_id, identity, &item.content) {
+                    Ok(plaintext) => match serde_json::from_str::<Envelope>(&plaintext) {
+                        Ok(Envelope::SessionShare {
+                            channel_id,
+                            session_id,
+                            session_key,
+                        }) => {
+                            match engine.megolm_import(
+                                channel_id,
+                                item.sender_id,
+                                &session_id,
+                                &session_key,
+                            ) {
+                                Ok(()) => imported.push(channel_id),
+                                Err(e) => {
+                                    eprintln!(
+                                        "bysyc: megolm import failed (channel {channel_id}): {e}"
+                                    )
+                                }
+                            }
+                            acks.push(item.id);
+                        }
+                        _ => acks.push(item.id), // not a share → malformed for us: skip
+                    },
+                    Err(_) => acks.push(item.id), // undecryptable: ack + skip
+                }
+            }
+        } else {
+            keep = items; // no engine: keep everything, retry after bootstrap
+        }
+        let flush_direct;
+        {
+            let mut st = guard(&self.state);
+            if st.ws_generation != generation {
+                return;
+            }
+            let Some(m) = st.main_mut() else { return };
+            m.mailbox.extend(keep);
+            flush_direct = m.net.is_some();
+            if !flush_direct {
+                for &id in &acks {
+                    push_capped(&mut m.outbox_acks, id, MAX_OUTBOX_ACKS);
+                }
+            }
+        }
+        if flush_direct && !acks.is_empty() {
+            let handle = guard(&self.state).main().and_then(|m| m.net.clone());
+            let sent = match handle {
+                Some(h) => h
+                    .out
+                    .try_send(WsClientMsg {
+                        id: crate::net::next_msg_id(),
+                        body: WsClientBody::AckMailbox {
+                            ids: acks.clone(),
+                        },
+                    })
+                    .is_ok(),
+                None => false,
+            };
+            if !sent {
+                let mut st = guard(&self.state);
+                if let Some(m) = st.main_mut() {
+                    for &id in &acks {
+                        push_capped(&mut m.outbox_acks, id, MAX_OUTBOX_ACKS);
+                    }
+                }
+            }
+        }
+        // A freshly imported session may unlock history we already cached —
+        // stage a backfill behind whatever is already queued.
+        for channel_id in imported {
+            stage_crypto_job(
+                &self.q,
+                CryptoJob::Backfill { generation, channel_id },
+                &self.state,
+                &self.store,
+                &self.ctx,
+            );
+        }
+        if !acks.is_empty() {
+            self.ctx.request_repaint();
+        }
+    }
+
+    /// Build the engine when login staged none: the KDF, unpickling of
+    /// every session and the initial re-persist all happen on this thread;
+    /// a brief re-lock then attaches the engine (and its persisted outbound
+    /// set) or surfaces the failure notice.
+    fn ensure_engine(&self, generation: u64, username: String) {
+        if guard(&self.state).ws_generation != generation {
+            return; // session superseded — no KDF for a dead world
+        }
+        let boot = crate::store::bootstrap_engine(&self.store, &username);
+        let repaint = {
+            let mut st = guard(&self.state);
+            if st.ws_generation != generation {
+                return;
+            }
+            match st.main_mut() {
+                Some(m) if m.engine.is_none() => match boot {
+                    Ok((engine, outbound)) => {
+                        m.engine = Some(engine);
+                        m.outbound.extend(outbound);
+                        true
+                    }
+                    Err(e) => {
+                        eprintln!("bysyc: {e}");
+                        m.notice = Some("crypto engine unavailable — sending disabled".into());
+                        true
+                    }
+                },
+                _ => false,
+            }
+        };
+        if repaint {
+            self.ctx.request_repaint();
+        }
+    }
+
+    /// Worker-side of [`MainState::backfill_plaintexts`]: the same retry
+    /// pass ([`retry_undecrypted`]) plus the persisted-envelope rebuild
+    /// ([`load_file_envelopes`]), run with no state lock held; only the
+    /// resulting `file_meta` insertions and the repaint need the world.
+    fn backfill(&self, generation: u64, channel_id: i64) {
+        let (engine, own_id, known) = {
+            let st = guard(&self.state);
+            if st.ws_generation != generation {
+                return;
+            }
+            let Some(m) = st.main() else { return };
+            (
+                m.engine.clone(),
+                m.account.id,
+                m.file_meta.keys().copied().collect::<HashSet<i64>>(),
+            )
+        };
+        let mut files = load_file_envelopes(&self.store, channel_id, &known);
+        let mut changed = !files.is_empty();
+        if let Some(engine) = engine {
+            let (texts, decrypted_files) =
+                retry_undecrypted(&engine, own_id, &self.store, channel_id);
+            changed = changed || !texts.is_empty();
+            files.extend(decrypted_files);
+        }
+        if !changed {
+            return;
+        }
+        let repaint = {
+            let mut st = guard(&self.state);
+            if st.ws_generation != generation {
+                return;
+            }
+            match st.main_mut() {
+                Some(m) => {
+                    for (id, fe) in files {
+                        m.file_meta.insert(id, fe);
+                    }
+                    true
+                }
+                None => false,
+            }
+        };
+        if repaint {
+            self.ctx.request_repaint();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Server message application
 // ---------------------------------------------------------------------------
 
 /// Apply one server-pushed WS message to the world and request a repaint.
 /// Returns `true` when the message was `Ready`.
 ///
+/// Only cheap mutations happen under the state lock: the world swap and the
+/// roster/identity updates below, plus staging the expensive tail of each
+/// event — Megolm/Olm decrypt, engine bootstrap (KDF), plaintext and
+/// message-row writes — onto the crypto queue (`CryptoJob`), drained
+/// sequentially by the crypto worker with no lock held. Publishing re-locks
+/// briefly, so a burst of incoming messages can no longer freeze the UI
+/// thread, and per-channel decrypt order still matches arrival order (one
+/// FIFO queue, one worker).
+///
 /// The WS task stamps `MainState::net` itself right after a `Ready` (it owns
 /// the handle). Message persistence happens in the caller *before* this runs
-/// (the caller holds the store and the raw dto); decryption, delete-marking
-/// and plaintext writes happen here under the state lock (lock order:
-/// state → engine → store, never store → engine).
+/// (the caller holds the store and the raw dto); lock order is
+/// state → queue, then engine → store on the worker — never the reverse.
 pub fn apply_server_msg(
-    state: &Mutex<ClientState>,
+    state: &Arc<Mutex<ClientState>>,
     store: &Arc<Mutex<Store>>,
     ctx: &Context,
     msg: WsServerMsg,
 ) -> bool {
     let mut st = guard(state);
+    let generation = st.ws_generation;
+    let q = Arc::clone(&st.jobs);
+    let mut jobs: Vec<CryptoJob> = Vec::new();
     let mut was_ready = false;
     match msg.body {
         WsServerBody::Ready {
@@ -1088,46 +1540,40 @@ pub fn apply_server_msg(
                     boot,
                 ));
             }
-            // The engine must exist before the mailbox below is processed
-            // (session shares ride in it). Login/restore stage one in
-            // `pending_engine`; if it is missing (crash between WS connect
-            // and login task?) bootstrap inline from the local store.
-            if let Some(m) = st.main_mut() {
-                if m.engine.is_none() {
-                    let username = m.account.username.clone();
-                    match crate::store::bootstrap_engine(store, &username) {
-                        Ok((engine, outbound)) => {
-                            m.engine = Some(engine);
-                            m.outbound.extend(outbound);
-                        }
-                        Err(e) => {
-                            eprintln!("bysyc: {e}");
-                            m.notice = Some("crypto engine unavailable — sending disabled".into());
-                        }
-                    }
-                }
-            }
             if let Some(m) = st.main_mut() {
                 m.seed_world();
-                m.process_mailbox(store);
-                // A share that arrived while we were offline may unlock
-                // history cached from the previous session.
+                // The crypto tail stages onto the worker, in the order the
+                // synchronous path used to run it: the engine must exist
+                // before the mailbox is processed (session shares ride in
+                // it) — login/restore stage one in `pending_engine`, and if
+                // it is missing (crash between WS connect and login task?)
+                // the worker bootstraps from the local store — then the
+                // mailbox, then a backfill per loaded channel (a share that
+                // arrived while we were offline may unlock history cached
+                // from the previous session).
+                let username = m.account.username.clone();
+                let need_boot = m.engine.is_none();
+                let items = std::mem::take(&mut m.mailbox);
                 let loaded: Vec<i64> = m.loaded.iter().copied().collect();
+                if need_boot {
+                    jobs.push(CryptoJob::EnsureEngine { generation, username });
+                }
+                if !items.is_empty() {
+                    jobs.push(CryptoJob::Mailbox { generation, items });
+                }
                 for ch in loaded {
-                    m.backfill_plaintexts(store, ch);
+                    jobs.push(CryptoJob::Backfill {
+                        generation,
+                        channel_id: ch,
+                    });
                 }
             }
         }
         WsServerBody::Message(dto) => {
-            if let Some(m) = st.main_mut() {
-                if dto.kind == MessageKind::Control {
-                    // v1 has no chat-routed control payloads; drop.
-                } else if m.apply_chat_message(store, &dto) {
-                    m.append_message(dto.clone());
-                    if !m.is_selected_channel(dto.channel_id) {
-                        m.unread.insert(dto.channel_id);
-                    }
-                }
+            // v1 has no chat-routed control payloads; drop those, stage the
+            // rest — the worker decrypts, persists and publishes the row.
+            if dto.kind != MessageKind::Control && st.main().is_some() {
+                jobs.push(CryptoJob::Chat { generation, dto });
             }
         }
         WsServerBody::MessageDeleted {
@@ -1139,15 +1585,19 @@ pub fn apply_server_msg(
             // (the broadcast reaches them too), so this may be a repeat —
             // both removals are idempotent. A message we never had (a
             // channel opened after the delete) is a no-op on either side.
-            if let Some(m) = st.main_mut() {
-                m.remove_message(channel_id, message_id);
-            }
-            let _ = guard(store).delete_message(message_id);
+            // Queued (not applied inline) so the delete lands after any
+            // still-pending decrypt of the same row: the worker is FIFO.
+            jobs.push(CryptoJob::Deleted {
+                generation,
+                channel_id,
+                message_id,
+            });
         }
         WsServerBody::MailboxAppend(item) => {
             if let Some(m) = st.main_mut() {
                 m.mailbox.push(item);
-                m.process_mailbox(store);
+                let items = std::mem::take(&mut m.mailbox);
+                jobs.push(CryptoJob::Mailbox { generation, items });
             }
         }
         WsServerBody::Presence { account_id, online } => {
@@ -1239,9 +1689,16 @@ pub fn apply_server_msg(
                     .or_default()
                     .insert(account.id);
                 // Their session share may already sit in the mailbox.
-                m.process_mailbox(store);
+                if !m.mailbox.is_empty() {
+                    let items = std::mem::take(&mut m.mailbox);
+                    jobs.push(CryptoJob::Mailbox { generation, items });
+                }
                 if account.id != m.account.id {
-                    m.pending_newcomers.push((guild_id, account.id));
+                    push_capped(
+                        &mut m.pending_newcomers,
+                        (guild_id, account.id),
+                        MAX_PENDING_NEWCOMERS,
+                    );
                 }
             }
         }
@@ -1276,7 +1733,7 @@ pub fn apply_server_msg(
             kind,
         } => {
             if let Some(m) = st.main_mut() {
-                m.pending_signals.push((from, call_id, kind));
+                push_capped(&mut m.pending_signals, (from, call_id, kind), MAX_PENDING_SIGNALS);
             }
         }
         WsServerBody::Error {
@@ -1290,6 +1747,11 @@ pub fn apply_server_msg(
         }
     }
     drop(st);
+    // Stage after releasing the state lock: spawning the worker (first job
+    // of a burst) never happens under it. Job order = arrival order.
+    for job in jobs {
+        stage_crypto_job(&q, job, state, store, ctx);
+    }
     ctx.request_repaint();
     was_ready
 }

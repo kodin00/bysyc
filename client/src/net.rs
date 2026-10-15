@@ -49,8 +49,8 @@
 //! not `ApiError` degrades to `Err("HTTP <status>")`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use bysyc_common::PROTOCOL_VERSION;
 use bysyc_common::protocol::{
@@ -80,13 +80,24 @@ pub fn next_msg_id() -> u64 {
 // REST
 // ---------------------------------------------------------------------------
 
+/// The one HTTP pool every [`Net`] shares (login, session restore, WS
+/// resync calls, background key publishes). Minting a `reqwest::Client`
+/// per call site would give each its own connection pool and TLS session
+/// cache, so the app would re-handshake with the Instance per flow; the
+/// token is attached per request instead, so sharing never shares auth.
+static HTTP: OnceLock<Arc<reqwest::Client>> = OnceLock::new();
+
+fn shared_http() -> Arc<reqwest::Client> {
+    HTTP.get_or_init(|| Arc::new(reqwest::Client::new())).clone()
+}
+
 /// HTTP client for one Instance. Cheap to clone (`reqwest::Client` inside);
 /// the token is the caller's session token.
 #[derive(Clone)]
 pub struct Net {
     base: String,
     token: String,
-    http: reqwest::Client,
+    http: Arc<reqwest::Client>,
 }
 
 impl Net {
@@ -95,7 +106,7 @@ impl Net {
         Net {
             base: base.trim().trim_end_matches('/').to_string(),
             token: String::new(),
-            http: reqwest::Client::new(),
+            http: shared_http(),
         }
     }
 
@@ -722,10 +733,46 @@ fn sign_out_everywhere(state: &Arc<Mutex<ClientState>>, ctx: &Context, reason: &
     ctx.request_repaint();
 }
 
+/// Chat frames drained off one socket before a single transactional
+/// insert ([`Store::insert_message_page`]); the drain also fires on any
+/// non-message frame, every heartbeat tick, and when the session ends —
+/// whichever ends the burst first.
+const WS_INSERT_BATCH: usize = 32;
+
+/// Insert the WS receive-path message batch in one transaction. A
+/// per-frame autocommit INSERT paid a WAL fsync per message whenever a
+/// burst (history replay, a busy channel) landed.
+fn flush_pending(store: &Arc<Mutex<Store>>, pending: &mut Vec<MessageDto>) {
+    if pending.is_empty() {
+        return;
+    }
+    let dtos = std::mem::take(pending);
+    if let Ok(s) = store.lock() {
+        if let Err(e) = s.insert_message_page(&dtos) {
+            eprintln!("bysyc: caching {} ws message(s) failed: {e}", dtos.len());
+        }
+    }
+}
+
+/// ±30% spread on each reconnect sleep: every client dropped by the same
+/// Instance restart would otherwise retry in lockstep.
+fn jittered(d: Duration) -> Duration {
+    use rand::RngExt;
+    d.mul_f64(rand::rng().random_range(0.7..=1.3))
+}
+
+/// A session must have carried a Ready and stayed up at least this long
+/// before the reconnect backoff resets. Anything shorter keeps the backoff
+/// growing, so a flapping Instance that completes the handshake and then
+/// drops us is retried with real spacing instead of every second.
+const MIN_SESSION_UPTIME: Duration = Duration::from_secs(10);
+
 /// The realtime gateway task: connect → apply `Ready` → stream deltas,
-/// reconnecting forever with exponential backoff (1 s → 30 s cap). Queued
-/// outgoing messages are drained once a socket is up. On reconnects the
-/// friend graph and guild list are re-GET-ed as a cheap resync.
+/// reconnecting forever with exponential backoff (1 s → 30 s cap, each
+/// sleep jittered ±30%; the backoff only resets after a session that
+/// carried a Ready stayed up [`MIN_SESSION_UPTIME`]). Queued outgoing
+/// messages are drained once a socket is up. On reconnects the friend
+/// graph and guild list are re-GET-ed as a cheap resync.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_ws(
     state: Arc<Mutex<ClientState>>,
@@ -748,16 +795,24 @@ pub async fn run_ws(
         let url = ws_url_from_base(&base, &token);
         match tokio_tungstenite::connect_async(url.as_str()).await {
             Ok((stream, _response)) => {
-                backoff = Duration::from_secs(1);
+                let connected_at = Instant::now();
+                let mut saw_ready = false;
                 let (mut write, mut read) = stream.split();
                 let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
                 heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 heartbeat.tick().await; // the first tick completes immediately
 
+                // Chat frames waiting for one transactional insert
+                // (see `flush_pending`).
+                let mut pending: Vec<MessageDto> = Vec::new();
+
                 let session: Result<(), String> = loop {
                     tokio::select! {
                         biased;
                         _ = heartbeat.tick() => {
+                            // The periodic tick also bounds how long a
+                            // partial batch can sit uncached.
+                            flush_pending(&store, &mut pending);
                             let msg = WsClientMsg { id: next_msg_id(), body: WsClientBody::Heartbeat };
                             match serde_json::to_string(&msg) {
                                 Ok(text) => {
@@ -787,7 +842,10 @@ pub async fn run_ws(
                                     }
                                 }
                                 // All NetHandles dropped (session torn down).
-                                None => return,
+                                None => {
+                                    flush_pending(&store, &mut pending);
+                                    return;
+                                }
                             }
                         }
                         frame = read.next() => {
@@ -803,12 +861,15 @@ pub async fn run_ws(
                                                     ..
                                                 } = &msg.body
                                                 {
+                                                    flush_pending(&store, &mut pending);
                                                     let reason =
                                                         message.clone();
                                                     sign_out_everywhere(&state, &ctx, &reason);
                                                     return;
                                                 }
                                                 if matches!(msg.body, WsServerBody::Ready { .. }) {
+                                                    saw_ready = true;
+                                                    flush_pending(&store, &mut pending);
                                                     apply_server_msg(&state, &store, &ctx, msg);
                                                     if let Some(m) = guard(&state).main_mut() {
                                                         m.net = Some(handle.clone());
@@ -821,15 +882,22 @@ pub async fn run_ws(
                                                 } else {
                                                     if let WsServerBody::Message(ref dto) = msg.body {
                                                         if dto.kind != bysyc_common::protocol::MessageKind::Control {
-                                                            if let Ok(s) = store.lock() {
-                                                                let _ = s.append_message(dto);
+                                                            pending.push(dto.clone());
+                                                            if pending.len() >= WS_INSERT_BATCH {
+                                                                flush_pending(&store, &mut pending);
                                                             }
                                                         }
+                                                    } else {
+                                                        // Any other frame
+                                                        // type ends the
+                                                        // burst.
+                                                        flush_pending(&store, &mut pending);
                                                     }
                                                     apply_server_msg(&state, &store, &ctx, msg);
                                                     drain_followups(&state, &store, &handle);
                                                 }
                                                 if !alive(&state, generation) {
+                                                    flush_pending(&store, &mut pending);
                                                     return;
                                                 }
                                             }
@@ -850,6 +918,14 @@ pub async fn run_ws(
                         }
                     }
                 };
+                flush_pending(&store, &mut pending);
+                // A completed handshake is not a session: reset the backoff
+                // only for one that carried a Ready and stayed up. A
+                // connection that dies within seconds keeps the backoff
+                // growing instead of resetting to 1 s per TCP success.
+                if saw_ready && connected_at.elapsed() >= MIN_SESSION_UPTIME {
+                    backoff = Duration::from_secs(1);
+                }
                 let _ = session;
                 if !alive(&state, generation) {
                     return;
@@ -871,7 +947,7 @@ pub async fn run_ws(
             }
         }
         ctx.request_repaint();
-        tokio::time::sleep(backoff).await;
+        tokio::time::sleep(jittered(backoff)).await;
         backoff = std::cmp::min(backoff * 2, Duration::from_secs(30));
     }
 }

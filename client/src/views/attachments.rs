@@ -8,7 +8,8 @@
 //! encrypted blob.
 //!
 //! **Server-side images** — png/jpeg/webp/bmp and single-frame gif inputs
-//! are re-encoded locally to lossy WebP ([`WEBP_QUALITY`]; re-encoding
+//! are downscaled to ≤ [`MAX_SEND_PX`] and re-encoded locally to lossy
+//! WebP ([`WEBP_QUALITY`]; re-encoding
 //! goes through raw pixels, so ALL EXIF/ICC/metadata is dropped — there is
 //! no metadata path into the encoder), renamed to a random
 //! `img_<hex>.webp` (the original filename never leaves the device), and
@@ -35,10 +36,13 @@
 //! - `fs::read` + WebP re-encode / `encrypt_file` run on a dedicated
 //!   `std::thread` kicked off by the composer's send flush (CPU-bound file
 //!   work off the UI thread).
-//! - Network + `spawn_blocking` decode/decrypt run on the tokio runtime.
+//! - Network + `spawn_blocking` decode/decrypt run on the tokio runtime;
+//!   full-resolution decodes are gated by [`MAX_PARALLEL_DECODES`]
+//!   permits (each holds a whole RGBA frame before the downscale).
 //! - Decoded images cross back to the UI thread through an `mpsc` channel
-//!   drained by [`drain_decoded`]; textures are created only on the UI
-//!   thread (egui requirement).
+//!   drained by [`drain_decoded`] — already converted to
+//!   `egui::ColorImage` on the worker, so the UI thread only uploads;
+//!   textures are created only on the UI thread (egui requirement).
 //! - Save/Open exports ride the same rails (dialog `std::thread` → runtime
 //!   → `spawn_blocking` write/opener) and report progress as strip rows in
 //!   [`FILE_OPS`], which outlives a logout that wipes `MainState`
@@ -51,13 +55,16 @@
 //! - The disk cache under the data dir (one file per attachment id) stores
 //!   the bytes exactly as they sit in object storage: still-ENCRYPTED
 //!   ciphertext for E2EE files, the already-server-visible WebP for
-//!   server-side images. Plaintext originals are only ever written when
-//!   the user explicitly Saves or Opens.
+//!   server-side images. Each decoded image also persists a downscaled
+//!   `<id>.thumb` PNG so the next load (and every load after a restart)
+//!   skips the fetch/decrypt/full decode — only ever the thumbnail,
+//!   never the plaintext original. Plaintext originals are only ever
+//!   written when the user explicitly Saves or Opens.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -82,6 +89,11 @@ pub const MAX_RAW_FILE_BYTES: usize = 48 * 1024 * 1024;
 /// Lossy WebP quality for the server-side image flow (libwebp's 0–100
 /// scale; 78 sits just under libwebp's default of 75–80 territory).
 pub const WEBP_QUALITY: f32 = 78.0;
+/// Longest side an uploaded image keeps: inputs are downscaled to ≤ this
+/// before the WebP re-encode, so a 12 MP phone photo ships as a bounded
+/// ~2048px WebP instead of a multi-megabyte original-resolution one
+/// (smaller inputs pass through untouched).
+pub const MAX_SEND_PX: u32 = 2048;
 /// Images at or below this decrypted size fetch + decode automatically;
 /// bigger ones wait for an explicit "load image" click.
 pub const AUTO_IMAGE_BYTES: i64 = 2 * 1024 * 1024;
@@ -92,6 +104,11 @@ pub const MAX_DECODE_PX: u32 = 1024;
 pub const INLINE_IMAGE_PX: f32 = 256.0;
 /// Popup cap — roughly a laptop half-screen.
 pub const POPUP_IMAGE_PX: egui::Vec2 = egui::Vec2::new(900.0, 700.0);
+/// Concurrent full-resolution decodes allowed at once. Each one holds a
+/// whole RGBA frame in memory before the downscale (4K ≈ 50 MB), so an
+/// unbounded fan-out of auto-fetched images is a memory spike, not a
+/// throughput win.
+pub const MAX_PARALLEL_DECODES: usize = 2;
 
 /// Fresh upload ids for the progress strip (UI-thread allocated).
 static UPLOAD_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -103,6 +120,23 @@ static FILE_OP_SEQ: AtomicU64 = AtomicU64::new(1);
 /// already on the wire is best-effort — it finishes, we just stop tracking.
 static CANCELLED_UPLOADS: LazyLock<Mutex<HashSet<u64>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// A client WITHOUT our bearer token, shared by every presigned PUT/GET:
+/// presigned endpoints reject (or mis-auth) Authorization headers, so these
+/// transfers must not use [`Net`]'s authed plumbing — and one client means
+/// one TLS connection pool instead of a fresh handshake per transfer.
+static PRESIGNED: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .unwrap_or_default()
+});
+
+/// The receive-path decode gate ([`MAX_PARALLEL_DECODES`] permits): each
+/// gated decode allocates a full-resolution RGBA frame before the
+/// thumbnail step, so auto-fetched images must not all decode at once.
+static DECODE_PERMITS: LazyLock<tokio::sync::Semaphore> =
+    LazyLock::new(|| tokio::sync::Semaphore::new(MAX_PARALLEL_DECODES));
 
 // ---------------------------------------------------------------------------
 // Send path
@@ -602,10 +636,11 @@ fn is_animated_gif(bytes: &[u8]) -> bool {
         .unwrap_or(true)
 }
 
-/// Decode to raw pixels and re-encode as lossy WebP at [`WEBP_QUALITY`].
-/// Going through pixels is also the metadata story: EXIF/ICC/text chunks
-/// have no path into this encoder, so none can survive. Alpha is preserved
-/// when present.
+/// Decode to raw pixels, downscale to ≤ [`MAX_SEND_PX`], and re-encode as
+/// lossy WebP at [`WEBP_QUALITY`] — the upload is bounded no matter what
+/// the phone camera produced. Going through pixels is also the metadata
+/// story: EXIF/ICC/text chunks have no path into this encoder, so none can
+/// survive. Alpha is preserved when present.
 fn reencode_webp(bytes: &[u8]) -> Option<Vec<u8>> {
     let img = match image::load_from_memory(bytes) {
         Ok(img) => img,
@@ -613,6 +648,14 @@ fn reencode_webp(bytes: &[u8]) -> Option<Vec<u8>> {
             eprintln!("bysyc: image decode for WebP re-encode failed: {e}");
             return None;
         }
+    };
+    // `thumbnail` alone would also UPSCALE small inputs (image's
+    // resize_dimensions has no "never grow" clamp), so only shrink what
+    // actually exceeds the cap.
+    let img = if img.width() > MAX_SEND_PX || img.height() > MAX_SEND_PX {
+        img.thumbnail(MAX_SEND_PX, MAX_SEND_PX)
+    } else {
+        img
     };
     let (width, height) = (img.width(), img.height());
     let encoded = if img.color().has_alpha() {
@@ -783,18 +826,10 @@ fn absolute(base: &str, url: &str) -> String {
     }
 }
 
-/// A client WITHOUT our bearer token: presigned endpoints reject (or
-/// mis-auth) Authorization headers, so the attachment PUT/GET must not use
-/// [`Net`]'s authed plumbing.
-fn presigned_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(120))
-        .build()
-        .unwrap_or_default()
-}
-
+/// Presigned PUT/GET ride [`PRESIGNED`] — see its doc for why that client
+/// carries no Authorization header.
 async fn put_presigned(url: &str, body: &[u8]) -> Result<(), String> {
-    let rsp = presigned_client()
+    let rsp = PRESIGNED
         .put(url)
         .body(body.to_vec())
         .send()
@@ -808,7 +843,7 @@ async fn put_presigned(url: &str, body: &[u8]) -> Result<(), String> {
 }
 
 async fn get_presigned(url: &str) -> Result<Vec<u8>, String> {
-    let rsp = presigned_client()
+    let rsp = PRESIGNED
         .get(url)
         .send()
         .await
@@ -826,12 +861,21 @@ async fn get_presigned(url: &str) -> Result<Vec<u8>, String> {
 // Attachment-bytes disk cache (filename = attachment id; bytes as stored)
 // ---------------------------------------------------------------------------
 
+/// The cache dir, resolved and created once per process (it used to be
+/// `create_dir_all`ed on every `cache_path` call — twice per
+/// [`ensure_bytes`]).
+static CACHE_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+
 fn cache_dir() -> Option<PathBuf> {
-    directories::ProjectDirs::from("", "", "bysyc").map(|d| {
-        let dir = d.data_dir().join("attachment-cache");
-        let _ = std::fs::create_dir_all(&dir);
-        dir
-    })
+    CACHE_DIR
+        .get_or_init(|| {
+            directories::ProjectDirs::from("", "", "bysyc").map(|d| {
+                let dir = d.data_dir().join("attachment-cache");
+                let _ = std::fs::create_dir_all(&dir);
+                dir
+            })
+        })
+        .clone()
 }
 
 fn cache_path(attachment_id: i64) -> Option<PathBuf> {
@@ -841,18 +885,27 @@ fn cache_path(attachment_id: i64) -> Option<PathBuf> {
 /// The bytes of an attachment exactly as they sit in object storage —
 /// still-encrypted ciphertext for E2EE files, the server-visible WebP for
 /// server-side images: disk cache first, else a fresh presigned GET (URLs
-/// expire, so never cache the URL) which then populates the cache.
+/// expire, so never cache the URL) which then populates the cache. The
+/// cache read/write ride a blocking thread — up to 48 MiB of sync fs has
+/// no business parking an async worker.
 async fn ensure_bytes(net: &Net, attachment_id: i64) -> Result<Vec<u8>, String> {
-    if let Some(p) = cache_path(attachment_id) {
-        if let Ok(bytes) = std::fs::read(&p) {
-            return Ok(bytes);
-        }
+    if let Some(p) = cache_path(attachment_id)
+        && let Ok(Ok(bytes)) = tokio::task::spawn_blocking(move || std::fs::read(p)).await
+    {
+        return Ok(bytes);
     }
     let dl = net.attachment_download_url(attachment_id).await?;
     let url = absolute(net.base(), &dl.url);
-    let bytes = get_presigned(&url).await?;
+    let mut bytes = get_presigned(&url).await?;
     if let Some(p) = cache_path(attachment_id) {
-        let _ = std::fs::write(&p, &bytes);
+        // The closure hands the bytes back so there is no 48 MiB clone
+        // just to persist them.
+        bytes = tokio::task::spawn_blocking(move || {
+            let _ = std::fs::write(&p, &bytes);
+            bytes
+        })
+        .await
+        .map_err(|e| format!("worker: {e}"))?;
     }
     Ok(bytes)
 }
@@ -898,12 +951,57 @@ async fn materialize(
 // Image decode (worker) → texture (UI thread)
 // ---------------------------------------------------------------------------
 
-/// A decoded, downscaled image crossing from a worker to the UI thread.
+/// A decoded, downscaled image crossing from a worker to the UI thread —
+/// already an egui [`egui::ColorImage`] (plain data, `Send`), so the RGBA
+/// copy + premultiply happens on the worker and the UI thread only
+/// uploads the texture.
 pub struct DecodedImage {
     pub attachment_id: i64,
-    pub width: u32,
-    pub height: u32,
-    pub rgba: Vec<u8>,
+    pub color: egui::ColorImage,
+}
+
+/// Where the persisted `<id>.thumb` of an attachment lives (alongside the
+/// stored bytes, same dir, so the cache stays one file per attachment plus
+/// its thumb).
+fn thumb_path(attachment_id: i64) -> Option<PathBuf> {
+    cache_dir().map(|d| d.join(format!("{attachment_id}.thumb")))
+}
+
+/// The persisted `<id>.thumb` bytes, if the file exists AND its magic
+/// bytes name a decodable image — a write torn by a crash or quit fails
+/// the sniff, and the load falls back to the full pipeline instead of
+/// dying on a decode error.
+fn read_cached_thumb(attachment_id: i64) -> Option<Vec<u8>> {
+    let bytes = std::fs::read(thumb_path(attachment_id)?).ok()?;
+    image::guess_format(&bytes).ok()?;
+    Some(bytes)
+}
+
+/// Persist a decoded thumbnail as a lossless PNG (≤ [`MAX_DECODE_PX`] a
+/// side) so the next load — including after a restart — skips the fetch,
+/// the decrypt, and the full-resolution decode. `ColorImage` pixels are
+/// already premultiplied for the texture; they are stored as-is and
+/// reloaded premultiplied ([`decode_cached_thumb`]), so the round trip
+/// never double-premultiplies translucent edges. Best-effort: a failed
+/// write only costs the next load the full pipeline.
+fn write_cached_thumb(attachment_id: i64, img: &DecodedImage) {
+    use image::ImageEncoder as _;
+    let Some(p) = thumb_path(attachment_id) else { return };
+    let (width, height) = (img.color.size[0] as u32, img.color.size[1] as u32);
+    let mut raw = Vec::with_capacity(img.color.pixels.len() * 4);
+    for c in &img.color.pixels {
+        raw.extend_from_slice(&c.to_array());
+    }
+    let Some(frame) = image::RgbaImage::from_raw(width, height, raw) else {
+        return;
+    };
+    let mut png = Vec::new();
+    if image::codecs::png::PngEncoder::new(&mut png)
+        .write_image(frame.as_raw(), width, height, image::ExtendedColorType::Rgba8)
+        .is_ok()
+    {
+        let _ = std::fs::write(p, png);
+    }
 }
 
 /// Decrypt + decode + downscale on a blocking thread. Only the ≤
@@ -922,7 +1020,8 @@ fn decode_thumbnail(
 }
 
 /// Decode + downscale already-plaintext image bytes (the server-side WebP
-/// flow skips the decrypt step entirely).
+/// flow skips the decrypt step entirely), converting to [`egui::ColorImage`]
+/// here on the worker instead of on the UI thread.
 fn decode_thumbnail_bytes(plain: &[u8], attachment_id: i64) -> Result<DecodedImage, String> {
     let img = image::load_from_memory(plain).map_err(|e| format!("decode: {e}"))?;
     let thumb = img.thumbnail(MAX_DECODE_PX, MAX_DECODE_PX);
@@ -930,10 +1029,36 @@ fn decode_thumbnail_bytes(plain: &[u8], attachment_id: i64) -> Result<DecodedIma
     let (width, height) = rgba.dimensions();
     Ok(DecodedImage {
         attachment_id,
-        width,
-        height,
-        rgba: rgba.into_raw(),
+        color: egui::ColorImage::from_rgba_unmultiplied(
+            [width as usize, height as usize],
+            rgba.as_raw(),
+        ),
     })
+}
+
+/// The persisted `<id>.thumb` decoded, or `None` when there is no usable
+/// one (absent, torn, or undecodable) — the caller then runs the full
+/// fetch+decrypt+decode pipeline, which rewrites it. Cheap by design (a
+/// ≤ [`MAX_DECODE_PX`] PNG), so it needs no [`DECODE_PERMITS`] gate.
+async fn decode_cached_thumb(attachment_id: i64) -> Option<DecodedImage> {
+    tokio::task::spawn_blocking(move || {
+        let plain = read_cached_thumb(attachment_id)?;
+        let img = image::load_from_memory(&plain).ok()?;
+        let rgba = img.to_rgba8();
+        let (width, height) = rgba.dimensions();
+        Some(DecodedImage {
+            attachment_id,
+            // Stored premultiplied (see write_cached_thumb), reloaded as
+            // such — no second premultiply pass.
+            color: egui::ColorImage::from_rgba_premultiplied(
+                [width as usize, height as usize],
+                rgba.as_raw(),
+            ),
+        })
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// Kick off (or join) the fetch-decode pipeline for one image attachment.
@@ -975,26 +1100,44 @@ pub fn fetch_image(
     let (key, nonce) = (key_b64.to_string(), nonce_b64.to_string());
     let encrypted = att.encrypted;
     rt.spawn(async move {
-        let result = match ensure_bytes(&h.net, att_id).await {
-            Ok(stored) => {
-                // spawn_blocking owns its inputs.
-                let engine = engine.clone();
-                let key = key.clone();
-                let nonce = nonce.clone();
-                tokio::task::spawn_blocking(move || {
-                    if encrypted {
-                        let engine = engine.as_deref().ok_or("crypto engine unavailable")?;
-                        decode_thumbnail(engine, &stored, &key, &nonce, att_id)
-                    } else {
-                        // Server-side image: the stored bytes ARE the image.
-                        decode_thumbnail_bytes(&stored, att_id)
+        // A previously persisted <id>.thumb short-circuits the pipeline: no
+        // presigned GET, no decrypt, no full-resolution decode. A missing
+        // or unusable thumb falls through to the pipeline that rewrites it.
+        let result = match decode_cached_thumb(att_id).await {
+            Some(img) => Ok(img),
+            None => match ensure_bytes(&h.net, att_id).await {
+                Ok(stored) => match DECODE_PERMITS.acquire().await {
+                    // The permit lives until the join resolves, so at most
+                    // MAX_PARALLEL_DECODES full-resolution frames exist at
+                    // once.
+                    Ok(_permit) => {
+                        // spawn_blocking owns its inputs.
+                        let engine = engine.clone();
+                        let key = key.clone();
+                        let nonce = nonce.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let decoded = if encrypted {
+                                let engine =
+                                    engine.as_deref().ok_or("crypto engine unavailable")?;
+                                decode_thumbnail(engine, &stored, &key, &nonce, att_id)
+                            } else {
+                                // Server-side image: the stored bytes ARE the image.
+                                decode_thumbnail_bytes(&stored, att_id)
+                            };
+                            // Keep the downscaled result for the next load.
+                            if let Ok(img) = &decoded {
+                                write_cached_thumb(att_id, img);
+                            }
+                            decoded
+                        })
+                        .await
+                        .map_err(|e| format!("worker: {e}"))
+                        .and_then(|r| r)
                     }
-                })
-                .await
-                .map_err(|e| format!("worker: {e}"))
-                .and_then(|r| r)
-            }
-            Err(e) => Err(e),
+                    Err(e) => Err(format!("decode gate: {e}")),
+                },
+                Err(e) => Err(e),
+            },
         };
         {
             let mut st = guard(&state);
@@ -1016,19 +1159,21 @@ pub fn fetch_image(
 }
 
 /// Bring finished background decodes onto the UI thread as textures. Must
-/// run on the UI thread (textures cannot be created elsewhere).
+/// run on the UI thread (textures cannot be created elsewhere) — the
+/// RGBA→pixel conversion already happened on the worker, so this only
+/// uploads.
 pub fn drain_decoded(ctx: &egui::Context, mv: &mut MainView) {
     while let Ok(img) = mv.image_rx.try_recv() {
-        let color = egui::ColorImage::from_rgba_unmultiplied(
-            [img.width as usize, img.height as usize],
-            &img.rgba,
-        );
+        let DecodedImage {
+            attachment_id,
+            color,
+        } = img;
         let tex = ctx.load_texture(
-            format!("attachment-{}", img.attachment_id),
+            format!("attachment-{attachment_id}"),
             color,
             egui::TextureOptions::default(),
         );
-        mv.image_cache.insert(img.attachment_id, tex);
+        mv.image_cache.insert(attachment_id, tex);
     }
 }
 
@@ -1151,14 +1296,15 @@ pub fn attachment_row(
     }
 
     // Thumbnail / loading / failure states below the chip.
-    if let Some(tex) = mv.image_cache.get(&att.id) {
+    if let Some(tex) = mv.image_cache.get(&att.id).cloned() {
+        mv.touch_image(att.id);
         let rsp = ui.add(
-            egui::Image::new(tex)
+            egui::Image::new(&tex)
                 .max_size(egui::Vec2::splat(INLINE_IMAGE_PX))
                 .sense(egui::Sense::click()),
         );
         if rsp.clicked() {
-            mv.image_popup = Some((att.id, name.clone()));
+            open_popup(state, mv, att.id, fe);
         }
         return;
     }
@@ -1200,6 +1346,82 @@ pub fn attachment_row(
     }
 }
 
+/// Everything the lightbox needs from a File envelope, cloned ONCE per
+/// open — the old popup re-scanned all of `file_meta` and re-cloned the
+/// envelope on every frame the window sat open.
+struct Popup {
+    /// The `file_meta` key this popup was opened for (stale-check for the
+    /// memo).
+    msg_id: i64,
+    att_id: i64,
+    name: String,
+    /// Empty key marks the server-side image flow (nothing to decrypt —
+    /// see upload_image_and_send).
+    key: String,
+    nonce: String,
+    encrypted: bool,
+}
+
+impl Popup {
+    /// From a File envelope; `None` for non-File envelopes, which cannot
+    /// open a lightbox.
+    fn from_envelope(msg_id: i64, fe: &Envelope) -> Option<Popup> {
+        let Envelope::File {
+            name,
+            key,
+            nonce,
+            attachment_id,
+            ..
+        } = fe
+        else {
+            return None;
+        };
+        Some(Popup {
+            msg_id,
+            att_id: *attachment_id,
+            name: name.clone(),
+            key: key.clone(),
+            nonce: nonce.clone(),
+            encrypted: !key.is_empty(),
+        })
+    }
+}
+
+/// The open lightbox's [`Popup`]. Module-local like [`FILE_OPS`]: it must
+/// survive a logout that wipes `MainState` mid-open no differently.
+static POPUP: LazyLock<Mutex<Option<Popup>>> = LazyLock::new(|| Mutex::new(None));
+
+fn popup_memo() -> std::sync::MutexGuard<'static, Option<Popup>> {
+    POPUP.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Open the lightbox for a clicked attachment: one reverse scan resolves
+/// the MESSAGE id (the `file_meta` key), which `mv.image_popup` now
+/// carries, and the envelope's strings are memoized here so the popup
+/// body never touches `file_meta` again while it is open.
+fn open_popup(
+    state: &Arc<Mutex<ClientState>>,
+    mv: &mut MainView,
+    att_id: i64,
+    fe: &Envelope,
+) {
+    let msg_id = {
+        let st = guard(state);
+        st.main().and_then(|m| {
+            m.file_meta.iter().find_map(|(id, fe)| {
+                matches!(fe, Envelope::File { attachment_id, .. } if *attachment_id == att_id)
+                    .then_some(*id)
+            })
+        })
+    };
+    let Some(msg_id) = msg_id else { return };
+    let Some(p) = Popup::from_envelope(msg_id, fe) else {
+        return;
+    };
+    mv.image_popup = Some((msg_id, p.name.clone()));
+    *popup_memo() = Some(p);
+}
+
 /// Full-size lightbox for a clicked thumbnail: Save / Open / Close.
 pub fn image_popup(
     state: &Arc<Mutex<ClientState>>,
@@ -1207,31 +1429,28 @@ pub fn image_popup(
     ctx: &egui::Context,
     mv: &mut MainView,
 ) {
-    let Some((att_id, name)) = mv.image_popup.clone() else {
-        return;
+    // `mv.image_popup` carries the MESSAGE id (the `file_meta` key, set at
+    // click time by open_popup); borrowed, not cloned, every frame.
+    let msg_id = match mv.image_popup.as_ref() {
+        Some((id, _)) => *id,
+        None => return,
     };
-    // Reverse lookup: the File envelope carrying this attachment's key.
-    let found = {
-        let st = guard(state);
-        st.main().and_then(|m| {
-            m.file_meta
-                .values()
-                .find(|fe| {
-                    matches!(fe, Envelope::File { attachment_id, .. } if *attachment_id == att_id)
-                })
-                .cloned()
-        })
-    };
-    let Some(fe) = found else {
+    // Resolve once per open; the guard lives for the frame like
+    // file_ops_ui's strip guard.
+    let mut memo = popup_memo();
+    if memo.as_ref().map(|p| p.msg_id) != Some(msg_id) {
+        let found = {
+            let st = guard(state);
+            st.main().and_then(|m| m.file_meta.get(&msg_id).cloned())
+        };
+        *memo = found.as_ref().and_then(|fe| Popup::from_envelope(msg_id, fe));
+    }
+    let Some(popup) = memo.as_ref() else {
         mv.image_popup = None; // envelope gone (restarted before decrypt?)
         return;
     };
-    // Empty key in the envelope marks the server-side image flow (nothing
-    // to decrypt — see upload_image_and_send).
-    let (key, nonce, encrypted) = match &fe {
-        Envelope::File { key, nonce, .. } => (key.clone(), nonce.clone(), !key.is_empty()),
-        _ => return,
-    };
+    let (att_id, name, key, nonce, encrypted) =
+        (popup.att_id, &popup.name, &popup.key, &popup.nonce, popup.encrypted);
     // Synthetic meta for fetch/save/open (only the id drives them).
     let att = AttachmentMeta {
         id: att_id,
@@ -1242,13 +1461,14 @@ pub fn image_popup(
     };
 
     let mut open = true;
-    egui::Window::new(name.clone())
+    egui::Window::new(popup.name.as_str())
         .id(egui::Id::new(("attachment_popup", att_id)))
         .open(&mut open)
         .collapsible(false)
         .show(ctx, |ui| {
-            if let Some(tex) = mv.image_cache.get(&att_id) {
-                ui.add(egui::Image::new(tex).max_size(POPUP_IMAGE_PX));
+            if let Some(tex) = mv.image_cache.get(&att_id).cloned() {
+                mv.touch_image(att_id);
+                ui.add(egui::Image::new(&tex).max_size(POPUP_IMAGE_PX));
             } else {
                 let (inflight, failed) = {
                     let st = guard(state);
@@ -1269,37 +1489,19 @@ pub fn image_popup(
                 } else if failed {
                     ui.weak("image unavailable");
                     if ui.button("retry").clicked() {
-                        fetch_image(state, rt, mv, ui.ctx(), &att, &key, &nonce);
+                        fetch_image(state, rt, mv, ui.ctx(), &att, key, nonce);
                     }
                 } else {
                     ui.weak("loading…");
-                    fetch_image(state, rt, mv, ui.ctx(), &att, &key, &nonce);
+                    fetch_image(state, rt, mv, ui.ctx(), &att, key, nonce);
                 }
             }
             ui.horizontal(|ui| {
                 if ui.button("Save").clicked() {
-                    save_attachment(
-                        state,
-                        rt,
-                        ui.ctx(),
-                        att_id,
-                        name.clone(),
-                        encrypted,
-                        &key,
-                        &nonce,
-                    );
+                    save_attachment(state, rt, ui.ctx(), att_id, name.clone(), encrypted, key, nonce);
                 }
                 if ui.button("Open").clicked() {
-                    open_attachment(
-                        state,
-                        rt,
-                        ui.ctx(),
-                        att_id,
-                        name.clone(),
-                        encrypted,
-                        &key,
-                        &nonce,
-                    );
+                    open_attachment(state, rt, ui.ctx(), att_id, name.clone(), encrypted, key, nonce);
                 }
             });
         });
@@ -1850,6 +2052,36 @@ mod tests {
         // (WebP may legitimately exceed the PNG for tiny inputs; the
         // contract sends the WebP regardless of relative size.)
         assert!(maybe_webp(b"definitely not an image").is_none());
+    }
+
+    #[test]
+    fn big_inputs_are_downscaled_small_ones_pass_through() {
+        let encode = |w: u32, h: u32| {
+            use image::ImageEncoder;
+            let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+                w,
+                h,
+                image::Rgb([200u8, 10, 10]),
+            ));
+            let mut png = Vec::new();
+            image::codecs::png::PngEncoder::new(&mut png)
+                .write_image(img.as_bytes(), w, h, image::ExtendedColorType::Rgb8)
+                .unwrap();
+            png
+        };
+        // A 3000×2000 input (6 MP) ships bounded at ≤ MAX_SEND_PX with its
+        // aspect ratio kept.
+        let webp = maybe_webp(&encode(3000, 2000)).expect("re-encodes");
+        let decoded = image::load_from_memory(&webp).unwrap();
+        assert!(decoded.width() <= MAX_SEND_PX && decoded.height() <= MAX_SEND_PX);
+        let longest = decoded.width().max(decoded.height());
+        assert_eq!(longest, MAX_SEND_PX, "big inputs hit the cap");
+        let (w, h) = (decoded.width() as f32, decoded.height() as f32);
+        assert!((w / h - 1.5).abs() < 0.02, "aspect kept: {w}x{h}");
+        // Small inputs pass through untouched.
+        let webp = maybe_webp(&encode(64, 48)).expect("re-encodes");
+        let decoded = image::load_from_memory(&webp).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (64, 48));
     }
 
     #[test]
