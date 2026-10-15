@@ -7,7 +7,9 @@
 //! by the app layer (ADR 0001: one device per Account; key export is the
 //! reinstall/recovery story).
 
+#[cfg(test)]
 use std::collections::HashMap;
+#[cfg(test)]
 use std::sync::Mutex;
 
 /// Persistent byte-blob store the [`crate::crypto::Engine`] pickles into.
@@ -29,10 +31,13 @@ pub trait KeyStore: Send + Sync {
 
 /// Trivial in-memory [`KeyStore`], used by the engine's unit tests and handy
 /// as a reference implementation for the real store. Wrap it in an `Arc` to
-/// share one between engines.
+/// share one between engines. Compiled only under `cfg(test)`: production
+/// code always persists through the app layer's real store.
+#[cfg(test)]
 #[derive(Default)]
 pub struct MemKeyStore(Mutex<HashMap<String, Vec<u8>>>);
 
+#[cfg(test)]
 impl KeyStore for MemKeyStore {
     fn get(&self, scope: &str) -> Option<Vec<u8>> {
         self.0.lock().unwrap().get(scope).cloned()

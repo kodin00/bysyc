@@ -99,15 +99,21 @@ pub fn show(app: &mut BysycApp, ui: &mut egui::Ui) {
     } = app;
     let ctx = ui.ctx().clone();
 
-    // egui 0.36: one `Panel` type with side constructors.
+    // egui 0.36: one `Panel` type with side constructors. Both side columns
+    // are drag-resizable within a bounded range so they stay usable from
+    // small windows (min) up to wide ones (max).
     egui::Panel::left("nav")
-        .resizable(false)
+        .resizable(true)
         .default_size(190.0)
+        .min_size(140.0)
+        .max_size(400.0)
         .show(ui, |ui| nav(ui, state, store, rt, main_view, &ctx));
 
     egui::Panel::left("middle")
-        .resizable(false)
+        .resizable(true)
         .default_size(210.0)
+        .min_size(140.0)
+        .max_size(400.0)
         .show(ui, |ui| middle(ui, state, rt, main_view, &ctx));
 
     egui::CentralPanel::default().show(ui, |ui| chat(ui, state, store, rt, main_view, &ctx));
@@ -147,72 +153,78 @@ fn nav(
     ui.heading("bysyc");
     ui.add_space(6.0);
 
-    for g in &guilds {
-        let is_current =
-            matches!(selected, Selection::Channel(c) if g.channels.iter().any(|ch| ch.id == c));
-        let marker = if is_current { "> " } else { "" };
-        if ui
-            .selectable_label(is_current, format!("{marker}{}", g.name))
-            .clicked()
-        {
-            let mut st = guard(state);
-            if let Some(m) = st.main_mut() {
-                if let Some(ch) = m.first_text_channel(g.id) {
-                    m.selected = Selection::Channel(ch);
-                    m.unread.remove(&ch);
+    // The guild/friends/DM list scrolls when it outgrows the column; the
+    // heading above and the Log out button below stay pinned.
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for g in &guilds {
+                let is_current =
+                    matches!(selected, Selection::Channel(c) if g.channels.iter().any(|ch| ch.id == c));
+                let marker = if is_current { "> " } else { "" };
+                if ui
+                    .selectable_label(is_current, format!("{marker}{}", g.name))
+                    .clicked()
+                {
+                    let mut st = guard(state);
+                    if let Some(m) = st.main_mut() {
+                        if let Some(ch) = m.first_text_channel(g.id) {
+                            m.selected = Selection::Channel(ch);
+                            m.unread.remove(&ch);
+                        }
+                    }
                 }
             }
-        }
-    }
-    if ui.button("+ guild").clicked() {
-        mv.guild_popup = !mv.guild_popup;
-    }
+            if ui.button("+ guild").clicked() {
+                mv.guild_popup = !mv.guild_popup;
+            }
 
-    ui.add_space(8.0);
-    ui.separator();
+            ui.add_space(8.0);
+            ui.separator();
 
-    let friends_label = if incoming > 0 {
-        format!("Friends ({incoming})")
-    } else {
-        "Friends".to_string()
-    };
-    if ui
-        .selectable_label(matches!(selected, Selection::Friends), friends_label)
-        .clicked()
-    {
-        if let Some(m) = guard(state).main_mut() {
-            m.selected = Selection::Friends;
-        }
-    }
-
-    ui.add_space(4.0);
-    for dm in &dms {
-        let sel = matches!(selected, Selection::Dm(c) if c == dm.channel.id);
-        ui.horizontal(|ui| {
-            let on = online.contains(&dm.peer.id);
-            ui.colored_label(
-                if on {
-                    egui::Color32::LIGHT_GREEN
-                } else {
-                    egui::Color32::GRAY
-                },
-                "●",
-            );
-            if ui.selectable_label(sel, dm.peer.username.clone()).clicked() {
-                let mut st = guard(state);
-                if let Some(m) = st.main_mut() {
-                    m.selected = Selection::Dm(dm.channel.id);
-                    m.unread.remove(&dm.channel.id);
+            let friends_label = if incoming > 0 {
+                format!("Friends ({incoming})")
+            } else {
+                "Friends".to_string()
+            };
+            if ui
+                .selectable_label(matches!(selected, Selection::Friends), friends_label)
+                .clicked()
+            {
+                if let Some(m) = guard(state).main_mut() {
+                    m.selected = Selection::Friends;
                 }
             }
-            if unread.contains(&dm.channel.id) {
-                ui.colored_label(egui::Color32::RED, "•");
+
+            ui.add_space(4.0);
+            for dm in &dms {
+                let sel = matches!(selected, Selection::Dm(c) if c == dm.channel.id);
+                ui.horizontal(|ui| {
+                    let on = online.contains(&dm.peer.id);
+                    ui.colored_label(
+                        if on {
+                            egui::Color32::LIGHT_GREEN
+                        } else {
+                            egui::Color32::GRAY
+                        },
+                        "●",
+                    );
+                    if ui.selectable_label(sel, dm.peer.username.clone()).clicked() {
+                        let mut st = guard(state);
+                        if let Some(m) = st.main_mut() {
+                            m.selected = Selection::Dm(dm.channel.id);
+                            m.unread.remove(&dm.channel.id);
+                        }
+                    }
+                    if unread.contains(&dm.channel.id) {
+                        ui.colored_label(egui::Color32::RED, "•");
+                    }
+                });
+            }
+            if ui.button("+ dm").clicked() {
+                mv.dm_picker = !mv.dm_picker;
             }
         });
-    }
-    if ui.button("+ dm").clicked() {
-        mv.dm_picker = !mv.dm_picker;
-    }
 
     ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
         if ui.button("Log out").clicked() {
@@ -482,97 +494,101 @@ fn middle(
         (m.selected, m.guilds.clone(), m.voice.clone(), m.account.id)
     };
 
-    match selected {
-        Selection::Friends => friends_panel(ui, state, rt, mv, ctx),
-        Selection::Dm(ch) => {
-            let peer = {
-                let st = guard(state);
-                st.main().and_then(|m| {
-                    m.dms
-                        .iter()
-                        .find(|d| d.channel.id == ch)
-                        .map(|d| d.peer.clone())
-                })
-            };
-            let Some(peer) = peer else { return };
-            ui.heading(format!("@{}", peer.username));
-            ui.weak("private, end-to-end encrypted");
-            if ui.button("Call").clicked() {
-                crate::call::start_private_call(state, rt, peer, ch);
-            }
-        }
-        Selection::Channel(ch) => {
-            let Some(g) = guilds
-                .iter()
-                .find(|g| g.channels.iter().any(|c| c.id == ch))
-            else {
-                ui.weak("nothing selected");
-                return;
-            };
-            ui.heading(g.name.clone());
-            let is_owner = g.owner_id == my_id;
-            if is_owner {
-                ui.horizontal(|ui| {
-                    if ui.small_button("+ channel").clicked() {
-                        mv.channel_popup = !mv.channel_popup;
-                    }
-                    if ui.small_button("invite").clicked() {
-                        spawn_invite(state, rt, ctx, g.id, g.name.clone());
-                    }
-                });
-            }
-            ui.separator();
-            for c in &g.channels {
-                match c.kind {
-                    ChannelKind::Text => {
-                        let sel = c.id == ch;
-                        ui.horizontal(|ui| {
-                            if ui.selectable_label(sel, format!("# {}", c.name)).clicked() {
-                                let mut st = guard(state);
-                                if let Some(m) = st.main_mut() {
-                                    m.selected = Selection::Channel(c.id);
-                                    m.unread.remove(&c.id);
-                                }
-                            }
-                            if is_owner && ui.small_button("×").clicked() {
-                                let id = c.id;
-                                spawn_rest(state, rt, ctx, move |h| async move {
-                                    h.net.delete_channel(id).await
-                                });
-                            }
-                        });
-                    }
-                    ChannelKind::Voice => {
-                        let participants = voice.get(&c.id);
-                        let n = participants.map_or(0, Vec::len);
-                        let joined = participants.is_some_and(|v| v.iter().any(|p| p.id == my_id));
-                        let label = if joined {
-                            format!("(v) {} — {n} in call  [leave]", c.name)
-                        } else {
-                            format!("(v) {} — {n} in call", c.name)
-                        };
-                        ui.horizontal(|ui| {
-                            if ui.selectable_label(joined, label).clicked() {
-                                if joined {
-                                    crate::call::leave_active_call(state, rt);
-                                } else {
-                                    crate::call::join_voice_channel(state, rt, c.id);
-                                }
-                            }
-                            if is_owner && ui.small_button("×").clicked() {
-                                let id = c.id;
-                                spawn_rest(state, rt, ctx, move |h| async move {
-                                    h.net.delete_channel(id).await
-                                });
-                            }
-                        });
-                    }
-                    ChannelKind::Dm => {}
+    // Channels / friends scroll so a long list never pushes the layout.
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, true])
+        .show(ui, |ui| match selected {
+            Selection::Friends => friends_panel(ui, state, rt, mv, ctx),
+            Selection::Dm(ch) => {
+                let peer = {
+                    let st = guard(state);
+                    st.main().and_then(|m| {
+                        m.dms
+                            .iter()
+                            .find(|d| d.channel.id == ch)
+                            .map(|d| d.peer.clone())
+                    })
+                };
+                let Some(peer) = peer else { return };
+                ui.heading(format!("@{}", peer.username));
+                ui.weak("private, end-to-end encrypted");
+                if ui.button("Call").clicked() {
+                    crate::call::start_private_call(state, rt, peer, ch);
                 }
             }
-            channel_popup(state, rt, mv, ctx, g.id, is_owner);
-        }
-    }
+            Selection::Channel(ch) => {
+                let Some(g) = guilds
+                    .iter()
+                    .find(|g| g.channels.iter().any(|c| c.id == ch))
+                else {
+                    ui.weak("nothing selected");
+                    return;
+                };
+                ui.heading(g.name.clone());
+                let is_owner = g.owner_id == my_id;
+                if is_owner {
+                    ui.horizontal(|ui| {
+                        if ui.small_button("+ channel").clicked() {
+                            mv.channel_popup = !mv.channel_popup;
+                        }
+                        if ui.small_button("invite").clicked() {
+                            spawn_invite(state, rt, ctx, g.id, g.name.clone());
+                        }
+                    });
+                }
+                ui.separator();
+                for c in &g.channels {
+                    match c.kind {
+                        ChannelKind::Text => {
+                            let sel = c.id == ch;
+                            ui.horizontal(|ui| {
+                                if ui.selectable_label(sel, format!("# {}", c.name)).clicked() {
+                                    let mut st = guard(state);
+                                    if let Some(m) = st.main_mut() {
+                                        m.selected = Selection::Channel(c.id);
+                                        m.unread.remove(&c.id);
+                                    }
+                                }
+                                if is_owner && ui.small_button("×").clicked() {
+                                    let id = c.id;
+                                    spawn_rest(state, rt, ctx, move |h| async move {
+                                        h.net.delete_channel(id).await
+                                    });
+                                }
+                            });
+                        }
+                        ChannelKind::Voice => {
+                            let participants = voice.get(&c.id);
+                            let n = participants.map_or(0, Vec::len);
+                            let joined =
+                                participants.is_some_and(|v| v.iter().any(|p| p.id == my_id));
+                            let label = if joined {
+                                format!("(v) {} — {n} in call  [leave]", c.name)
+                            } else {
+                                format!("(v) {} — {n} in call", c.name)
+                            };
+                            ui.horizontal(|ui| {
+                                if ui.selectable_label(joined, label).clicked() {
+                                    if joined {
+                                        crate::call::leave_active_call(state, rt);
+                                    } else {
+                                        crate::call::join_voice_channel(state, rt, c.id);
+                                    }
+                                }
+                                if is_owner && ui.small_button("×").clicked() {
+                                    let id = c.id;
+                                    spawn_rest(state, rt, ctx, move |h| async move {
+                                        h.net.delete_channel(id).await
+                                    });
+                                }
+                            });
+                        }
+                        ChannelKind::Dm => {}
+                    }
+                }
+                channel_popup(state, rt, mv, ctx, g.id, is_owner);
+            }
+        });
 }
 
 /// "+ channel" window for guild owners: name + text/voice toggle.
@@ -899,6 +915,102 @@ fn chat(
         }
     }
 
+    // Composer strip, carved out as a bottom panel BEFORE the history
+    // ScrollArea: a vertical ScrollArea claims all remaining height of its
+    // parent, so widgets laid out after it were pushed off-screen (the
+    // invisible-composer bug). Typing indicator, reply banner, and upload
+    // progress strip live here too, directly above the input.
+    egui::Panel::bottom("chat_composer")
+        .resizable(false)
+        .min_size(52.0)
+        .show(ui, |ui| {
+            // Typing indicator (pruned past its TTL).
+            let typing_line: Option<String> = {
+                let mut st = guard(state);
+                if let Some(m) = st.main_mut() {
+                    match m.typing.get(&ch).copied() {
+                        Some((sender, at)) if at.elapsed().as_secs() < TYPING_TTL_SECS => {
+                            Some(m.account_name(sender))
+                        }
+                        Some(_) => {
+                            m.typing.remove(&ch);
+                            None
+                        }
+                        None => None,
+                    }
+                } else {
+                    None
+                }
+            };
+            if let Some(name) = typing_line {
+                ui.weak(format!("{name} is typing…"));
+            }
+
+            // Reply banner: who and what is being replied to, cancellable.
+            if let Some(rid) = mv.reply_to.get(&ch).copied() {
+                let target = {
+                    let st = guard(state);
+                    st.main().and_then(|m| {
+                        m.messages.get(&ch).and_then(|v| {
+                            v.iter()
+                                .find(|x| x.id == rid)
+                                .map(|x| (m.account_name(x.sender_id), preview_body(store, x)))
+                        })
+                    })
+                };
+                let known = target.is_some();
+                let (name, snippet) = target.unwrap_or_else(|| ("(gone)".into(), String::new()));
+                if known {
+                    ui.horizontal(|ui| {
+                        ui.weak(format!("replying to {name}: {snippet}"));
+                        if ui.small_button("cancel").clicked() {
+                            mv.reply_to.remove(&ch);
+                        }
+                    });
+                } else {
+                    mv.reply_to.remove(&ch);
+                }
+            }
+
+            // Attachment upload progress strip (above the composer).
+            attachments::uploads_ui(ui, state);
+
+            // Composer.
+            let response = {
+                let buf = mv.composer.entry(ch).or_default();
+                ui.add(
+                    egui::TextEdit::singleline(buf)
+                        .hint_text("Message…  (Ctrl+Enter to send)")
+                        .desired_width(f32::INFINITY),
+                )
+            };
+            if response.changed() {
+                maybe_send_typing(state, mv, ch);
+            }
+            let mut send = false;
+            ui.horizontal(|ui| {
+                if ui.button("Send").clicked() {
+                    send = true;
+                }
+                if ui.button("+ attach").clicked() {
+                    attachments::begin_attach(state, store, rt, ctx, mv, ch);
+                }
+            });
+            if response.lost_focus()
+                && ui.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.ctrl)
+            {
+                send = true;
+            }
+            if send {
+                let text = mv.composer.get(&ch).cloned().unwrap_or_default();
+                let text = text.trim().to_string();
+                if !text.is_empty() {
+                    mv.composer.insert(ch, String::new());
+                    do_send(state, store, rt, ctx, mv, ch, text);
+                }
+            }
+        });
+
     // Message list — virtualized per ADR 0003.
     let count = guard(state)
         .main()
@@ -1002,90 +1114,6 @@ fn chat(
                 }
             }
         });
-
-    // Typing indicator (pruned past its TTL).
-    let typing_line: Option<String> = {
-        let mut st = guard(state);
-        if let Some(m) = st.main_mut() {
-            match m.typing.get(&ch).copied() {
-                Some((sender, at)) if at.elapsed().as_secs() < TYPING_TTL_SECS => {
-                    Some(m.account_name(sender))
-                }
-                Some(_) => {
-                    m.typing.remove(&ch);
-                    None
-                }
-                None => None,
-            }
-        } else {
-            None
-        }
-    };
-    if let Some(name) = typing_line {
-        ui.weak(format!("{name} is typing…"));
-    }
-
-    // Reply banner: who and what is being replied to, cancellable.
-    if let Some(rid) = mv.reply_to.get(&ch).copied() {
-        let target = {
-            let st = guard(state);
-            st.main().and_then(|m| {
-                m.messages.get(&ch).and_then(|v| {
-                    v.iter()
-                        .find(|x| x.id == rid)
-                        .map(|x| (m.account_name(x.sender_id), preview_body(store, x)))
-                })
-            })
-        };
-        let known = target.is_some();
-        let (name, snippet) = target.unwrap_or_else(|| ("(gone)".into(), String::new()));
-        if known {
-            ui.horizontal(|ui| {
-                ui.weak(format!("replying to {name}: {snippet}"));
-                if ui.small_button("cancel").clicked() {
-                    mv.reply_to.remove(&ch);
-                }
-            });
-        } else {
-            mv.reply_to.remove(&ch);
-        }
-    }
-
-    // Attachment upload progress strip (above the composer).
-    attachments::uploads_ui(ui, state);
-
-    // Composer.
-    let response = {
-        let buf = mv.composer.entry(ch).or_default();
-        ui.add(
-            egui::TextEdit::singleline(buf)
-                .hint_text("Message…  (Ctrl+Enter to send)")
-                .desired_width(f32::INFINITY),
-        )
-    };
-    if response.changed() {
-        maybe_send_typing(state, mv, ch);
-    }
-    let mut send = false;
-    ui.horizontal(|ui| {
-        if ui.button("Send").clicked() {
-            send = true;
-        }
-        if ui.button("+ attach").clicked() {
-            attachments::begin_attach(state, store, rt, ctx, mv, ch);
-        }
-    });
-    if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.ctrl) {
-        send = true;
-    }
-    if send {
-        let text = mv.composer.get(&ch).cloned().unwrap_or_default();
-        let text = text.trim().to_string();
-        if !text.is_empty() {
-            mv.composer.insert(ch, String::new());
-            do_send(state, store, rt, ctx, mv, ch, text);
-        }
-    }
 
     // Image lightbox for clicked thumbnails.
     attachments::image_popup(state, rt, ctx, mv);

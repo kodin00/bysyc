@@ -200,18 +200,14 @@ const STUN_MAGIC: [u8; 4] = [0x21, 0x12, 0xA4, 0x42];
 // Message types: small methods, class encoded in bits 4/8 (RFC 5389 §6).
 const TYPE_ALLOCATE_REQ: u16 = 0x0003;
 const TYPE_ALLOCATE_OK: u16 = 0x0103;
-const TYPE_ALLOCATE_ERR: u16 = 0x0113;
 const TYPE_REFRESH_REQ: u16 = 0x0004;
 const TYPE_REFRESH_OK: u16 = 0x0104;
-const TYPE_REFRESH_ERR: u16 = 0x0114;
 const TYPE_SEND_IND: u16 = 0x0016;
 const TYPE_DATA_IND: u16 = 0x0017;
 const TYPE_PERMISSION_REQ: u16 = 0x0008;
 const TYPE_PERMISSION_OK: u16 = 0x0108;
-const TYPE_PERMISSION_ERR: u16 = 0x0118;
 const TYPE_BIND_REQ: u16 = 0x0009;
 const TYPE_BIND_OK: u16 = 0x0109;
-const TYPE_BIND_ERR: u16 = 0x0119;
 
 const ATTR_USERNAME: u16 = 0x0006;
 const ATTR_MESSAGE_INTEGRITY: u16 = 0x0008;
@@ -302,14 +298,6 @@ impl StunBuilder {
 
     fn nonce(self, nonce: &str) -> Self {
         self.attr(ATTR_NONCE, nonce.as_bytes())
-    }
-
-    fn error_code(self, code: u16, reason: &str) -> Self {
-        let class = (code / 100) as u8;
-        let number = (code % 100) as u8;
-        let mut v = vec![0, 0, class, number];
-        v.extend_from_slice(reason.as_bytes());
-        self.attr(ATTR_ERROR_CODE, &v)
     }
 
     fn header(&self, body_len: u16) -> Vec<u8> {
@@ -973,6 +961,27 @@ mod tests {
         msg.extend_from_slice(&trans_id);
         msg.extend_from_slice(&body);
         msg
+    }
+
+    /// Allocate error response type — the server side of the exchange; the
+    /// client only ever receives these, never sends them.
+    const TYPE_ALLOCATE_ERR: u16 = 0x0113;
+
+    /// Append an ERROR-CODE attribute. The builder proper has no such
+    /// method (the client never emits STUN errors); tests synthesize the
+    /// server's side of the 401/403 dance with this extension.
+    trait StunErrorCode {
+        fn error_code(self, code: u16, reason: &str) -> Self;
+    }
+
+    impl StunErrorCode for StunBuilder {
+        fn error_code(self, code: u16, reason: &str) -> Self {
+            let class = (code / 100) as u8;
+            let number = (code % 100) as u8;
+            let mut v = vec![0, 0, class, number];
+            v.extend_from_slice(reason.as_bytes());
+            self.attr(ATTR_ERROR_CODE, &v)
+        }
     }
 
     #[test]

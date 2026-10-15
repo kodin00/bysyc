@@ -203,7 +203,6 @@ struct Peer {
 /// instead of performing I/O, so tests can loop two cores together.
 pub struct SessionCore {
     me_id: i64,
-    call_id: i64,
     kind: CallKind,
     clock0: Instant,
     peers: Vec<Peer>,
@@ -225,10 +224,9 @@ pub struct SessionCore {
 }
 
 impl SessionCore {
-    pub fn new(me_id: i64, call_id: i64, kind: CallKind, clock0: Instant) -> Self {
+    pub fn new(me_id: i64, kind: CallKind, clock0: Instant) -> Self {
         SessionCore {
             me_id,
-            call_id,
             kind,
             clock0,
             peers: Vec::new(),
@@ -986,7 +984,7 @@ fn run(cfg: SessionConfig, rx: std::sync::mpsc::Receiver<SessionCmd>, ui: Arc<Ui
         }
     };
 
-    let mut core = SessionCore::new(cfg.me_id, cfg.call_id, cfg.kind, Instant::now());
+    let mut core = SessionCore::new(cfg.me_id, cfg.kind, Instant::now());
     let mut signals: Vec<OutSignal> = Vec::new();
     {
         let mut out = Vec::new();
@@ -1258,8 +1256,8 @@ mod tests {
             let t0 = Instant::now();
             let addr_a: SocketAddr = "127.0.0.1:41001".parse().unwrap();
             let addr_b: SocketAddr = "127.0.0.1:41002".parse().unwrap();
-            let mut a = SessionCore::new(id_a, 1, CallKind::Private, t0);
-            let mut b = SessionCore::new(id_b, 1, CallKind::Private, t0);
+            let mut a = SessionCore::new(id_a, CallKind::Private, t0);
+            let mut b = SessionCore::new(id_b, CallKind::Private, t0);
             a.set_local(&[addr_a], &mut Vec::new());
             b.set_local(&[addr_b], &mut Vec::new());
             Pair {
@@ -1400,7 +1398,7 @@ mod tests {
         let a = account(10, "a");
         let b = account(20, "b");
         let c = account(30, "c");
-        let mut core = SessionCore::new(10, 7, CallKind::Channel, t0);
+        let mut core = SessionCore::new(10, CallKind::Channel, t0);
         core.set_local(&["127.0.0.1:42001".parse().unwrap()], &mut Vec::new());
         let mut out = Vec::new();
         core.apply_roster(&[a.clone(), b.clone(), c.clone()], &mut out);
@@ -1432,12 +1430,12 @@ mod tests {
         let t0 = Instant::now();
         let a = account(5, "a");
         let b = account(6, "b");
-        let mut core = SessionCore::new(6, 9, CallKind::Private, t0);
+        let mut core = SessionCore::new(6, CallKind::Private, t0);
         core.set_local(&["127.0.0.1:43001".parse().unwrap()], &mut Vec::new());
         core.start_private(&a, true, &mut Vec::new()); // we offered (we are 6)
         // Meanwhile 5 also offered and their offer arrives.
         let foreign = {
-            let mut lower = SessionCore::new(5, 9, CallKind::Private, t0);
+            let mut lower = SessionCore::new(5, CallKind::Private, t0);
             lower.set_local(&["127.0.0.1:43002".parse().unwrap()], &mut Vec::new());
             let mut o2 = Vec::new();
             lower.start_private(&b, true, &mut o2);
@@ -1515,7 +1513,7 @@ mod tests {
     fn turn_ready_advertises_relay_to_all_peers() {
         let t0 = Instant::now();
         let b = account(20, "b");
-        let mut core = SessionCore::new(10, 7, CallKind::Channel, t0);
+        let mut core = SessionCore::new(10, CallKind::Channel, t0);
         core.set_local(&["127.0.0.1:44001".parse().unwrap()], &mut Vec::new());
         core.apply_roster(&[account(10, "a"), b], &mut Vec::new());
         let mut out = Vec::new();
@@ -1542,7 +1540,7 @@ mod tests {
     #[test]
     fn deferred_offer_accepted_when_roster_arrives() {
         let t0 = Instant::now();
-        let mut core = SessionCore::new(30, 7, CallKind::Channel, t0);
+        let mut core = SessionCore::new(30, CallKind::Channel, t0);
         core.set_local(&["127.0.0.1:45001".parse().unwrap()], &mut Vec::new());
         // An offer from 10 arrives before any roster.
         core.handle_signal(
@@ -1567,7 +1565,7 @@ mod tests {
         // so unmuted audio never plays stale content.
         let t0 = Instant::now();
         let peer = account(2, "b");
-        let mut core = SessionCore::new(1, 1, CallKind::Private, t0);
+        let mut core = SessionCore::new(1, CallKind::Private, t0);
         core.set_local(&["127.0.0.1:46001".parse().unwrap()], &mut Vec::new());
         core.start_private(&peer, false, &mut Vec::new());
         assert_eq!(core.peer_count(), 1);

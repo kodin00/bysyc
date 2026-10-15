@@ -27,6 +27,9 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 720.0])
+            // Floor for the three-column layout + composer: below this the
+            // side columns (each ≥ 140 px) starve the chat area.
+            .with_min_inner_size([640.0, 420.0])
             .with_title("bysyc"),
         ..Default::default()
     };
