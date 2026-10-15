@@ -1,13 +1,17 @@
-//! Channel message send/fetch — owned by S4.
+//! Channel message send/fetch/delete — owned by S4.
 //!
 //! Message `content` is base64 ciphertext and opaque to the Instance
 //! (ADR 0001): we validate only its encoded shape and size, store it
 //! verbatim, and fan it out. The sender receives the created
 //! [`MessageDto`] as the HTTP response; it is deliberately NOT echoed
 //! back over the gateway — only other subscribers of `chan:{id}` receive
-//! the published copy.
+//! the published copy. Deletion (`DELETE /channels/{id}/messages/{mid}`,
+//! senders may remove only their own) drops the row plus any attachment
+//! row/object owned by it, then fans a [`WsServerBody::MessageDeleted`]
+//! out to the same `chan:{id}` subscribers — the deleter included, since
+//! the `204` response carries no body.
 //!
-//! # Schema (S1's migration, landed)
+//! # Schema (S1's migration, landed; attachments.encrypted via migration 2)
 //!
 //! - `channels(id, guild_id NULL, kind 'text'|'voice', name)` — DM
 //!   channels are rows with `guild_id IS NULL` paired in `dm_channels`;
@@ -19,14 +23,17 @@
 //!   `EXTRACT(EPOCH ...)::bigint` conversions and written only by the
 //!   column's `now()` default
 //! - `attachments(id, uploader_id, name, size, nonce, s3_key,
-//!   message_id NULL)`
+//!   message_id NULL, encrypted)` — `encrypted` is FALSE only for
+//!   server-stored WebP images (see `attachments.rs`); every row that
+//!   predates the column reads as TRUE via its default
 
 use std::collections::HashMap;
 
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::routing::get;
+use axum::http::StatusCode;
+use axum::routing::{delete, get};
 use base64::Engine as _;
 use bysyc_common::protocol::{
     AttachmentMeta, ChannelKind, MessageDto, MessageKind, MessagePage, SendMessageRequest,
@@ -36,6 +43,7 @@ use sqlx::{PgPool, Row};
 
 use crate::db::AppState;
 use crate::error::{ApiError, ApiResult};
+use crate::s3;
 use crate::session::Authed;
 
 /// Maximum plaintext-ciphertext the Instance will carry: 64 KiB decoded
@@ -47,10 +55,15 @@ const MAX_CIPHERTEXT_BYTES: usize = 64 * 1024;
 const MAX_CIPHERTEXT_CHARS: usize = 90_000;
 
 pub fn router() -> axum::Router<AppState> {
-    axum::Router::new().route(
-        "/channels/{id}/messages",
-        get(page_messages).post(send_message),
-    )
+    axum::Router::new()
+        .route(
+            "/channels/{id}/messages",
+            get(page_messages).post(send_message),
+        )
+        .route(
+            "/channels/{id}/messages/{message_id}",
+            delete(delete_message),
+        )
 }
 
 /// Validate that `content` is base64 ciphertext of at most 64 KiB decoded
@@ -158,7 +171,7 @@ async fn send_message(
     let attachment_meta = match req.attachment_id {
         Some(att_id) => {
             let row = sqlx::query(
-                "SELECT id, name, size, nonce FROM attachments \
+                "SELECT id, name, size, nonce, encrypted FROM attachments \
                  WHERE id = $1 AND uploader_id = $2 AND message_id IS NULL",
             )
             .bind(att_id)
@@ -171,6 +184,7 @@ async fn send_message(
                     name: r.try_get("name")?,
                     size: r.try_get("size")?,
                     nonce: r.try_get("nonce")?,
+                    encrypted: r.try_get("encrypted")?,
                 }),
                 None => {
                     return Err(ApiError::invalid(
@@ -280,7 +294,8 @@ async fn page_messages(
     let rows = sqlx::query(
         "SELECT m.id, m.sender_id, m.kind, m.content, m.reply_to, \
                 (EXTRACT(EPOCH FROM m.created_at) * 1000)::bigint AS created_at_ms, \
-                a.id AS att_id, a.name AS att_name, a.size AS att_size, a.nonce AS att_nonce \
+                a.id AS att_id, a.name AS att_name, a.size AS att_size, \
+                a.nonce AS att_nonce, a.encrypted AS att_encrypted \
          FROM messages m \
          LEFT JOIN attachments a ON a.id = m.attachment_id \
          WHERE m.channel_id = $1 AND ($2::bigint IS NULL OR m.id < $2) \
@@ -304,6 +319,7 @@ async fn page_messages(
                 name: row.try_get("att_name")?,
                 size: row.try_get("att_size")?,
                 nonce: row.try_get("att_nonce")?,
+                encrypted: row.try_get("att_encrypted")?,
             }),
             None => None,
         };
@@ -322,6 +338,89 @@ async fn page_messages(
     messages.reverse();
 
     Ok(Json(MessagePage { messages, has_more }))
+}
+
+/// DELETE /channels/{id}/messages/{message_id} — remove one of the
+/// caller's own messages (chat or control alike; anyone else's yields
+/// [`ErrorCode::Forbidden`]). A message with an attached file takes its
+/// attachments row and — best-effort — the stored object with it. Every
+/// subscriber of the channel, the deleter included, is pushed
+/// [`WsServerBody::MessageDeleted`]; history paging stops returning the
+/// message immediately.
+async fn delete_message(
+    State(state): State<AppState>,
+    auth: Authed,
+    Path((channel_id, message_id)): Path<(i64, i64)>,
+) -> ApiResult<StatusCode> {
+    let me = auth.0;
+
+    let row = sqlx::query("SELECT sender_id FROM messages WHERE id = $1 AND channel_id = $2")
+        .bind(message_id)
+        .bind(channel_id)
+        .fetch_optional(&state.pg)
+        .await?;
+    match row {
+        Some(r) if r.try_get::<i64, _>("sender_id")? == me => {}
+        Some(_) => return Err(ApiError::forbidden("only the sender can delete a message")),
+        None => return Err(ApiError::not_found("no such message")),
+    }
+
+    // Grab the object key before deleting: `attachments.message_id` is
+    // ON DELETE SET NULL, so after the message row is gone the row can no
+    // longer be found by message_id.
+    let s3_key: Option<String> =
+        sqlx::query_scalar("SELECT s3_key FROM attachments WHERE message_id = $1")
+            .bind(message_id)
+            .fetch_optional(&state.pg)
+            .await?;
+
+    // Attachment row first, then the message: deleting the message first
+    // would null out `attachments.message_id` before the row is matched.
+    let mut tx = state.pg.begin().await?;
+    sqlx::query("DELETE FROM attachments WHERE message_id = $1")
+        .bind(message_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM messages WHERE id = $1")
+        .bind(message_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+
+    // The row is gone from the source of truth; object removal is
+    // best-effort (an orphaned object sits behind an unguessable key) and
+    // must not fail the already-committed delete.
+    if let Some(key) = s3_key.as_deref() {
+        if let Err(e) = s3::delete_object(&state, key).await {
+            tracing::warn!(
+                message_id,
+                key,
+                "message deleted but object removal failed: {}",
+                e.message
+            );
+        }
+    }
+
+    // Same best-effort fan-out contract as send; a client that misses the
+    // push reconciles on its next history page.
+    if let Err(e) = crate::events::publish_to_channel(
+        &state.redis,
+        channel_id,
+        &WsServerBody::MessageDeleted {
+            channel_id,
+            message_id,
+        },
+    )
+    .await
+    {
+        tracing::warn!(
+            channel_id,
+            message_id,
+            "message deleted but fan-out failed: {e}"
+        );
+    }
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[cfg(test)]

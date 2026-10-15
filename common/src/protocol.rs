@@ -50,6 +50,8 @@
 //! | `POST /friends/requests/{id}/decline` | decline an incoming Friend Request | — |
 //! | `DELETE /friends/{id}` | remove a Friend | — |
 //! | `GET /channels/{id}/messages?before=<id>&limit=50` | page channel history | [`MessagePage`] |
+//! | `DELETE /channels/{id}/messages/{message_id}` | delete one of the caller's own messages | — |
+//! | `POST /attachments/image` | upload a WebP image (server-stored, unencrypted) | raw WebP bytes → [`ImageUploadResponse`] |
 //! | `GET /attachments/{id}/download-url` | presigned download URL | [`DownloadUrlResponse`] |
 //! | `GET /ws?token=...&protocol=1` | WebSocket gateway | [`WsClientMsg`] / [`WsServerMsg`] |
 //!
@@ -400,20 +402,35 @@ pub struct OpenDmRequest {
 // Messages REST
 // ---------------------------------------------------------------------------
 
-/// Metadata about a client-side-encrypted attachment. Bytes are encrypted
-/// on the device (content-key derived from `nonce`); the server only ever
-/// sees ciphertext in object storage.
+/// Serde default for [`AttachmentMeta::encrypted`]: every attachment
+/// created before the flag existed is ciphertext, so a missing field means
+/// `true`.
+fn default_true() -> bool {
+    true
+}
+
+/// Metadata about an attachment. For encrypted attachments (everything but
+/// image uploads) the bytes are encrypted on the device (content-key derived
+/// from `nonce`); the server only ever sees ciphertext in object storage.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct AttachmentMeta {
     /// Attachment id.
     pub id: i64,
-    /// Original file name chosen by the sender.
+    /// Original file name chosen by the sender. For image attachments the
+    /// name is server-assigned (`img_...webp`) — original file names are
+    /// never revealed for those.
     pub name: String,
-    /// Ciphertext size in bytes.
+    /// Ciphertext size in bytes (the stored size, either way).
     pub size: i64,
     /// Base64 client-generated nonce from which the attachment's content
-    /// key is derived; needed to decrypt after download.
+    /// key is derived; needed to decrypt after download. Empty for
+    /// unencrypted image attachments (nothing to derive).
     pub nonce: String,
+    /// Whether the stored bytes are client-side ciphertext. `false` only
+    /// for server-stored WebP images (`POST /attachments/image`) — the one
+    /// attachment kind whose bytes the Instance has seen.
+    #[serde(default = "default_true")]
+    pub encrypted: bool,
 }
 
 /// Why a Message exists.
@@ -516,6 +533,16 @@ pub struct CreateAttachmentResponse {
     pub attachment: AttachmentMeta,
     /// Presigned `PUT` endpoint for the ciphertext bytes.
     pub upload_url: String,
+}
+
+/// Result of `POST /attachments/image`: the stored image attachment. There
+/// is no `upload_url` — unlike [`CreateAttachmentResponse`], the bytes were
+/// uploaded to the Instance itself, which validated them as WebP and stored
+/// them server-side (under a server-assigned name; `encrypted == false`).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ImageUploadResponse {
+    /// The stored image attachment.
+    pub attachment: AttachmentMeta,
 }
 
 /// Returned by `GET /attachments/{id}/download-url`: a short-lived
@@ -686,6 +713,16 @@ pub enum WsServerBody {
     },
     /// A new Message in a channel the Account can see (chat or control).
     Message(MessageDto),
+    /// A Message was deleted from a channel the Account can see. Clients
+    /// drop it from their local cache; history paging no longer returns it.
+    /// Unlike [`WsServerBody::Message`], the deleting sender receives this
+    /// too — the `DELETE` response is a bodyless `204`.
+    MessageDeleted {
+        /// Channel the Message was removed from.
+        channel_id: i64,
+        /// The deleted Message.
+        message_id: i64,
+    },
     /// A directed control item arrived while online; ack after decrypting
     /// and persisting.
     MailboxAppend(MailboxItem),
@@ -951,6 +988,13 @@ mod tests {
         });
         roundtrip(WsServerMsg {
             id: Some(3),
+            body: WsServerBody::MessageDeleted {
+                channel_id: 10,
+                message_id: 100,
+            },
+        });
+        roundtrip(WsServerMsg {
+            id: Some(3),
             body: WsServerBody::MailboxAppend(mailbox_item()),
         });
         roundtrip(WsServerMsg {
@@ -1173,12 +1217,36 @@ mod tests {
                 name: "cat.png".into(),
                 size: 4096,
                 nonce: "bm9uY2U=".into(),
+                encrypted: true,
             },
             upload_url: "https://s3/put-here".into(),
+        });
+        roundtrip(ImageUploadResponse {
+            attachment: AttachmentMeta {
+                id: 301,
+                name: "img_ab12cd34ef56.webp".into(),
+                size: 2048,
+                nonce: String::new(),
+                encrypted: false,
+            },
         });
         roundtrip(DownloadUrlResponse {
             url: "https://s3/get-here".into(),
             expires_at_ms: 1_700_000_360_000,
         });
+    }
+
+    #[test]
+    fn attachment_meta_without_encrypted_deserializes_as_encrypted() {
+        // JSON produced before the `encrypted` flag existed (every stored
+        // attachment was ciphertext) must keep deserializing, as `true`.
+        let legacy = serde_json::json!({
+            "id": 300,
+            "name": "cat.png",
+            "size": 4096,
+            "nonce": "bm9uY2U="
+        });
+        let meta: AttachmentMeta = serde_json::from_value(legacy).expect("legacy json parses");
+        assert!(meta.encrypted);
     }
 }

@@ -12,6 +12,7 @@
 
 use std::time::Duration;
 
+use axum::body::Bytes;
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::{Client, Config as S3Config};
@@ -97,6 +98,43 @@ pub async fn presign_put(state: &AppState, key: &str, expires: Duration) -> ApiR
 /// Presign an object `GET` (offline).
 pub async fn presign_get(state: &AppState, key: &str, expires: Duration) -> ApiResult<String> {
     sign(state, key, expires, false).await
+}
+
+/// PUT bytes to `key` in the attachment bucket, via the Instance itself.
+///
+/// Used only by the image path, where the server has deliberately seen the
+/// bytes (WebP-validated plaintext) — everything else uploads through
+/// presigned URLs and never transits the Instance. Failing this fails the
+/// caller's request: no row should point at an object that isn't there.
+pub async fn put_object(state: &AppState, key: &str, body: Bytes) -> ApiResult<()> {
+    ensure_bucket(state).await?;
+    client(&state.config)
+        .put_object()
+        .bucket(&state.config.s3_bucket)
+        .key(key)
+        .body(aws_sdk_s3::primitives::ByteStream::from(body))
+        .send()
+        .await
+        .map_err(|e| {
+            tracing::error!(key, "object upload failed: {e}");
+            ApiError::internal("could not store object")
+        })?;
+    Ok(())
+}
+
+/// DELETE the object at `key`. Best-effort by contract: this helper does
+/// not log — callers tolerate the failure (message deletion must not fail
+/// because a stray object survived) and log it themselves. An orphaned
+/// object behind an unguessable 128-bit key leaks nothing.
+pub async fn delete_object(state: &AppState, key: &str) -> ApiResult<()> {
+    client(&state.config)
+        .delete_object()
+        .bucket(&state.config.s3_bucket)
+        .key(key)
+        .send()
+        .await
+        .map_err(|e| ApiError::internal(format!("could not delete object: {e}")))?;
+    Ok(())
 }
 
 async fn sign(state: &AppState, key: &str, expires: Duration, put: bool) -> ApiResult<String> {

@@ -41,9 +41,18 @@ CREATE INDEX idx_mailbox_recipient ON mailbox(recipient_id);
 CREATE TABLE voice_participants(channel_id BIGINT NOT NULL REFERENCES channels(id) ON DELETE CASCADE, account_id BIGINT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, joined_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY(channel_id, account_id));
 "#;
 
+/// Migration 2: image attachments (`POST /attachments/image`). Those bytes
+/// are stored unencrypted — the Instance itself PUT them after validating
+/// the WebP magic — so `encrypted` distinguishes them from the ciphertext
+/// every earlier row holds. `DEFAULT TRUE` backfills existing rows for
+/// free; no data rewrite needed.
+const MIGRATION_2: &str = r#"
+ALTER TABLE attachments ADD COLUMN encrypted BOOLEAN NOT NULL DEFAULT TRUE;
+"#;
+
 /// Every migration in application order: `(version, sql)`. Append-only —
 /// never edit or reorder a shipped entry.
-const MIGRATIONS: &[(i64, &str)] = &[(1, MIGRATION_1)];
+const MIGRATIONS: &[(i64, &str)] = &[(1, MIGRATION_1), (2, MIGRATION_2)];
 
 /// S1: apply all embedded migrations in order, guarded by schema_migrations.
 ///
