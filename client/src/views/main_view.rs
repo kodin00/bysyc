@@ -6,7 +6,8 @@
 //!   participant count; joining is C5's), or the friends panel (accept /
 //!   decline requests, open DMs, add by username).
 //! - right: message history of the selected channel or DM plus the composer
-//!   (Enter sends, Shift+Enter breaks the line).
+//!   (Enter sends, Shift+Enter breaks the line; attached or dropped files
+//!   queue above it and ride the next send).
 //!
 //! History is loaded from SQLite first, then merged with a REST page on
 //! first open; sends are optimistic (negative temp ids, pinned at the tail)
@@ -15,6 +16,7 @@
 //! pruned after [`TYPING_TTL_SECS`].
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -87,6 +89,15 @@ pub struct MainView {
     /// parks here from its own thread — it cannot reach this view — and
     /// the UI thread folds them back into the composers each frame.
     pub unsent: Arc<Mutex<HashMap<i64, String>>>,
+    /// Files queued to ride a channel's next send (attach pick or OS
+    /// drop), per channel like [`MainView::composer`]. The send path in
+    /// `chat` drains them into the attachment upload pipeline; until then
+    /// they only render in the pending strip.
+    pub pending: HashMap<i64, Vec<attachments::PendingFile>>,
+    /// The attach button's picker thread hands chosen files (with the
+    /// channel the click happened in) to the UI thread here.
+    pub attach_tx: std::sync::mpsc::Sender<(i64, PathBuf)>,
+    pub attach_rx: std::sync::mpsc::Receiver<(i64, PathBuf)>,
     /// Focus the create-guild name field on the popup's next frame (set
     /// when the popup opens).
     pub guild_popup_focus: bool,
@@ -113,6 +124,7 @@ pub struct LoadAnchor {
 impl MainView {
     pub fn new() -> Self {
         let (image_tx, image_rx) = std::sync::mpsc::channel();
+        let (attach_tx, attach_rx) = std::sync::mpsc::channel();
         MainView {
             composer: HashMap::new(),
             last_typing_sent: HashMap::new(),
@@ -136,6 +148,9 @@ impl MainView {
             delete_confirm: None,
             notice_seen: None,
             unsent: Arc::new(Mutex::new(HashMap::new())),
+            pending: HashMap::new(),
+            attach_tx,
+            attach_rx,
             guild_popup_focus: false,
             channel_popup_focus: false,
         }
@@ -992,6 +1007,13 @@ fn chat(
         restore_draft(&mut mv.composer, fch, &text);
     }
 
+    // Attach-button picks cross back here from the picker thread; the
+    // channel is the one the click happened in (the dialog may outlive a
+    // channel switch), so this drains even with no channel selected.
+    while let Ok((fch, path)) = mv.attach_rx.try_recv() {
+        attachments::add_pending(mv, fch, path);
+    }
+
     // Status / notice banners.
     let (reconnecting, notice) = {
         let st = guard(state);
@@ -1067,6 +1089,10 @@ fn chat(
         m.unread.remove(&ch);
     }
 
+    // Files dropped onto the window (anywhere) queue with the viewed
+    // channel's composer — the same pending state the attach button feeds.
+    attachments::add_dropped(ui, mv, ch);
+
     // Channel-switch detection for the message list's scroll state (see
     // the ScrollArea below).
     let scroll_reset = mv.chat_channel_prev != Some(ch);
@@ -1109,8 +1135,9 @@ fn chat(
     // Composer strip, carved out as a bottom panel BEFORE the history
     // ScrollArea: a vertical ScrollArea claims all remaining height of its
     // parent, so widgets laid out after it were pushed off-screen (the
-    // invisible-composer bug). Typing indicator, reply banner, and upload
-    // progress strip live here too, directly above the input.
+    // invisible-composer bug). Typing indicator, reply banner, pending
+    // attachments, and upload progress strip live here too, directly above
+    // the input.
     egui::Panel::bottom("chat_composer")
         .resizable(false)
         .min_size(52.0)
@@ -1169,6 +1196,10 @@ fn chat(
                 }
             }
 
+            // Pending attachments (attach button / OS drop): queued with
+            // the next send, removable here.
+            attachments::pending_ui(ui, mv, ch);
+
             // Attachment upload progress strip (above the composer).
             attachments::uploads_ui(ui, state);
 
@@ -1226,7 +1257,7 @@ fn chat(
                     send = true;
                 }
                 if icon_button(ui, "bytes://attach.svg", ICON_ATTACH, "Attach file").clicked() {
-                    attachments::begin_attach(state, store, rt, ctx, mv, ch);
+                    attachments::begin_attach(ctx, mv, ch);
                 }
             });
             if send {
@@ -1237,6 +1268,11 @@ fn chat(
                 mv.composer.insert(ch, String::new());
                 if !text.is_empty() {
                     do_send(state, store, rt, ctx, mv, ch, text);
+                }
+                // Queued attachments ride the same send: each file enters
+                // the upload pipeline as its own encrypted message.
+                for file in mv.pending.remove(&ch).unwrap_or_default() {
+                    attachments::queue_upload(state, store, rt, ctx, mv, ch, file);
                 }
                 // A button click moves focus to the button — put it back
                 // so typing continues without a re-click.

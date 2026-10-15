@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <!-- bysyc: a gear whose rim and teeth are rusting away — a wink at Rust.
+       Flat design: base #B7410E, darker hub #8B3A1E, corrosion #C97B4A,
+       one verdigris hint #4E8577. Transparent background; plain paths only.
+       The upper-right bite (two teeth gone) is a jagged erosion edge with
+       crumbs breaking away. -->
+  <!-- gear body: six intact teeth + eroded rim, hub hole punched out -->
+  <path fill="#B7410E" fill-rule="evenodd" d="M 42.09 13.02 L 42.93 10.07 A 24.5 24.5 0 0 0 37.93 8.23 L 36.69 2.37 A 30.0 30.0 0 0 0 27.31 2.37 L 26.07 8.23 A 24.5 24.5 0 0 0 19.38 11.00 L 14.37 7.73 A 30.0 30.0 0 0 0 7.73 14.37 L 11.00 19.38 A 24.5 24.5 0 0 0 8.23 26.07 L 2.37 27.31 A 30.0 30.0 0 0 0 2.37 36.69 L 8.23 37.93 A 24.5 24.5 0 0 0 11.00 44.62 L 7.73 49.63 A 30.0 30.0 0 0 0 14.37 56.27 L 19.38 53.00 A 24.5 24.5 0 0 0 26.07 55.77 L 27.31 61.63 A 30.0 30.0 0 0 0 36.69 61.63 L 37.93 55.77 A 24.5 24.5 0 0 0 44.62 53.00 L 49.63 56.27 A 30.0 30.0 0 0 0 56.27 49.63 L 53.00 44.62 A 24.5 24.5 0 0 0 55.23 39.77 L 52.56 38.29 L 55.92 37.30 L 52.35 34.50 L 57.49 32.67 L 52.12 30.24 L 56.45 26.80 L 50.72 25.55 L 53.83 20.88 L 48.87 20.18 L 50.28 14.95 L 45.63 15.76 L 45.42 12.10 L 42.41 13.07 Z M 32.0 23.0 A 9 9 0 1 0 32.0 41.0 A 9 9 0 1 0 32.0 23.0 Z"/>
+  <!-- recessed hub ring -->
+  <path fill="#8B3A1E" fill-rule="evenodd" d="M 32.0 14.5 A 17.5 17.5 0 1 0 32.0 49.5 A 17.5 17.5 0 1 0 32.0 14.5 Z M 32.0 23.0 A 9 9 0 1 0 32.0 41.0 A 9 9 0 1 0 32.0 23.0 Z"/>
+  <!-- copper corrosion spots near the crack edges + one copper crumb -->
+  <path fill="#C97B4A" d="M 52.91 42.66 L 50.12 43.77 L 47.21 42.53 L 49.07 40.01 L 51.79 39.62 Z M 39.81 10.81 L 39.00 13.14 L 36.68 14.38 L 36.14 11.84 L 37.28 9.85 Z M 58.20 10.90 L 60.40 12.10 L 59.00 13.80 L 57.90 12.60 Z"/>
+  <!-- verdigris hint on the far rim -->
+  <path fill="#4E8577" d="M 24.31 52.50 L 21.85 51.67 L 20.59 49.24 L 23.23 48.64 L 25.31 49.86 Z"/>
+  <!-- crumbs breaking away across the eroded sector -->
+  <path fill="#B7410E" d="M 51.20 9.40 L 54.00 10.20 L 53.00 12.40 L 50.90 11.60 Z M 58.40 18.70 L 61.20 20.00 L 59.00 21.60 Z M 61.30 30.20 L 63.10 31.50 L 61.60 32.50 Z"/>
+</svg>

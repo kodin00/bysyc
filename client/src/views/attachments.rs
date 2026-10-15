@@ -11,8 +11,9 @@
 //! crypto, or network):
 //!
 //! - `rfd` native dialogs run on their own `std::thread` (they block).
-//! - `fs::read` + `encrypt_file` run on that same dialog thread (CPU-bound
-//!   file work off the UI thread; the dialog already parked it).
+//! - `fs::read` + `encrypt_file` run on a dedicated `std::thread` kicked
+//!   off by the composer's send flush (CPU-bound file work off the UI
+//!   thread).
 //! - Network + `spawn_blocking` decode/decrypt run on the tokio runtime.
 //! - Decoded images cross back to the UI thread through an `mpsc` channel
 //!   drained by [`drain_decoded`]; textures are created only on the UI
@@ -81,19 +82,94 @@ static CANCELLED_UPLOADS: LazyLock<Mutex<HashSet<u64>>> =
 // Send path
 // ---------------------------------------------------------------------------
 
-/// "+ attach": open a native file picker, then run the whole send pipeline.
+/// One file queued in the composer, waiting to ride the channel's next
+/// send (attach pick or OS drop). Nothing is read or sent until then.
+pub struct PendingFile {
+    pub path: PathBuf,
+    /// Display name, sanitized exactly as the send pipeline will send it.
+    pub name: String,
+}
+
+/// "+ attach": open a native file picker and queue the chosen file with
+/// this channel's composer — nothing sends until Enter / the send button
+/// flushes the pending strip (see the chat view's send path).
 ///
-/// The picker (and the file read + AES-GCM encrypt, which are both slow
-/// enough to matter for 48 MiB) run on a dedicated `std::thread`; the
-/// network half continues on the runtime. Progress is tracked in
-/// [`MainState::uploads`] keyed by a fresh [`UPLOAD_SEQ`] id.
-pub fn begin_attach(
+/// rfd's sync dialog parks its thread, so it is never the UI thread (it is
+/// a windowed app, which is the one context rfd allows dialogs from any
+/// thread). The channel is captured at click time: the dialog may outlive
+/// a channel switch.
+pub fn begin_attach(ctx: &egui::Context, mv: &MainView, ch: i64) {
+    let tx = mv.attach_tx.clone();
+    let ctx = ctx.clone();
+    std::thread::spawn(move || {
+        if let Some(path) = rfd::FileDialog::new().pick_file() {
+            let _ = tx.send((ch, path));
+        }
+        ctx.request_repaint();
+    });
+}
+
+/// Queue one file with a channel's composer (attach pick or OS drop).
+pub fn add_pending(mv: &mut MainView, ch: i64, path: PathBuf) {
+    let name = sanitize_filename(
+        &path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "file".into()),
+    );
+    mv.pending.entry(ch).or_default().push(PendingFile { path, name });
+}
+
+/// Files dropped onto the window this frame queue with the viewed
+/// channel's composer — the same pending state the attach button feeds.
+/// egui hands dropped files over for a single frame only, so this runs
+/// every frame; entries without a usable plain-file path (directories) are
+/// skipped. Nothing here sends.
+pub fn add_dropped(ui: &egui::Ui, mv: &mut MainView, ch: i64) {
+    for file in ui.input(|i| i.raw.dropped_files.clone()) {
+        let path = file.path().to_path_buf();
+        if path.is_file() {
+            add_pending(mv, ch, path);
+        }
+    }
+}
+
+/// The pending-attachment strip above the composer: one row per queued
+/// file, removable with "x", sent with the channel's next send.
+pub fn pending_ui(ui: &mut egui::Ui, mv: &mut MainView, ch: i64) {
+    let mut remove: Option<usize> = None;
+    let Some(files) = mv.pending.get(&ch) else {
+        return;
+    };
+    for (idx, f) in files.iter().enumerate() {
+        ui.horizontal(|ui| {
+            ui.weak(format!("📎 {}", f.name));
+            if ui.small_button("x").clicked() {
+                remove = Some(idx);
+            }
+        });
+    }
+    if let Some(idx) = remove
+        && let Some(files) = mv.pending.get_mut(&ch)
+    {
+        files.remove(idx);
+    }
+}
+
+/// Send one queued composer attachment: read + AES-GCM encrypt on a
+/// dedicated `std::thread` (both slow enough to matter for 48 MiB), then
+/// the network half continues on the runtime via [`upload_and_send`].
+/// Progress is tracked in [`MainState::uploads`] keyed by a fresh
+/// [`UPLOAD_SEQ`] id.
+#[allow(clippy::too_many_arguments)]
+pub fn queue_upload(
     state: &Arc<Mutex<ClientState>>,
     store: &Arc<Mutex<Store>>,
     rt: &tokio::runtime::Handle,
     ctx: &egui::Context,
     mv: &mut MainView,
     ch: i64,
+    file: PendingFile,
 ) {
     // Gather everything the background threads need while still on the UI
     // thread: account id, engine, session generation, temp row id.
@@ -118,8 +194,8 @@ pub fn begin_attach(
     if let Some(m) = guard(state).main_mut() {
         m.uploads.push(UploadStatus {
             id: upload_id,
-            name: "(picking…)".into(),
-            phase: UploadPhase::Picking,
+            name: file.name.clone(),
+            phase: UploadPhase::Encrypting,
         });
     }
 
@@ -128,37 +204,13 @@ pub fn begin_attach(
     let rt = rt.clone();
     let ctx = ctx.clone();
 
-    // rfd's sync dialog parks its thread: never the UI thread (it is a
-    // windowed app, which is the one context rfd allows dialogs from any
-    // thread).
     std::thread::spawn(move || {
-        let Some(path) = rfd::FileDialog::new().pick_file() else {
-            drop_upload(&state, upload_id);
-            ctx.request_repaint();
-            return;
-        };
         if !session_alive(&state, generation) {
             drop_upload(&state, upload_id);
             return;
         }
-        if upload_stopped(&state, upload_id, ch, temp) {
-            ctx.request_repaint();
-            return;
-        }
 
-        let name = sanitize_filename(
-            &path
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "file".into()),
-        );
-        set_upload(&state, upload_id, |u| {
-            u.name = name.clone();
-            u.phase = UploadPhase::Encrypting;
-        });
-        ctx.request_repaint();
-
-        let bytes = match std::fs::read(&path) {
+        let bytes = match std::fs::read(&file.path) {
             Ok(b) => b,
             Err(e) => {
                 fail_upload(&state, upload_id, format!("read: {e}"));
@@ -204,7 +256,7 @@ pub fn begin_attach(
             generation,
             upload_id,
             temp,
-            name,
+            name: file.name,
             size: bytes.len(),
             ciphertext,
             key_b64,
@@ -728,7 +780,6 @@ fn upload_rows(ui: &mut egui::Ui, state: &Arc<Mutex<ClientState>>) {
         }
         for u in &m.uploads {
             let line = match &u.phase {
-                UploadPhase::Picking => format!("{} — picking…", u.name),
                 UploadPhase::Encrypting => format!("{} — encrypting…", u.name),
                 UploadPhase::Uploading => format!("{} — uploading…", u.name),
                 UploadPhase::Sending => format!("{} — sending…", u.name),

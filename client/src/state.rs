@@ -85,8 +85,6 @@ pub enum Selection {
 /// Progress of one attachment upload, shown above the composer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UploadPhase {
-    /// Native file picker is open (worker thread).
-    Picking,
     /// Reading + AES-GCM encrypting the bytes (worker thread).
     Encrypting,
     /// `POST /attachments` + presigned `PUT` of the ciphertext.
@@ -104,7 +102,7 @@ pub enum UploadPhase {
 pub struct UploadStatus {
     /// Monotonic id; background tasks update their row by id.
     pub id: u64,
-    /// File name (filled in once picked).
+    /// File name.
     pub name: String,
     pub phase: UploadPhase,
 }
