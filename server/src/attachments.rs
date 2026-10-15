@@ -273,7 +273,10 @@ mod tests {
     #[test]
     fn webp_magic_rejects_truncated_garbage_and_non_webp_riff() {
         assert!(!is_webp(b""), "empty");
-        assert!(!is_webp(b"RIFF\x24\x00\x00\x00WEB"), "cut before the FourCC");
+        assert!(
+            !is_webp(b"RIFF\x24\x00\x00\x00WEB"),
+            "cut before the FourCC"
+        );
         assert!(!is_webp(b"RIFF\x24\x00\x00\x00"), "RIFF alone");
         // Other RIFF containers look similar but are not WebP.
         assert!(!is_webp(&riff(b"AVI ")), "RIFF/AVI");

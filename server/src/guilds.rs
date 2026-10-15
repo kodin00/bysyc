@@ -7,8 +7,9 @@
 //!   DB-side (`now() + interval`) so no clock skew creeps in.
 //! - `friends` / `dm_channels` pairs are stored normalized (`a < b`);
 //!   queries use LEAST/GREATEST.
-//! - WS events fan out through [`crate::events::publish_to_account`] after
-//!   the mutating transaction has committed.
+//! - WS events fan out once the mutation has landed; the guild member
+//!   fan-out batches [`crate::events::publish_to_account`]'s exact envelope
+//!   into a single Redis pipeline ([`publish_to_accounts`]).
 //!
 //! Semantics pinned for v1:
 //! - Channel create/delete and invite issuance are Owner-only; anyone else
@@ -24,13 +25,12 @@ use axum::{Json, Router};
 use bysyc_common::protocol::{
     AccountBrief, ChannelInfo, ChannelKind, CreateChannelRequest, CreateGuildInviteRequest,
     CreateGuildRequest, DmChannel, ErrorCode, GuildInfo, GuildInviteDto, JoinGuildRequest,
-    OpenDmRequest, WsServerBody,
+    OpenDmRequest, WsServerBody, WsServerMsg,
 };
 use rand::distr::{Alphanumeric, SampleString};
 
 use crate::db::AppState;
 use crate::error::{ApiError, ApiResult};
-use crate::events;
 use crate::session::Authed;
 
 pub fn router() -> Router<AppState> {
@@ -86,6 +86,37 @@ async fn is_online(state: &AppState, id: i64) -> ApiResult<bool> {
         .await?)
 }
 
+/// The exact envelope [`crate::events::publish_to_account`] puts on the
+/// wire: `WsServerMsg { id: None }` serialized to JSON.
+fn event_json(body: &WsServerBody) -> String {
+    serde_json::to_string(&WsServerMsg {
+        id: None,
+        body: body.clone(),
+    })
+    .expect("WsServerBody serializes")
+}
+
+/// Publish one directed event to many accounts in a single Redis round
+/// trip. Same topics and payload bytes the per-account helper produces;
+/// the body is serialized once.
+async fn publish_to_accounts(
+    redis: &redis::aio::ConnectionManager,
+    accounts: &[i64],
+    body: &WsServerBody,
+) -> ApiResult<()> {
+    if accounts.is_empty() {
+        return Ok(());
+    }
+    let json = event_json(body);
+    let mut pipe = redis::Pipeline::new();
+    for id in accounts {
+        pipe.publish(format!("acct:{id}"), json.as_str());
+    }
+    let mut conn = redis.clone();
+    pipe.query_async::<()>(&mut conn).await?;
+    Ok(())
+}
+
 /// The Guild's owner id, or `None` when the Guild does not exist.
 async fn guild_owner(pool: &sqlx::PgPool, guild_id: i64) -> ApiResult<Option<i64>> {
     Ok(
@@ -117,37 +148,39 @@ async fn member_ids(pool: &sqlx::PgPool, guild_id: i64) -> ApiResult<Vec<i64>> {
     )
 }
 
-async fn guild_channels(pool: &sqlx::PgPool, guild_id: i64) -> ApiResult<Vec<ChannelInfo>> {
-    let rows: Vec<(i64, String, String)> =
-        sqlx::query_as("SELECT id, kind, name FROM channels WHERE guild_id = $1 ORDER BY id")
-            .bind(guild_id)
-            .fetch_all(pool)
-            .await?;
-    rows.into_iter()
-        .map(|(id, kind, name)| {
-            Ok(ChannelInfo {
+/// Full GuildInfo snapshot (guild row + channels ordered by id) in one
+/// `guilds LEFT JOIN channels` query — the same shape list_guilds folds.
+async fn guild_info(pool: &sqlx::PgPool, guild_id: i64) -> ApiResult<GuildInfo> {
+    let rows: Vec<(String, i64, Option<i64>, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT g.name, g.owner_id, c.id, c.kind, c.name \
+         FROM guilds g LEFT JOIN channels c ON c.guild_id = g.id \
+         WHERE g.id = $1 ORDER BY c.id",
+    )
+    .bind(guild_id)
+    .fetch_all(pool)
+    .await?;
+    // A guild with no channels still yields one row of NULL channel
+    // columns; no rows at all means the guild does not exist.
+    let (name, owner_id) = match rows.first() {
+        Some((name, owner_id, ..)) => (name.clone(), *owner_id),
+        None => return Err(ApiError::not_found("no such guild")),
+    };
+    let mut channels = Vec::new();
+    for (_, _, id, kind, ch_name) in rows {
+        if let (Some(id), Some(kind), Some(ch_name)) = (id, kind, ch_name) {
+            channels.push(ChannelInfo {
                 id,
                 guild_id: Some(guild_id),
                 kind: parse_kind(&kind)?,
-                name,
-            })
-        })
-        .collect()
-}
-
-/// Full GuildInfo snapshot (guild row + channels ordered by id).
-async fn guild_info(pool: &sqlx::PgPool, guild_id: i64) -> ApiResult<GuildInfo> {
-    let (name, owner_id): (String, i64) =
-        sqlx::query_as("SELECT name, owner_id FROM guilds WHERE id = $1")
-            .bind(guild_id)
-            .fetch_optional(pool)
-            .await?
-            .ok_or_else(|| ApiError::not_found("no such guild"))?;
+                name: ch_name,
+            });
+        }
+    }
     Ok(GuildInfo {
         id: guild_id,
         name,
         owner_id,
-        channels: guild_channels(pool, guild_id).await?,
+        channels,
     })
 }
 
@@ -174,7 +207,7 @@ async fn create_guild(
         .await?;
     // Two default Channels. Names may repeat across kinds — `name` is not
     // unique. Serial order gives text the lower id, so id-sorted channels
-    // come out text-then-voice, matching guild_channels().
+    // come out text-then-voice, matching guild_info()/list_guilds().
     let (text_id,): (i64,) = sqlx::query_as(
         "INSERT INTO channels (guild_id, kind, name) VALUES ($1, 'text', 'general') RETURNING id",
     )
@@ -270,12 +303,22 @@ async fn join_guild(
     Authed(me): Authed,
     Json(req): Json<JoinGuildRequest>,
 ) -> ApiResult<Json<GuildInfo>> {
-    let guild_id: Option<i64> =
-        sqlx::query_scalar("SELECT guild_id FROM guild_invites WHERE code = $1")
-            .bind(&req.code)
-            .fetch_optional(&state.pg)
-            .await?;
-    let Some(guild_id) = guild_id else {
+    // One query resolves the invite's guild, whether we are already a
+    // member (idempotent rejoin), and our own brief columns for the
+    // MemberJoined fan-out below.
+    let lookup: Option<(i64, bool, String, Option<String>)> = sqlx::query_as(
+        "SELECT i.guild_id, \
+                EXISTS(SELECT 1 FROM guild_members m \
+                       WHERE m.guild_id = i.guild_id AND m.account_id = $2), \
+                a.username, a.identity_key \
+         FROM guild_invites i JOIN accounts a ON a.id = $2 \
+         WHERE i.code = $1",
+    )
+    .bind(&req.code)
+    .bind(me)
+    .fetch_optional(&state.pg)
+    .await?;
+    let Some((guild_id, already_member, username, identity_key)) = lookup else {
         return Err(ApiError::bad(
             ErrorCode::InvalidInvite,
             "unknown invite code",
@@ -284,85 +327,70 @@ async fn join_guild(
 
     // Idempotent: joining a Guild already joined just returns it (no use
     // consumed, no events).
-    let member: Option<i64> = sqlx::query_scalar(
-        "SELECT account_id FROM guild_members WHERE guild_id = $1 AND account_id = $2",
-    )
-    .bind(guild_id)
-    .bind(me)
-    .fetch_optional(&state.pg)
-    .await?;
-    if member.is_some() {
+    if already_member {
         return Ok(Json(guild_info(&state.pg, guild_id).await?));
     }
 
-    let mut tx = state.pg.begin().await?;
-    // Consume one use atomically; the WHERE clause re-validates expiry and
-    // the use limit so concurrent redemptions cannot overshoot max_uses.
-    let consumed = sqlx::query(
-        "UPDATE guild_invites SET uses = uses + 1 \
-         WHERE code = $1 AND (expires_at IS NULL OR expires_at > now()) \
-           AND (max_uses IS NULL OR uses < max_uses)",
+    // Consume one use, record the membership and list the members from
+    // before this join — one atomic statement, so the WHERE clause
+    // re-validates expiry and the use limit and concurrent redemptions
+    // cannot overshoot max_uses. An expired or used-up invite leaves
+    // `consume` (and with it the whole result set) empty.
+    // A concurrent join by the same account lands on the PK; treat as the
+    // same successful join rather than an error.
+    let rows: Vec<(i64, Option<i64>)> = sqlx::query_as(
+        "WITH consume AS ( \
+             UPDATE guild_invites SET uses = uses + 1 \
+             WHERE code = $1 AND (expires_at IS NULL OR expires_at > now()) \
+               AND (max_uses IS NULL OR uses < max_uses) \
+             RETURNING guild_id \
+         ), joined AS ( \
+             INSERT INTO guild_members (guild_id, account_id) \
+             SELECT guild_id, $2 FROM consume ON CONFLICT DO NOTHING \
+         ) \
+         SELECT c.guild_id, m.account_id \
+         FROM consume c LEFT JOIN guild_members m \
+              ON m.guild_id = c.guild_id AND m.account_id <> $2",
     )
     .bind(&req.code)
-    .execute(&mut *tx)
-    .await?
-    .rows_affected();
-    if consumed == 0 {
+    .bind(me)
+    .fetch_all(&state.pg)
+    .await?;
+    if rows.is_empty() {
         return Err(ApiError::bad(
             ErrorCode::InvalidInvite,
             "invite code expired or used up",
         ));
     }
-    // A concurrent join by the same account lands on the PK; treat as the
-    // same successful join rather than an error.
-    sqlx::query(
-        "INSERT INTO guild_members (guild_id, account_id) VALUES ($1, $2) \
-         ON CONFLICT DO NOTHING",
-    )
-    .bind(guild_id)
-    .bind(me)
-    .execute(&mut *tx)
-    .await?;
-    // Members from *before* this join get MemberJoined; I get GuildJoined.
-    let existing: Vec<i64> = sqlx::query_scalar(
-        "SELECT account_id FROM guild_members WHERE guild_id = $1 AND account_id <> $2",
-    )
-    .bind(guild_id)
-    .bind(me)
-    .fetch_all(&mut *tx)
-    .await?;
-    let my_row: BriefRow = sqlx::query_as(BRIEF_SQL)
-        .bind(me)
-        .fetch_one(&mut *tx)
-        .await?;
-    tx.commit().await?;
+    let existing: Vec<i64> = rows.iter().filter_map(|&(_, member)| member).collect();
 
+    // The snapshot and our presence probe are independent; run them
+    // concurrently.
+    let (guild, online) = tokio::join!(guild_info(&state.pg, guild_id), is_online(&state, me));
+    let guild = guild?;
     let my_brief = AccountBrief {
-        id: my_row.0,
-        username: my_row.1,
-        identity_key: my_row.2.unwrap_or_default(),
-        online: is_online(&state, me).await?,
+        id: me,
+        username,
+        identity_key: identity_key.unwrap_or_default(),
+        online: online?,
     };
-    for member in existing {
-        events::publish_to_account(
-            &state.redis,
-            member,
-            &WsServerBody::MemberJoined {
-                guild_id,
-                account: my_brief.clone(),
-            },
-        )
-        .await?;
+
+    // Members from *before* this join get MemberJoined; I get GuildJoined —
+    // one pipeline, one round trip.
+    let joined_json = event_json(&WsServerBody::GuildJoined {
+        guild: guild.clone(),
+    });
+    let member_json = event_json(&WsServerBody::MemberJoined {
+        guild_id,
+        account: my_brief,
+    });
+    let mut pipe = redis::Pipeline::new();
+    for member in &existing {
+        pipe.publish(format!("acct:{member}"), member_json.as_str());
     }
-    let guild = guild_info(&state.pg, guild_id).await?;
-    events::publish_to_account(
-        &state.redis,
-        me,
-        &WsServerBody::GuildJoined {
-            guild: guild.clone(),
-        },
-    )
-    .await?;
+    pipe.publish(format!("acct:{me}"), joined_json.as_str());
+    let mut conn = state.redis.clone();
+    pipe.query_async::<()>(&mut conn).await?;
     tracing::info!(guild_id, account_id = me, "guild joined");
     Ok(Json(guild))
 }
@@ -395,17 +423,15 @@ async fn leave_guild(
             .await?;
     tx.commit().await?;
 
-    for member in remaining {
-        events::publish_to_account(
-            &state.redis,
-            member,
-            &WsServerBody::MemberLeft {
-                guild_id,
-                account_id: me,
-            },
-        )
-        .await?;
-    }
+    publish_to_accounts(
+        &state.redis,
+        &remaining,
+        &WsServerBody::MemberLeft {
+            guild_id,
+            account_id: me,
+        },
+    )
+    .await?;
     tracing::info!(guild_id, account_id = me, "guild left");
     Ok(StatusCode::NO_CONTENT)
 }
@@ -441,17 +467,15 @@ async fn create_channel(
         kind: req.kind,
         name: req.name,
     };
-    for member in member_ids(&state.pg, guild_id).await? {
-        events::publish_to_account(
-            &state.redis,
-            member,
-            &WsServerBody::ChannelCreated {
-                guild_id,
-                channel: channel.clone(),
-            },
-        )
-        .await?;
-    }
+    publish_to_accounts(
+        &state.redis,
+        &member_ids(&state.pg, guild_id).await?,
+        &WsServerBody::ChannelCreated {
+            guild_id,
+            channel: channel.clone(),
+        },
+    )
+    .await?;
     tracing::info!(guild_id, channel_id, owner_id = me, "channel created");
     Ok(Json(channel))
 }
@@ -477,17 +501,15 @@ async fn delete_channel(
         .bind(channel_id)
         .execute(&state.pg)
         .await?;
-    for member in member_ids(&state.pg, guild_id).await? {
-        events::publish_to_account(
-            &state.redis,
-            member,
-            &WsServerBody::ChannelDeleted {
-                guild_id,
-                channel_id,
-            },
-        )
-        .await?;
-    }
+    publish_to_accounts(
+        &state.redis,
+        &member_ids(&state.pg, guild_id).await?,
+        &WsServerBody::ChannelDeleted {
+            guild_id,
+            channel_id,
+        },
+    )
+    .await?;
     tracing::info!(guild_id, channel_id, owner_id = me, "channel deleted");
     Ok(StatusCode::NO_CONTENT)
 }
@@ -639,7 +661,6 @@ async fn list_dms(
     let rows: Vec<DmListRow> = sqlx::query_as(
         "SELECT m.channel_id, p.id, p.username, p.identity_key \
          FROM dm_channels m \
-         JOIN channels c ON c.id = m.channel_id \
          JOIN accounts p ON p.id = CASE WHEN m.a = $1 THEN m.b ELSE m.a END \
          WHERE m.a = $1 OR m.b = $1 \
          ORDER BY m.channel_id DESC",

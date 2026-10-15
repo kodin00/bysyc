@@ -73,18 +73,20 @@ pub async fn create(
 pub async fn validate(redis: &redis::aio::ConnectionManager, token: &str) -> Result<i64, ApiError> {
     let key = format!("sess:{token}");
     let mut conn = redis.clone();
-    let account_id: Option<String> = redis::cmd("GET").arg(&key).query_async(&mut conn).await?;
+    // GETEX fetches and slides the TTL in one round trip; a missing key
+    // yields None without creating anything.
+    let account_id: Option<String> = redis::cmd("GETEX")
+        .arg(&key)
+        .arg("EX")
+        .arg(SESSION_TTL_SECS)
+        .query_async(&mut conn)
+        .await?;
     let Some(account_id) = account_id else {
         return Err(ApiError::unauthorized("invalid or expired session token"));
     };
     let account_id: i64 = account_id
         .parse()
         .map_err(|_| ApiError::internal("corrupt session record"))?;
-    redis::cmd("EXPIRE")
-        .arg(&key)
-        .arg(SESSION_TTL_SECS)
-        .query_async::<()>(&mut conn)
-        .await?;
     Ok(account_id)
 }
 

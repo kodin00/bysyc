@@ -12,10 +12,10 @@
 
 use std::time::Duration;
 
-use axum::body::Bytes;
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::{Client, Config as S3Config};
+use axum::body::Bytes;
 
 use crate::config::Config;
 use crate::db::AppState;
@@ -33,6 +33,11 @@ static BUCKET_READY: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_ne
 /// Build a path-style S3 client against the configured SeaweedFS endpoint.
 /// `BehaviorVersion::latest()` is set explicitly because we build the SDK
 /// config by hand (no aws-config defaults) — the SDK panics without it.
+///
+/// Called exactly once at boot; the client then lives in
+/// [`AppState::s`](crate::db::AppState::s) so every request reuses its
+/// connection pool. Never construct one per call — that dials fresh TCP per
+/// request.
 pub fn client(config: &Config) -> Client {
     let s3 = S3Config::builder()
         .behavior_version(BehaviorVersion::latest())
@@ -58,12 +63,7 @@ pub async fn ensure_bucket(state: &AppState) -> ApiResult<()> {
     BUCKET_READY
         .get_or_try_init(|| async {
             let bucket = &state.config.s3_bucket;
-            match client(&state.config)
-                .create_bucket()
-                .bucket(bucket)
-                .send()
-                .await
-            {
+            match state.s3.create_bucket().bucket(bucket).send().await {
                 Ok(_) => {
                     tracing::info!(bucket, "created S3 bucket");
                     Ok(())
@@ -92,12 +92,12 @@ pub async fn ensure_bucket(state: &AppState) -> ApiResult<()> {
 /// Presign an object `PUT` (offline; the URL authorizes the client's raw
 /// body upload — Content-Type is deliberately not part of the signature).
 pub async fn presign_put(state: &AppState, key: &str, expires: Duration) -> ApiResult<String> {
-    sign(state, key, expires, true).await
+    sign(&state.s3, &state.config.s3_bucket, key, expires, true).await
 }
 
 /// Presign an object `GET` (offline).
 pub async fn presign_get(state: &AppState, key: &str, expires: Duration) -> ApiResult<String> {
-    sign(state, key, expires, false).await
+    sign(&state.s3, &state.config.s3_bucket, key, expires, false).await
 }
 
 /// PUT bytes to `key` in the attachment bucket, via the Instance itself.
@@ -108,7 +108,8 @@ pub async fn presign_get(state: &AppState, key: &str, expires: Duration) -> ApiR
 /// caller's request: no row should point at an object that isn't there.
 pub async fn put_object(state: &AppState, key: &str, body: Bytes) -> ApiResult<()> {
     ensure_bucket(state).await?;
-    client(&state.config)
+    state
+        .s3
         .put_object()
         .bucket(&state.config.s3_bucket)
         .key(key)
@@ -127,7 +128,8 @@ pub async fn put_object(state: &AppState, key: &str, body: Bytes) -> ApiResult<(
 /// because a stray object survived) and log it themselves. An orphaned
 /// object behind an unguessable 128-bit key leaks nothing.
 pub async fn delete_object(state: &AppState, key: &str) -> ApiResult<()> {
-    client(&state.config)
+    state
+        .s3
         .delete_object()
         .bucket(&state.config.s3_bucket)
         .key(key)
@@ -137,16 +139,21 @@ pub async fn delete_object(state: &AppState, key: &str) -> ApiResult<()> {
     Ok(())
 }
 
-async fn sign(state: &AppState, key: &str, expires: Duration, put: bool) -> ApiResult<String> {
+async fn sign(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    expires: Duration,
+    put: bool,
+) -> ApiResult<String> {
     let config = PresigningConfig::expires_in(expires)
         .map_err(|e| ApiError::internal(format!("invalid presign expiry: {e}")))?;
-    let client = client(&state.config);
     // The two builders carry distinct error types; map each to ApiError so
     // the branches agree on `PresignedRequest`.
     let presigned = if put {
         client
             .put_object()
-            .bucket(&state.config.s3_bucket)
+            .bucket(bucket)
             .key(key)
             .presigned(config)
             .await
@@ -154,7 +161,7 @@ async fn sign(state: &AppState, key: &str, expires: Duration, put: bool) -> ApiR
     } else {
         client
             .get_object()
-            .bucket(&state.config.s3_bucket)
+            .bucket(bucket)
             .key(key)
             .presigned(config)
             .await

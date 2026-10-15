@@ -39,7 +39,7 @@ use bysyc_common::protocol::{
     AttachmentMeta, ChannelKind, MessageDto, MessageKind, MessagePage, SendMessageRequest,
     WsServerBody,
 };
-use sqlx::{PgPool, Row};
+use sqlx::{AssertSqlSafe, PgPool, Row};
 
 use crate::db::AppState;
 use crate::error::{ApiError, ApiResult};
@@ -86,23 +86,27 @@ pub(crate) fn check_ciphertext(content: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// Channel-membership predicate shared by [`can_read`] and the send path's
+/// check and write queries: account `$2` may act on channel `$1` when it is
+/// a member of the owning guild or a participant in the DM. Nonexistent
+/// channels read false. Queries embedding it are wrapped in
+/// [`AssertSqlSafe`]: the interpolation is this compile-time constant, so
+/// nothing user-controlled ever reaches the SQL text.
+const MEMBER_OF: &str = "EXISTS (SELECT 1 FROM channels c \
+     LEFT JOIN dm_channels dc ON dc.channel_id = c.id \
+     WHERE c.id = $1 \
+       AND (EXISTS (SELECT 1 FROM guild_members gm \
+                    WHERE gm.guild_id = c.guild_id AND gm.account_id = $2) \
+            OR dc.a = $2 OR dc.b = $2))";
+
 /// Whether `me` can read `channel_id`: member of the owning guild, or a
 /// participant in the DM. Nonexistent channels read as false.
 pub(crate) async fn can_read(pg: &PgPool, me: i64, channel_id: i64) -> sqlx::Result<bool> {
-    let ok = sqlx::query_scalar::<_, i64>(
-        "SELECT 1::bigint \
-         FROM channels c \
-         LEFT JOIN dm_channels dc ON dc.channel_id = c.id \
-         WHERE c.id = $1 \
-           AND (EXISTS (SELECT 1 FROM guild_members gm \
-                        WHERE gm.guild_id = c.guild_id AND gm.account_id = $2) \
-                OR dc.a = $2 OR dc.b = $2)",
-    )
-    .bind(channel_id)
-    .bind(me)
-    .fetch_optional(pg)
-    .await?;
-    Ok(ok.is_some())
+    sqlx::query_scalar::<_, bool>(AssertSqlSafe(format!("SELECT {MEMBER_OF}")))
+        .bind(channel_id)
+        .bind(me)
+        .fetch_one(pg)
+        .await
 }
 
 /// `MessageKind` <-> its `messages.kind` column spelling.
@@ -144,48 +148,106 @@ async fn send_message(
         .map_err(|e| ApiError::invalid(format!("malformed request body: {e}")))?;
     check_ciphertext(&req.content)?;
 
-    if !can_read(&state.pg, me, channel_id).await? {
+    // Both preconditions in one round trip: channel membership, and — only
+    // when the request is a reply — that the target lives in this channel.
+    let checks = sqlx::query(AssertSqlSafe(format!(
+        "SELECT {MEMBER_OF} AS member, \
+         ($3::bigint IS NULL \
+          OR EXISTS (SELECT 1 FROM messages WHERE id = $3 AND channel_id = $1)) AS reply_ok"
+    )))
+    .bind(channel_id)
+    .bind(me)
+    .bind(req.reply_to)
+    .fetch_one(&state.pg)
+    .await?;
+    if !checks.try_get::<bool, _>("member")? {
         return Err(ApiError::forbidden("not a member of this channel"));
     }
-
-    if let Some(reply_to) = req.reply_to {
-        let target = sqlx::query_scalar::<_, i64>(
-            "SELECT 1::bigint FROM messages WHERE id = $1 AND channel_id = $2",
-        )
-        .bind(reply_to)
-        .bind(channel_id)
-        .fetch_optional(&state.pg)
-        .await?;
-        if target.is_none() {
-            return Err(ApiError::invalid(
-                "reply_to does not reference a message in this channel",
-            ));
-        }
+    if !checks.try_get::<bool, _>("reply_ok")? {
+        return Err(ApiError::invalid(
+            "reply_to does not reference a message in this channel",
+        ));
     }
 
-    // Attachment claim + insert run in one transaction: the UPDATE's
-    // `message_id IS NULL` guard makes the claim atomic even without the
-    // pre-SELECT (two concurrent sends cannot both win).
-    let mut tx = state.pg.begin().await?;
-
-    let attachment_meta = match req.attachment_id {
-        Some(att_id) => {
-            let row = sqlx::query(
-                "SELECT id, name, size, nonce, encrypted FROM attachments \
-                 WHERE id = $1 AND uploader_id = $2 AND message_id IS NULL",
-            )
-            .bind(att_id)
+    // One write round trip on either path; no explicit transaction, since
+    // every precondition the old BEGIN..COMMIT guarded now rides inside
+    // the statement itself.
+    let (message_id, created_at_ms, attachment_meta) = match req.attachment_id {
+        None => {
+            // Membership is re-asserted in the WHERE, so a revocation
+            // racing the check above cannot slip a row in: zero returned
+            // rows means exactly that.
+            let row = sqlx::query(AssertSqlSafe(format!(
+                "INSERT INTO messages \
+                     (channel_id, sender_id, kind, content, reply_to, attachment_id) \
+                 SELECT $1, $2, $3, $4, $5, NULL \
+                 WHERE {MEMBER_OF} \
+                 RETURNING id, (EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_at_ms"
+            )))
+            .bind(channel_id)
             .bind(me)
-            .fetch_optional(&mut *tx)
+            .bind(message_kind_str(req.kind.clone()))
+            .bind(&req.content)
+            .bind(req.reply_to)
+            .fetch_optional(&state.pg)
             .await?;
             match row {
-                Some(r) => Some(AttachmentMeta {
-                    id: r.try_get("id")?,
-                    name: r.try_get("name")?,
-                    size: r.try_get("size")?,
-                    nonce: r.try_get("nonce")?,
-                    encrypted: r.try_get("encrypted")?,
-                }),
+                Some(r) => (r.try_get("id")?, r.try_get("created_at_ms")?, None),
+                None => {
+                    return Err(ApiError::forbidden("not a member of this channel"));
+                }
+            }
+        }
+        Some(att_id) => {
+            // Claim + insert as one statement: `locked` takes the
+            // attachment row lock under the uploader/unclaimed guard, so a
+            // concurrent send loses the lock race, locks nothing, inserts
+            // nothing — the atomicity the old explicit transaction bought,
+            // with none of its round trips. `ins` runs before `claim`
+            // because the latter reads the former's RETURNING output, which
+            // also satisfies the attachments.message_id foreign key.
+            let row = sqlx::query(
+                "WITH locked AS ( \
+                     SELECT id FROM attachments \
+                     WHERE id = $6 AND uploader_id = $2 AND message_id IS NULL \
+                     FOR UPDATE \
+                 ), ins AS ( \
+                     INSERT INTO messages \
+                         (channel_id, sender_id, kind, content, reply_to, attachment_id) \
+                     SELECT $1, $2, $3, $4, $5, l.id FROM locked l \
+                     RETURNING id, attachment_id, \
+                             (EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_at_ms \
+                 ), claim AS ( \
+                     UPDATE attachments a SET message_id = i.id \
+                     FROM ins i \
+                     WHERE a.id = i.attachment_id \
+                     RETURNING a.id, a.name, a.size, a.nonce, a.encrypted \
+                 ) \
+                 SELECT i.id, i.created_at_ms, \
+                        c.id AS att_id, c.name AS att_name, c.size AS att_size, \
+                        c.nonce AS att_nonce, c.encrypted AS att_encrypted \
+                 FROM ins i CROSS JOIN claim c",
+            )
+            .bind(channel_id)
+            .bind(me)
+            .bind(message_kind_str(req.kind.clone()))
+            .bind(&req.content)
+            .bind(req.reply_to)
+            .bind(att_id)
+            .fetch_optional(&state.pg)
+            .await?;
+            match row {
+                Some(r) => (
+                    r.try_get("id")?,
+                    r.try_get("created_at_ms")?,
+                    Some(AttachmentMeta {
+                        id: r.try_get("att_id")?,
+                        name: r.try_get("att_name")?,
+                        size: r.try_get("att_size")?,
+                        nonce: r.try_get("att_nonce")?,
+                        encrypted: r.try_get("att_encrypted")?,
+                    }),
+                ),
                 None => {
                     return Err(ApiError::invalid(
                         "attachment not found, not uploaded by you, or already attached",
@@ -193,43 +255,7 @@ async fn send_message(
                 }
             }
         }
-        None => None,
     };
-
-    let row = sqlx::query(
-        "INSERT INTO messages \
-             (channel_id, sender_id, kind, content, reply_to, attachment_id) \
-         VALUES ($1, $2, $3, $4, $5, $6) \
-         RETURNING id, (EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_at_ms",
-    )
-    .bind(channel_id)
-    .bind(me)
-    .bind(message_kind_str(req.kind.clone()))
-    .bind(&req.content)
-    .bind(req.reply_to)
-    .bind(req.attachment_id)
-    .fetch_one(&mut *tx)
-    .await?;
-    let message_id: i64 = row.try_get("id")?;
-    let created_at_ms: i64 = row.try_get("created_at_ms")?;
-
-    if let (Some(att_id), Some(_)) = (req.attachment_id, attachment_meta.as_ref()) {
-        let claimed = sqlx::query(
-            "UPDATE attachments SET message_id = $1 \
-             WHERE id = $2 AND uploader_id = $3 AND message_id IS NULL",
-        )
-        .bind(message_id)
-        .bind(att_id)
-        .bind(me)
-        .execute(&mut *tx)
-        .await?;
-        if claimed.rows_affected() == 0 {
-            // Concurrently claimed by another message; roll back our insert.
-            return Err(ApiError::invalid("attachment was already attached"));
-        }
-    }
-
-    tx.commit().await?;
 
     let dto = MessageDto {
         id: message_id,
@@ -347,6 +373,11 @@ async fn page_messages(
 /// subscriber of the channel, the deleter included, is pushed
 /// [`WsServerBody::MessageDeleted`]; history paging stops returning the
 /// message immediately.
+///
+/// One round trip: authorization rides inside the DELETE predicate itself
+/// (no check-then-delete window), and the attachment row leaves in the
+/// same implicit transaction before the message's ON DELETE SET NULL can
+/// sever the link.
 async fn delete_message(
     State(state): State<AppState>,
     auth: Authed,
@@ -354,38 +385,39 @@ async fn delete_message(
 ) -> ApiResult<StatusCode> {
     let me = auth.0;
 
-    let row = sqlx::query("SELECT sender_id FROM messages WHERE id = $1 AND channel_id = $2")
-        .bind(message_id)
-        .bind(channel_id)
-        .fetch_optional(&state.pg)
-        .await?;
-    match row {
-        Some(r) if r.try_get::<i64, _>("sender_id")? == me => {}
-        Some(_) => return Err(ApiError::forbidden("only the sender can delete a message")),
-        None => return Err(ApiError::not_found("no such message")),
+    // `del` deletes only the caller's own message in this channel; `att`
+    // drops the attachment row(s) it owned and returns the object key(s).
+    // The main query reads the pre-statement snapshot, so `existed` still
+    // sees a row `del` declined to delete — that splits a zero-row delete
+    // into forbidden (someone else's) vs. not-found, exactly the split the
+    // old pre-SELECT made.
+    let row = sqlx::query(
+        "WITH del AS ( \
+             DELETE FROM messages \
+             WHERE id = $1 AND channel_id = $2 AND sender_id = $3 \
+             RETURNING id \
+         ), att AS ( \
+             DELETE FROM attachments WHERE message_id IN (SELECT id FROM del) \
+             RETURNING s3_key \
+         ) \
+         SELECT (SELECT s3_key FROM att LIMIT 1) AS s3_key, \
+                EXISTS (SELECT 1 FROM del) AS deleted, \
+                EXISTS (SELECT 1 FROM messages WHERE id = $1 AND channel_id = $2) AS existed",
+    )
+    .bind(message_id)
+    .bind(channel_id)
+    .bind(me)
+    .fetch_one(&state.pg)
+    .await?;
+
+    if !row.try_get::<bool, _>("deleted")? {
+        return Err(if row.try_get::<bool, _>("existed")? {
+            ApiError::forbidden("only the sender can delete a message")
+        } else {
+            ApiError::not_found("no such message")
+        });
     }
-
-    // Grab the object key before deleting: `attachments.message_id` is
-    // ON DELETE SET NULL, so after the message row is gone the row can no
-    // longer be found by message_id.
-    let s3_key: Option<String> =
-        sqlx::query_scalar("SELECT s3_key FROM attachments WHERE message_id = $1")
-            .bind(message_id)
-            .fetch_optional(&state.pg)
-            .await?;
-
-    // Attachment row first, then the message: deleting the message first
-    // would null out `attachments.message_id` before the row is matched.
-    let mut tx = state.pg.begin().await?;
-    sqlx::query("DELETE FROM attachments WHERE message_id = $1")
-        .bind(message_id)
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("DELETE FROM messages WHERE id = $1")
-        .bind(message_id)
-        .execute(&mut *tx)
-        .await?;
-    tx.commit().await?;
+    let s3_key: Option<String> = row.try_get("s3_key")?;
 
     // The row is gone from the source of truth; object removal is
     // best-effort (an orphaned object sits behind an unguessable key) and

@@ -54,8 +54,11 @@ async fn register(
     }
 
     // Hash before opening the transaction: argon2 is slow and must not hold
-    // the invite/username locks below.
-    let password_hash = passwd::hash_password(&req.password);
+    // the invite/username locks below. It's also CPU-bound (~19 MiB, tens of
+    // ms), so it runs on the blocking pool instead of an async worker.
+    let password_hash = tokio::task::spawn_blocking(move || passwd::hash_password(&req.password))
+        .await
+        .map_err(|_| ApiError::internal("password hash worker panicked"))?;
 
     let mut tx = state.pg.begin().await?;
 
@@ -144,7 +147,12 @@ async fn login(
         tracing::info!(username = %req.username, "login failed: unknown account");
         return Err(ApiError::unauthorized("invalid credentials"));
     };
-    if !passwd::verify_password(&req.password, &password_hash) {
+    // Same blocking-pool treatment as register: argon2 is CPU-bound.
+    let verified =
+        tokio::task::spawn_blocking(move || passwd::verify_password(&req.password, &password_hash))
+            .await
+            .map_err(|_| ApiError::internal("password verify worker panicked"))?;
+    if !verified {
         tracing::info!(account_id = id, "login failed: wrong password");
         return Err(ApiError::unauthorized("invalid credentials"));
     }

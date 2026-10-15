@@ -10,12 +10,29 @@ use rand::distr::{Alphanumeric, SampleString};
 pub struct AppState {
     pub pg: sqlx::PgPool,
     pub redis: redis::aio::ConnectionManager,
+    /// Second manager on its own connection, dedicated to event publishes —
+    /// a clone of [`Self::redis`] would share one pipe, so publishes could
+    /// queue behind session/presence traffic. Publish call sites migrate to
+    /// this field incrementally.
+    pub redis_events: redis::aio::ConnectionManager,
+    /// S3 client built once at boot. `aws_sdk_s3::Client` wraps its
+    /// connection pool in Arcs, so the clone in `AppState` reuses the same
+    /// TCP pool instead of dialing per request.
+    pub s3: aws_sdk_s3::Client,
     pub config: Config,
 }
 
-pub async fn connect_pool(database_url: &str) -> Result<sqlx::PgPool, sqlx::Error> {
+pub async fn connect_pool(
+    database_url: &str,
+    max_connections: u32,
+) -> Result<sqlx::PgPool, sqlx::Error> {
     sqlx::postgres::PgPoolOptions::new()
-        .max_connections(16)
+        .max_connections(max_connections)
+        // A couple of warm connections so a quiet period doesn't force a
+        // fresh dial+auth on the next burst.
+        .min_connections(2)
+        .acquire_timeout(std::time::Duration::from_secs(5))
+        .max_lifetime(std::time::Duration::from_secs(30 * 60))
         .connect(database_url)
         .await
 }
@@ -50,9 +67,27 @@ const MIGRATION_2: &str = r#"
 ALTER TABLE attachments ADD COLUMN encrypted BOOLEAN NOT NULL DEFAULT TRUE;
 "#;
 
+/// Migration 3: secondary indexes for the hot lookups the existing keys
+/// don't cover. Each column below is the non-leading column of its table's
+/// (composite) primary/unique key, so queries filtering on it alone —
+/// "which guilds is this account in", "list channel X's attachments'
+/// messages", "show my pending friend requests", "which voice rooms am I
+/// in", "find the attachments a deleted message claimed" — planned a full
+/// scan. `IF NOT EXISTS` keeps each statement safe to re-run outside the
+/// schema_migrations guard.
+const MIGRATION_3: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_guild_members_account ON guild_members(account_id);
+CREATE INDEX IF NOT EXISTS idx_channels_guild ON channels(guild_id);
+CREATE INDEX IF NOT EXISTS idx_friends_b ON friends(b);
+CREATE INDEX IF NOT EXISTS idx_dm_channels_b ON dm_channels(b);
+CREATE INDEX IF NOT EXISTS idx_friend_requests_to ON friend_requests(to_id);
+CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_id);
+CREATE INDEX IF NOT EXISTS idx_voice_participants_account ON voice_participants(account_id);
+"#;
+
 /// Every migration in application order: `(version, sql)`. Append-only —
 /// never edit or reorder a shipped entry.
-const MIGRATIONS: &[(i64, &str)] = &[(1, MIGRATION_1), (2, MIGRATION_2)];
+const MIGRATIONS: &[(i64, &str)] = &[(1, MIGRATION_1), (2, MIGRATION_2), (3, MIGRATION_3)];
 
 /// S1: apply all embedded migrations in order, guarded by schema_migrations.
 ///

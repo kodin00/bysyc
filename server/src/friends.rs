@@ -7,6 +7,7 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use bysyc_common::protocol::{AccountBrief, FriendList, WsServerBody};
 use serde::Deserialize;
+use std::collections::HashMap;
 
 use crate::db::AppState;
 use crate::error::{ApiError, ApiResult};
@@ -70,32 +71,63 @@ async fn brief(state: &AppState, id: i64) -> Result<AccountBrief, ApiError> {
 }
 
 async fn friend_list(state: &AppState, me: i64) -> Result<FriendList, ApiError> {
-    let friends: Vec<BriefRow> = sqlx::query_as(
-        "SELECT b.id, b.username, b.identity_key FROM friends f \
-         JOIN accounts b ON b.id = CASE WHEN f.a = $1 THEN f.b ELSE f.a END \
-         WHERE f.a = $1 OR f.b = $1",
-    )
-    .bind(me)
-    .fetch_all(&state.pg)
-    .await?;
-    let incoming: Vec<BriefRow> = sqlx::query_as(
-        "SELECT a.id, a.username, a.identity_key FROM friend_requests r \
-         JOIN accounts a ON a.id = r.from_id WHERE r.to_id = $1",
-    )
-    .bind(me)
-    .fetch_all(&state.pg)
-    .await?;
-    let outgoing: Vec<BriefRow> = sqlx::query_as(
-        "SELECT a.id, a.username, a.identity_key FROM friend_requests r \
-         JOIN accounts a ON a.id = r.to_id WHERE r.from_id = $1",
-    )
-    .bind(me)
-    .fetch_all(&state.pg)
-    .await?;
+    let (friends, incoming, outgoing) = tokio::join!(
+        sqlx::query_as::<_, BriefRow>(
+            "SELECT b.id, b.username, b.identity_key FROM friends f \
+             JOIN accounts b ON b.id = CASE WHEN f.a = $1 THEN f.b ELSE f.a END \
+             WHERE f.a = $1 OR f.b = $1",
+        )
+        .bind(me)
+        .fetch_all(&state.pg),
+        sqlx::query_as::<_, BriefRow>(
+            "SELECT a.id, a.username, a.identity_key FROM friend_requests r \
+             JOIN accounts a ON a.id = r.from_id WHERE r.to_id = $1",
+        )
+        .bind(me)
+        .fetch_all(&state.pg),
+        sqlx::query_as::<_, BriefRow>(
+            "SELECT a.id, a.username, a.identity_key FROM friend_requests r \
+             JOIN accounts a ON a.id = r.to_id WHERE r.from_id = $1",
+        )
+        .bind(me)
+        .fetch_all(&state.pg),
+    );
+    let (friends, incoming, outgoing) = (friends?, incoming?, outgoing?);
+
+    // One merged presence pipeline for all three lists; an account can
+    // appear in more than one list, so map results back by account id.
+    let mut ids: Vec<i64> = friends
+        .iter()
+        .chain(&incoming)
+        .chain(&outgoing)
+        .map(|(id, _, _)| *id)
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let mut online_by_id: HashMap<i64, bool> = HashMap::new();
+    if !ids.is_empty() {
+        let mut pipe = redis::Pipeline::new();
+        for id in &ids {
+            pipe.cmd("EXISTS").arg(format!("presence:{id}"));
+        }
+        let mut conn = state.redis.clone();
+        let online: Vec<bool> = pipe.query_async(&mut conn).await?;
+        online_by_id = ids.into_iter().zip(online).collect();
+    }
+    let attach = |rows: Vec<BriefRow>| -> Vec<AccountBrief> {
+        rows.into_iter()
+            .map(|(id, username, identity_key)| AccountBrief {
+                id,
+                username,
+                identity_key: identity_key.unwrap_or_default(),
+                online: online_by_id.get(&id).copied().unwrap_or(false),
+            })
+            .collect()
+    };
     Ok(FriendList {
-        friends: with_online(state, friends).await?,
-        incoming: with_online(state, incoming).await?,
-        outgoing: with_online(state, outgoing).await?,
+        friends: attach(friends),
+        incoming: attach(incoming),
+        outgoing: attach(outgoing),
     })
 }
 
@@ -178,23 +210,31 @@ async fn send_request(
         .await?;
         tx.commit().await?;
 
-        let my_brief = brief(&state, me).await?;
-        let peer_brief = with_online(&state, vec![peer_row])
-            .await?
-            .pop()
-            .expect("one brief");
-        events::publish_to_account(
-            &state.redis,
-            peer,
-            &WsServerBody::FriendRequestAccepted { by: my_brief },
-        )
-        .await?;
-        events::publish_to_account(
-            &state.redis,
-            me,
-            &WsServerBody::FriendRequestAccepted { by: peer_brief },
-        )
-        .await?;
+        // Our own row and the peer's presence flag are independent; fetch
+        // them concurrently. The caller's brief is definitionally online —
+        // this request proves it — so skip the Redis probe for it.
+        let (my_row, peer_briefs) = tokio::join!(
+            sqlx::query_as::<_, BriefRow>(BRIEF_SQL)
+                .bind(me)
+                .fetch_optional(&state.pg),
+            with_online(&state, vec![peer_row]),
+        );
+        let my_row = my_row?.ok_or_else(|| ApiError::not_found("no such account"))?;
+        let my_brief = AccountBrief {
+            id: my_row.0,
+            username: my_row.1,
+            identity_key: my_row.2.unwrap_or_default(),
+            online: true,
+        };
+        let peer_brief = peer_briefs?.pop().expect("one brief");
+        let to_peer_body = WsServerBody::FriendRequestAccepted { by: my_brief };
+        let to_me_body = WsServerBody::FriendRequestAccepted { by: peer_brief };
+        let (to_peer, to_me) = tokio::join!(
+            events::publish_to_account(&state.redis, peer, &to_peer_body),
+            events::publish_to_account(&state.redis, me, &to_me_body),
+        );
+        to_peer?;
+        to_me?;
         return Ok(Json(friend_list(&state, me).await?));
     }
 
@@ -252,7 +292,19 @@ async fn accept(
     .await?;
     tx.commit().await?;
 
-    let my_brief = brief(&state, me).await?;
+    // The accepter is definitionally online — this request proves it — so
+    // build the brief from our own row without the Redis probe.
+    let my_row: BriefRow = sqlx::query_as(BRIEF_SQL)
+        .bind(me)
+        .fetch_optional(&state.pg)
+        .await?
+        .ok_or_else(|| ApiError::not_found("no such account"))?;
+    let my_brief = AccountBrief {
+        id: my_row.0,
+        username: my_row.1,
+        identity_key: my_row.2.unwrap_or_default(),
+        online: true,
+    };
     events::publish_to_account(
         &state.redis,
         peer,
@@ -294,17 +346,13 @@ async fn remove(
     if deleted.rows_affected() == 0 {
         return Err(ApiError::not_found("not friends with this account"));
     }
-    events::publish_to_account(
-        &state.redis,
-        me,
-        &WsServerBody::FriendRemoved { account_id: peer },
-    )
-    .await?;
-    events::publish_to_account(
-        &state.redis,
-        peer,
-        &WsServerBody::FriendRemoved { account_id: me },
-    )
-    .await?;
+    let to_me_body = WsServerBody::FriendRemoved { account_id: peer };
+    let to_peer_body = WsServerBody::FriendRemoved { account_id: me };
+    let (to_me, to_peer) = tokio::join!(
+        events::publish_to_account(&state.redis, me, &to_me_body),
+        events::publish_to_account(&state.redis, peer, &to_peer_body),
+    );
+    to_me?;
+    to_peer?;
     Ok(StatusCode::NO_CONTENT)
 }

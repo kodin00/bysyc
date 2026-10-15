@@ -17,6 +17,8 @@ pub struct Config {
     pub admin_password: Option<String>,
     /// Ciphertext-size cap per attachment, from `ATTACHMENT_MAX_MB` (default 50).
     pub attachment_max_bytes: u64,
+    /// Postgres pool ceiling, from `DB_MAX_CONNECTIONS` (default 16).
+    pub db_max_connections: u32,
 }
 
 impl Config {
@@ -40,6 +42,7 @@ impl Config {
             attachment_max_bytes: env("ATTACHMENT_MAX_MB", "50").parse::<u64>().unwrap_or(50)
                 * 1024
                 * 1024,
+            db_max_connections: env("DB_MAX_CONNECTIONS", "16").parse::<u32>().unwrap_or(16),
         }
     }
 }

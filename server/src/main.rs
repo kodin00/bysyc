@@ -52,13 +52,19 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn boot(config: &config::Config) -> anyhow::Result<AppState> {
-    let pg = db::connect_pool(&config.database_url).await?;
+    let pg = db::connect_pool(&config.database_url, config.db_max_connections).await?;
     db::migrate(&pg).await?;
     let redis_client = redis::Client::open(config.redis_url.as_str())?;
-    let redis = redis::aio::ConnectionManager::new(redis_client).await?;
+    let redis = redis::aio::ConnectionManager::new(redis_client.clone()).await?;
+    // Not a clone of `redis` (a manager clone shares one connection): a
+    // second manager so event publishes get their own pipe.
+    let redis_events = redis::aio::ConnectionManager::new(redis_client).await?;
+    let s3 = s3::client(config);
     Ok(AppState {
         pg,
         redis,
+        redis_events,
+        s3,
         config: config.clone(),
     })
 }

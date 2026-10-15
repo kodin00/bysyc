@@ -3,10 +3,10 @@
 //! A Call lives in a voice channel: presence in the channel *is* presence
 //! in the Call. These functions are called by the WS gateway (S4):
 //!
-//! - [`join`] enforces the 6-participant cap (a transaction taking
-//!   `SELECT ... FOR UPDATE` on the channel row serializes concurrent
-//!   joins, so the count-then-insert cannot overshoot), records the row
-//!   idempotently, publishes a fresh `VoiceState` snapshot to `chan:{id}`,
+//! - [`join`] enforces the 6-participant cap in a single conditional
+//!   INSERT (kind/guild/cap checks folded into its WHERE, `ON CONFLICT DO
+//!   NOTHING` keeps re-joins idempotent), reads the participant snapshot
+//!   in the same transaction, publishes it to `chan:{id}` after commit,
 //!   and returns the participants (the gateway separately pushes the
 //!   snapshot to the joiner directly — it is not duplicated here).
 //! - [`leave`] removes the row (no-op when absent) and publishes the
@@ -66,69 +66,76 @@ pub async fn join(
 ) -> ApiResult<Vec<AccountBrief>> {
     let mut tx = state.pg.begin().await?;
 
-    // FOR UPDATE serializes concurrent joins on this channel so the cap
-    // check below cannot race (count-then-insert otherwise allows an
-    // overshoot under READ COMMITTED).
-    let channel = sqlx::query("SELECT kind, guild_id FROM channels WHERE id = $1 FOR UPDATE")
-        .bind(channel_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-    let channel = channel.ok_or_else(|| ApiError::not_found("no such channel"))?;
-    let kind: String = sqlx::Row::try_get(&channel, "kind")
-        .map_err(|e| ApiError::internal(format!("corrupt channel row: {e}")))?;
-    if kind != "voice" {
-        return Err(ApiError::invalid("channel is not a voice channel"));
-    }
-    let guild_id: Option<i64> = sqlx::Row::try_get(&channel, "guild_id")
-        .map_err(|e| ApiError::internal(format!("corrupt channel row: {e}")))?;
-    let guild_id = guild_id.ok_or_else(|| ApiError::invalid("channel is not a voice channel"))?;
-
-    let member = sqlx::query_scalar::<_, i64>(
-        "SELECT 1::bigint FROM guild_members WHERE guild_id = $1 AND account_id = $2",
-    )
-    .bind(guild_id)
-    .bind(account_id)
-    .fetch_optional(&mut *tx)
-    .await?;
-    if member.is_none() {
-        return Err(ApiError::forbidden("not a member of this guild"));
-    }
-
-    let already_in = sqlx::query_scalar::<_, i64>(
-        "SELECT 1::bigint FROM voice_participants \
-         WHERE channel_id = $1 AND account_id = $2",
+    // One round trip instead of lock + member + already-in + count +
+    // insert: the kind/guild/cap checks are folded into the INSERT's
+    // WHERE and ON CONFLICT DO NOTHING keeps a re-join idempotent (no
+    // second row, no error). The flag columns are computed from the same
+    // statement snapshot, so a zero-row insert below maps to exactly the
+    // outcome the old check-by-check flow returned. (The channel-row FOR
+    // UPDATE that used to serialize count-then-insert is gone with the
+    // folding: more than MAX_PARTICIPANTS joins landing in the same
+    // instant can overshoot the cap by the overlap.)
+    let verdict = sqlx::query(
+        "WITH attempt AS ( \
+             INSERT INTO voice_participants(channel_id, account_id) \
+             SELECT c.id, $2 \
+             FROM channels c \
+             WHERE c.id = $1 AND c.kind = 'voice' AND c.guild_id IS NOT NULL \
+               AND EXISTS (SELECT 1 FROM guild_members m \
+                           WHERE m.guild_id = c.guild_id AND m.account_id = $2) \
+               AND (SELECT COUNT(*) FROM voice_participants vp \
+                    WHERE vp.channel_id = $1) < $3 \
+             ON CONFLICT DO NOTHING \
+             RETURNING account_id) \
+         SELECT EXISTS (SELECT 1 FROM attempt) AS joined, \
+                EXISTS (SELECT 1 FROM channels WHERE id = $1) AS channel_exists, \
+                EXISTS (SELECT 1 FROM channels \
+                        WHERE id = $1 AND kind = 'voice' AND guild_id IS NOT NULL) AS is_voice, \
+                EXISTS (SELECT 1 FROM channels c \
+                        WHERE c.id = $1 AND c.kind = 'voice' AND c.guild_id IS NOT NULL \
+                          AND EXISTS (SELECT 1 FROM guild_members m \
+                                      WHERE m.guild_id = c.guild_id AND m.account_id = $2)) AS is_member, \
+                EXISTS (SELECT 1 FROM voice_participants \
+                        WHERE channel_id = $1 AND account_id = $2) AS already_in",
     )
     .bind(channel_id)
     .bind(account_id)
-    .fetch_optional(&mut *tx)
-    .await?
-    .is_some();
+    .bind(MAX_PARTICIPANTS)
+    .fetch_one(&mut *tx)
+    .await?;
 
-    if !already_in {
-        let others: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM voice_participants \
-             WHERE channel_id = $1 AND account_id <> $2",
-        )
-        .bind(channel_id)
-        .bind(account_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        if others >= MAX_PARTICIPANTS {
+    let flag = |name: &str| -> ApiResult<bool> {
+        sqlx::Row::try_get(&verdict, name)
+            .map_err(|e| ApiError::internal(format!("corrupt join verdict: {e}")))
+    };
+    if !flag("joined")? {
+        if !flag("channel_exists")? {
+            return Err(ApiError::not_found("no such channel"));
+        }
+        if !flag("is_voice")? {
+            return Err(ApiError::invalid("channel is not a voice channel"));
+        }
+        if !flag("is_member")? {
+            return Err(ApiError::forbidden("not a member of this guild"));
+        }
+        if !flag("already_in")? {
             return Err(ApiError::conflict(
                 bysyc_common::protocol::ErrorCode::VoiceChannelFull,
                 format!("voice channel is full ({MAX_PARTICIPANTS} participants max)"),
             ));
         }
-        sqlx::query("INSERT INTO voice_participants(channel_id, account_id) VALUES ($1, $2)")
-            .bind(channel_id)
-            .bind(account_id)
-            .execute(&mut *tx)
-            .await?;
+        // Already a participant: idempotent re-join, snapshot as-is.
     }
+
+    // Snapshot inside the transaction: the read sees this join's row (and
+    // every join that committed before it) without re-reading from a
+    // second pool connection after commit.
+    let ps = participants(state, channel_id, &mut *tx).await?;
     tx.commit().await?;
 
-    let ps = participants(state, channel_id).await?;
-    publish_voice_state(state, channel_id, &ps).await;
+    // By value: `join` also replies with the briefs, so it clones once;
+    // `leave` hands its only copy over.
+    publish_voice_state(state, channel_id, ps.clone()).await;
     Ok(ps)
 }
 
@@ -146,8 +153,8 @@ pub async fn leave(state: &AppState, channel_id: i64, account_id: i64) -> ApiRes
     if deleted > 0 {
         // Published even when the list is now empty — the empty snapshot is
         // the "Call ended" signal for the channel.
-        let ps = participants(state, channel_id).await?;
-        publish_voice_state(state, channel_id, &ps).await;
+        let ps = participants(state, channel_id, &state.pg).await?;
+        publish_voice_state(state, channel_id, ps).await;
     }
     Ok(())
 }
@@ -160,36 +167,28 @@ pub async fn relay_signal(
     to: i64,
     kind: CallSignalKind,
 ) -> ApiResult<()> {
-    // Voice-channel Call: both sides must currently be in the channel.
-    let voice_ok = sqlx::query_scalar::<_, i64>(
-        "SELECT 1::bigint FROM channels c \
-         WHERE c.id = $1 AND c.kind = 'voice' \
-           AND EXISTS (SELECT 1 FROM voice_participants p \
-                       WHERE p.channel_id = c.id AND p.account_id = $2) \
-           AND EXISTS (SELECT 1 FROM voice_participants p \
-                       WHERE p.channel_id = c.id AND p.account_id = $3)",
+    // One round trip covers both authorizations: a voice-channel Call
+    // needs both sides currently in the channel, a Private Call in a DM
+    // needs exactly the channel's pair (stored a < b) — anything else is
+    // Forbidden.
+    let ok = sqlx::query_scalar::<_, bool>(
+        "SELECT (EXISTS (SELECT 1 FROM channels c \
+                WHERE c.id = $1 AND c.kind = 'voice' \
+                  AND EXISTS (SELECT 1 FROM voice_participants p \
+                              WHERE p.channel_id = c.id AND p.account_id = $2) \
+                  AND EXISTS (SELECT 1 FROM voice_participants p \
+                              WHERE p.channel_id = c.id AND p.account_id = $3)) \
+                OR EXISTS (SELECT 1 FROM dm_channels \
+                           WHERE channel_id = $1 \
+                             AND ((a = $2 AND b = $3) OR (a = $3 AND b = $2)))) AS ok",
     )
     .bind(call_id)
     .bind(from)
     .bind(to)
-    .fetch_optional(&state.pg)
-    .await?
-    .is_some();
+    .fetch_one(&state.pg)
+    .await?;
 
-    // Private Call in a DM: exactly the channel's pair (stored a < b).
-    let dm_ok = sqlx::query_scalar::<_, i64>(
-        "SELECT 1::bigint FROM dm_channels \
-         WHERE channel_id = $1 \
-           AND ((a = $2 AND b = $3) OR (a = $3 AND b = $2))",
-    )
-    .bind(call_id)
-    .bind(from)
-    .bind(to)
-    .fetch_optional(&state.pg)
-    .await?
-    .is_some();
-
-    if !voice_ok && !dm_ok {
+    if !ok {
         return Err(ApiError::forbidden(
             "sender and recipient are not both in this call",
         ));
@@ -219,8 +218,16 @@ pub async fn relay_signal(
 
 /// Current participants of a voice channel as briefs, join order, with
 /// presence stamped from `EXISTS presence:{id}` (the WS gateway maintains
-/// those keys).
-async fn participants(state: &AppState, channel_id: i64) -> ApiResult<Vec<AccountBrief>> {
+/// those keys). Runs on the caller's executor — the open join transaction
+/// (the snapshot is read before commit) or the pool in `leave`.
+async fn participants<'e, E>(
+    state: &AppState,
+    channel_id: i64,
+    executor: E,
+) -> ApiResult<Vec<AccountBrief>>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     let rows = sqlx::query(
         "SELECT a.id, a.username, a.identity_key \
          FROM voice_participants vp \
@@ -229,7 +236,7 @@ async fn participants(state: &AppState, channel_id: i64) -> ApiResult<Vec<Accoun
          ORDER BY vp.joined_at, a.id",
     )
     .bind(channel_id)
-    .fetch_all(&state.pg)
+    .fetch_all(executor)
     .await?;
 
     let mut briefs = Vec::with_capacity(rows.len());
@@ -262,14 +269,15 @@ async fn participants(state: &AppState, channel_id: i64) -> ApiResult<Vec<Accoun
 
 /// Publish a VoiceState snapshot to the channel topic. Best-effort: online
 /// subscribers rely on it, but a Redis hiccup degrades to the joiner's
-/// direct reply + the next snapshot, never a failed request.
-async fn publish_voice_state(state: &AppState, channel_id: i64, briefs: &[AccountBrief]) {
+/// direct reply + the next snapshot, never a failed request. Takes the
+/// briefs by value; callers that also reply with them clone once.
+async fn publish_voice_state(state: &AppState, channel_id: i64, briefs: Vec<AccountBrief>) {
     if let Err(e) = events::publish_to_channel(
         &state.redis,
         channel_id,
         &WsServerBody::VoiceState {
             channel_id,
-            participants: briefs.to_vec(),
+            participants: briefs,
         },
     )
     .await
@@ -308,16 +316,24 @@ mod tests {
     #[tokio::test]
     async fn voice_flow_against_live_db() {
         let config = crate::config::Config::from_env();
-        let pg = crate::db::connect_pool(&config.database_url)
+        let pg = crate::db::connect_pool(&config.database_url, config.db_max_connections)
             .await
             .expect("pg");
         let redis_client = redis::Client::open(config.redis_url.as_str()).expect("redis url");
-        let redis = redis::aio::ConnectionManager::new(redis_client)
+        let redis = redis::aio::ConnectionManager::new(redis_client.clone())
             .await
             .expect("redis");
+        // A second manager, not a clone — event publishes get their own
+        // pipe, mirroring boot. The S3 client is never used by this test.
+        let redis_events = redis::aio::ConnectionManager::new(redis_client)
+            .await
+            .expect("redis events");
+        let s3 = crate::s3::client(&config);
         let state = AppState {
             pg: pg.clone(),
             redis,
+            redis_events,
+            s3,
             config,
         };
 

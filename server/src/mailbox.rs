@@ -45,6 +45,13 @@ struct MailboxSendRequest {
 /// their live connections. Used by the REST route below and available to
 /// sibling modules (e.g. key management) that need directed delivery.
 ///
+/// `content` is taken by value so one buffer serves both the row (written
+/// under a borrow) and the pushed [`MailboxItem`] (moved in) — no copy in
+/// between. A recipient that does not reference an existing account
+/// surfaces as the insert's foreign-key violation (23503), mapped here to
+/// the same 404 the old existence probe produced; the sender FK cannot
+/// fire, since `sender_id` is the authenticated caller.
+///
 /// The row is committed before the push: if Redis fan-out fails the item
 /// still arrives in the recipient's next `Ready` drain, so a publish error
 /// is logged, not propagated.
@@ -52,23 +59,30 @@ pub async fn deliver(
     state: &AppState,
     recipient_id: i64,
     sender_id: i64,
-    content: &str,
+    content: String,
 ) -> ApiResult<()> {
-    let row = sqlx::query(
+    let row = match sqlx::query(
         "INSERT INTO mailbox (recipient_id, sender_id, content) \
          VALUES ($1, $2, $3) \
          RETURNING id, (EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_at_ms",
     )
     .bind(recipient_id)
     .bind(sender_id)
-    .bind(content)
+    .bind(content.as_str())
     .fetch_one(&state.pg)
-    .await?;
+    .await
+    {
+        Ok(row) => row,
+        Err(sqlx::Error::Database(db)) if db.code().as_deref() == Some("23503") => {
+            return Err(ApiError::not_found("recipient not found"));
+        }
+        Err(e) => return Err(e.into()),
+    };
 
     let item = MailboxItem {
         id: row.try_get("id")?,
         sender_id,
-        content: content.to_string(),
+        content,
         created_at_ms: row.try_get("created_at_ms")?,
     };
 
@@ -85,8 +99,9 @@ pub async fn deliver(
 }
 
 /// POST /mailbox — send one directed ciphertext control item. `204` on
-/// acceptance. `to` must reference an existing account (404 otherwise);
-/// no friendship requirement, see the module docs.
+/// acceptance. `to` must reference an existing account (the insert's
+/// foreign-key check answers 404); no friendship requirement, see the
+/// module docs.
 async fn post_mailbox(
     State(state): State<AppState>,
     auth: Authed,
@@ -97,14 +112,6 @@ async fn post_mailbox(
         .map_err(|e| ApiError::invalid(format!("malformed request body: {e}")))?;
     check_ciphertext(&req.content)?;
 
-    let exists = sqlx::query_scalar::<_, i64>("SELECT 1::bigint FROM accounts WHERE id = $1")
-        .bind(req.to)
-        .fetch_optional(&state.pg)
-        .await?;
-    if exists.is_none() {
-        return Err(ApiError::not_found("recipient not found"));
-    }
-
-    deliver(&state, req.to, me, &req.content).await?;
+    deliver(&state, req.to, me, req.content).await?;
     Ok(StatusCode::NO_CONTENT)
 }

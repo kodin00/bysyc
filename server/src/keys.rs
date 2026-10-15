@@ -48,25 +48,37 @@ async fn upload_otk(
     if req.one_time_keys.len() > MAX_OTKS_PER_UPLOAD {
         return Err(ApiError::invalid("at most 50 one-time keys per upload"));
     }
-    let mut tx = state.pg.begin().await?;
+    // Client-side format: a single opaque "key_id:b64pubkey" string.
+    // Validate in one pass, deduping repeated key_ids last-wins — the
+    // previous sequential upserts silently overwrote, while a single
+    // set-based INSERT ... ON CONFLICT DO UPDATE would reject the whole
+    // batch with "cannot affect row a second time".
+    let mut pairs: Vec<(&str, &str)> = Vec::with_capacity(req.one_time_keys.len());
     for entry in &req.one_time_keys {
-        // Client-side format: a single opaque "key_id:b64pubkey" string.
         let Some((key_id, pubkey)) = entry.split_once(':') else {
             return Err(ApiError::invalid(
                 "one-time key entries must be formatted 'key_id:b64pubkey'",
             ));
         };
-        sqlx::query(
-            "INSERT INTO one_time_keys (account_id, key_id, pubkey) VALUES ($1, $2, $3) \
-             ON CONFLICT (account_id, key_id) DO UPDATE SET pubkey = EXCLUDED.pubkey",
-        )
-        .bind(me)
-        .bind(key_id)
-        .bind(pubkey)
-        .execute(&mut *tx)
-        .await?;
+        match pairs.iter_mut().find(|(k, _)| *k == key_id) {
+            Some(slot) => slot.1 = pubkey,
+            None => pairs.push((key_id, pubkey)),
+        }
     }
-    tx.commit().await?;
+    if pairs.is_empty() {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    let (key_ids, pubkeys): (Vec<&str>, Vec<&str>) = pairs.into_iter().unzip();
+    sqlx::query(
+        "INSERT INTO one_time_keys (account_id, key_id, pubkey) \
+         SELECT $1, k, p FROM unnest($2::text[], $3::text[]) AS t(k, p) \
+         ON CONFLICT (account_id, key_id) DO UPDATE SET pubkey = EXCLUDED.pubkey",
+    )
+    .bind(me)
+    .bind(&key_ids)
+    .bind(&pubkeys)
+    .execute(&state.pg)
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
