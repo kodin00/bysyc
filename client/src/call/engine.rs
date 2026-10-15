@@ -850,8 +850,7 @@ impl SessionCore {
         // owned Vec per peer, so that per-peer clone stays.
         let mut frame = [0f32; FRAME_SAMPLES];
         let mut packet = std::mem::take(&mut self.tx_packet);
-        let mut enc_failed = false;
-        while self.frame_acc.len() >= FRAME_SAMPLES && !enc_failed {
+        while self.frame_acc.len() >= FRAME_SAMPLES {
             frame.copy_from_slice(&self.frame_acc[..FRAME_SAMPLES]);
             self.frame_acc.drain(..FRAME_SAMPLES);
             if self
@@ -861,7 +860,7 @@ impl SessionCore {
                 .encode_frame_into(&frame, &mut packet)
                 .is_err()
             {
-                break;
+                break; // stop the burst on encoder failure; mic data is lost
             }
             for peer in &mut self.peers {
                 if !peer.connected {

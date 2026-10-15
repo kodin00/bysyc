@@ -1174,6 +1174,14 @@ impl CryptoWorker {
             let Some(m) = st.main() else { return };
             (m.engine.clone(), m.account.id)
         };
+        // The WS receive loop batches raw inserts; this job can beat the
+        // batch to the store. Put the row in first — INSERT OR IGNORE keeps
+        // this a no-op when the batch already flushed, and never clobbers a
+        // plaintext another path stored.
+        {
+            let s = guard(&self.store);
+            let _ = s.insert_message_page(std::slice::from_ref(&dto));
+        }
         let mut file = None;
         let mut deleted = None;
         let show = if dto.sender_id == own_id {
