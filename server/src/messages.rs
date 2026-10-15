@@ -271,9 +271,9 @@ async fn send_message(
     // The message is durably stored; fan-out is best-effort. Clients
     // backfill gaps through the history endpoint.
     if let Err(e) = crate::events::publish_to_channel(
-        &state.redis,
+        &state.redis_events,
         channel_id,
-        &WsServerBody::Message(dto.clone()),
+        WsServerBody::Message(dto.clone()),
     )
     .await
     {
@@ -436,9 +436,9 @@ async fn delete_message(
     // Same best-effort fan-out contract as send; a client that misses the
     // push reconciles on its next history page.
     if let Err(e) = crate::events::publish_to_channel(
-        &state.redis,
+        &state.redis_events,
         channel_id,
-        &WsServerBody::MessageDeleted {
+        WsServerBody::MessageDeleted {
             channel_id,
             message_id,
         },

@@ -12,24 +12,33 @@
 //! 3. **Task layout** (one task per connection, single writer):
 //!
 //!    ```text
-//!    [subscription task] --raw JSON--> [out mpsc] --> [writer task] --> socket
-//!    [connection loop] ---direct replies-^
+//!    [bus forwarder task] --raw JSON--> [out mpsc] --> [writer task] --> socket
+//!    [connection loop] ----direct replies-^
 //!    ```
 //!
 //!    Every frame to the client is written by the writer task alone, in
 //!    order, so `Ready` precedes any pub/sub event.
-//! 4. **Subscription lifecycle**: the subscription task owns a dedicated
-//!    Redis pub/sub connection subscribed to `acct:{me}` plus `chan:{c}`
-//!    for every channel `me` can read. The set is synchronized (a) once at
-//!    connect, (b) on every client `Heartbeat` — the cheap, well-defined
-//!    sync point — and (c) after a successful `VoiceJoin` (so a Private
-//!    Call in a freshly opened DM works without waiting for a heartbeat).
-//!    A client that just joined a Guild or opened a DM should therefore
-//!    send a `Heartbeat` to start receiving the new channel's events;
-//!    events missed before that are backfilled via
-//!    `GET /channels/{id}/messages`. The task reconnects with backoff and
-//!    re-establishes the full subscription set if the Redis connection
-//!    drops.
+//! 4. **Event delivery — shared subscriber workers.** Instead of one Redis
+//!    pub/sub connection per WebSocket connection, a small pool of workers
+//!    (`WS_EVENT_WORKERS`, default 4; spawned once in `main`) owns every
+//!    Redis subscription in the process. Connections are homed
+//!    round-robin to one worker; that worker's single Redis connection
+//!    holds the union of its homed connections' topics, so a connection
+//!    sees its every topic (`acct:{me}` plus `chan:{c}` for each channel
+//!    `me` can read — recomputed at connect, on every client `Heartbeat`,
+//!    and after a successful `VoiceJoin`) arrive on one ordered stream,
+//!    preserving cross-topic publish order exactly like the old
+//!    per-connection subscriber did. Topic sets are refcounted per worker
+//!    in the [`EventBus`]; a worker's first holder of a topic subscribes
+//!    it, its last holder out unsubscribes. Workers forward
+//!    `(topic, payload)` pairs into per-worker `tokio::sync::broadcast`
+//!    rings; each connection's forwarder task filters its home ring by its
+//!    own topics and writes payloads verbatim. A connection that lags the
+//!    ring simply misses events — backfill is `GET /channels/{id}/messages`.
+//!    A client that just joined a Guild or opened a DM should send a
+//!    `Heartbeat` to start receiving the new channel's events (the beat
+//!    resyncs subscriptions immediately — pub/sub delivery starts only once
+//!    the topic is subscribed, so a deferred sync would drop events).
 //! 5. **Server-side heartbeat interval** (30s): refreshes the presence TTL
 //!    as a safety net independent of client heartbeats. Connectivity is
 //!    detected from socket close, not from TTL expiry.
@@ -43,8 +52,15 @@
 //! - One live connection per account: a second concurrent connection gets
 //!   its own socket but shares the single presence key, so the first
 //!   disconnect marks the account offline while the second socket lives.
-//! - `Typing` membership is checked against the database on every message
-//!   (no cache).
+//! - `Typing` readability is answered from the connection's cached channel
+//!   set (refreshed on every resync) with a DB fallback for channels not
+//!   yet in the cache; membership revoked between resyncs can therefore
+//!   still emit `Typing` until the next heartbeat.
+//! - A topic with readers on several workers is subscribed once per such
+//!   worker (at most `WS_EVENT_WORKERS` Redis-side copies, constant — not
+//!   one per connection); per-connection event ordering is unaffected
+//!   (every topic a connection reads rides that connection's home
+//!   worker's single Redis stream).
 //!
 //! # Schema (S1's migration, landed)
 //!
@@ -62,6 +78,7 @@
 //! - `voice_participants(channel_id, account_id)`
 
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
@@ -72,7 +89,7 @@ use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use redis::aio::ConnectionManager;
 use sqlx::{PgPool, Row};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc, Mutex};
 
 use bysyc_common::PROTOCOL_VERSION;
 use bysyc_common::protocol::{
@@ -90,6 +107,15 @@ const PRESENCE_TTL_SECS: u64 = 90;
 const TICK_INTERVAL: Duration = Duration::from_secs(30);
 /// Outgoing frame queue depth per connection before backpressure kicks in.
 const OUT_QUEUE_DEPTH: usize = 256;
+/// Broadcast ring size for the shared event bus; also the per-connection
+/// lag allowance before events start being skipped.
+const EVENT_BUS_CAPACITY: usize = 1024;
+/// Worker command queue depth per subscriber worker. Workers drain commands
+/// even while reconnecting, so a deep queue only matters for Redis outages.
+const WORKER_CMD_QUEUE: usize = 256;
+/// How long teardown waits for the forwarder to release its bus topics
+/// before aborting it (a wedged writer could otherwise stall it mid-send).
+const FORWARDER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub fn router() -> axum::Router<AppState> {
     axum::Router::new().route("/ws", get(ws_upgrade))
@@ -139,8 +165,335 @@ async fn ws_upgrade(
 }
 
 // ---------------------------------------------------------------------------
+// Shared event bus (replaces one Redis pub/sub connection per connection)
+// ---------------------------------------------------------------------------
+
+/// One gateway event as the workers forward it: the Redis topic it was
+/// published to plus the already-serialized `WsServerMsg` JSON (see
+/// [`crate::events`]). `Arc` on both fields and on the event itself keeps
+/// broadcast fan-out to refcount bumps.
+struct BusEvent {
+    topic: Arc<str>,
+    payload: Arc<str>,
+}
+
+/// Topic-management command from the registry to one subscriber worker.
+#[derive(Debug)]
+enum WorkerCmd {
+    /// The topic gained its first interested connection on this worker.
+    Add(Arc<str>),
+    /// The topic lost its last interested connection on this worker.
+    Remove(Arc<str>),
+}
+
+/// The process-wide fan-out point between Redis pub/sub and every live
+/// gateway connection. Connections are sharded round-robin over a small
+/// pool of subscriber workers; each worker owns ONE Redis pub/sub
+/// connection holding the union of its homed connections' topics and feeds
+/// its own broadcast ring. Because every topic a connection cares about
+/// rides that single Redis connection, the connection observes events in
+/// Redis publish order — the per-connection ordering the old
+/// one-subscriber-per-connection design gave, which clients rely on (e.g. a
+/// Megolm session share published to `acct:{id}` must arrive before the
+/// message it unlocks on `chan:{id}`).
+struct EventBus {
+    /// Per worker: command channel + that worker's broadcast ring.
+    workers: Vec<WorkerHandle>,
+    /// Per worker: live topic -> holder count (connections homed there).
+    /// Guarded by the bus's tokio Mutex; every operation is a HashMap
+    /// touch plus (rarely) queueing a worker command.
+    registry: Mutex<Vec<HashMap<Arc<str>, usize>>>,
+    next_worker: std::sync::atomic::AtomicUsize,
+}
+
+struct WorkerHandle {
+    cmd_tx: mpsc::Sender<WorkerCmd>,
+    events: broadcast::Sender<Arc<BusEvent>>,
+}
+
+/// AppState/router state are owned by other files, so the bus rides in a
+/// module static installed by [`start_event_bus`] from `main` before the
+/// listener binds.
+static EVENT_BUS: OnceLock<EventBus> = OnceLock::new();
+
+/// Start `workers` shared subscriber workers and install the process-wide
+/// bus. No-op if called twice.
+pub(crate) fn start_event_bus(redis_url: &str, workers: usize) {
+    if EVENT_BUS.get().is_some() {
+        return;
+    }
+    let (bus, worker_rxs) = EventBus::with_workers(workers);
+    for (id, cmd_rx) in worker_rxs.into_iter().enumerate() {
+        let ring = bus.workers[id].events.clone();
+        tokio::spawn(run_event_worker(redis_url.to_owned(), id, cmd_rx, ring));
+    }
+    let _ = EVENT_BUS.set(bus);
+}
+
+fn event_bus() -> Option<&'static EventBus> {
+    EVENT_BUS.get()
+}
+
+impl EventBus {
+    fn with_workers(workers: usize) -> (Self, Vec<mpsc::Receiver<WorkerCmd>>) {
+        let mut handles = Vec::with_capacity(workers);
+        let mut worker_rxs = Vec::with_capacity(workers);
+        let mut registry = Vec::with_capacity(workers);
+        for _ in 0..workers.max(1) {
+            let (cmd_tx, cmd_rx) = mpsc::channel(WORKER_CMD_QUEUE);
+            let (events, _) = broadcast::channel(EVENT_BUS_CAPACITY);
+            handles.push(WorkerHandle { cmd_tx, events });
+            worker_rxs.push(cmd_rx);
+            registry.push(HashMap::new());
+        }
+        (
+            Self {
+                workers: handles,
+                registry: Mutex::new(registry),
+                next_worker: std::sync::atomic::AtomicUsize::new(0),
+            },
+            worker_rxs,
+        )
+    }
+
+    /// Home worker for a new connection (round-robin).
+    fn assign(&self) -> usize {
+        let n = self.workers.len();
+        self.next_worker
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % n
+    }
+
+    /// This connection's view of its home worker's stream; filtering by
+    /// topic is the forwarder's job (it owns the topic set).
+    fn events(&self, worker: usize) -> broadcast::Receiver<Arc<BusEvent>> {
+        self.workers[worker].events.subscribe()
+    }
+
+    /// Move one connection homed at `worker` from `current` topics to
+    /// `desired`: the worker's first holder of a topic subscribes it on its
+    /// Redis connection, its last holder out unsubscribes. An unchanged set
+    /// is a no-op (digest short-circuit). `current` is updated to
+    /// `desired` on completion.
+    async fn set_topics(
+        &self,
+        worker: usize,
+        current: &mut HashSet<Arc<str>>,
+        desired: HashSet<Arc<str>>,
+    ) {
+        if *current == desired {
+            return;
+        }
+        let mut cmds: Vec<WorkerCmd> = Vec::new();
+        {
+            let mut registry = self.registry.lock().await;
+            let topics = &mut registry[worker];
+            for topic in desired.difference(&*current) {
+                let holders = topics.entry(Arc::clone(topic)).or_insert(0);
+                *holders += 1;
+                if *holders == 1 {
+                    cmds.push(WorkerCmd::Add(Arc::clone(topic)));
+                }
+            }
+            for topic in current.difference(&desired) {
+                if let Some(holders) = topics.get_mut(topic) {
+                    *holders -= 1;
+                    if *holders == 0 {
+                        topics.remove(topic);
+                        cmds.push(WorkerCmd::Remove(Arc::clone(topic)));
+                    }
+                }
+            }
+        }
+        let cmd_tx = self.workers[worker].cmd_tx.clone();
+        for cmd in cmds {
+            // Only fails if the worker task is gone; workers never exit on
+            // their own (they outlive every connection by design).
+            if let Err(e) = cmd_tx.send(cmd).await {
+                tracing::error!("event worker command dropped: {e}");
+            }
+        }
+        *current = desired;
+    }
+}
+
+/// One shared Redis pub/sub connection holding the union of the topics its
+/// homed connections care about. Mirrors the old per-connection
+/// subscriber's resilience: reconnects with backoff and re-establishes its
+/// whole held set, keeps accepting topic commands while disconnected (they
+/// apply on reconnect), and forwards every received payload into its
+/// broadcast ring verbatim.
+async fn run_event_worker(
+    redis_url: String,
+    id: usize,
+    mut cmd_rx: mpsc::Receiver<WorkerCmd>,
+    bus_tx: broadcast::Sender<Arc<BusEvent>>,
+) {
+    let client = match redis::Client::open(redis_url.as_str()) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("invalid redis url for pub/sub: {e}");
+            return;
+        }
+    };
+
+    let mut held: HashSet<Arc<str>> = HashSet::new();
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        let mut pubsub = match client.get_async_pubsub().await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(id, "pub/sub connect failed, retrying in {backoff:?}: {e}");
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(30));
+                continue;
+            }
+        };
+        backoff = Duration::from_secs(1);
+
+        // (Re)establish this worker's entire held set after a (re)connect.
+        if !held.is_empty() {
+            let all: Vec<&str> = held.iter().map(|t| t.as_ref()).collect();
+            if let Err(e) = pubsub.subscribe(all).await {
+                tracing::warn!(id, "pub/sub resubscribe failed: {e}");
+                continue;
+            }
+        }
+
+        loop {
+            // The message stream mutably borrows `pubsub` (and is not
+            // Unpin — hence the pin). Binding it per iteration and dropping
+            // it before the handlers run lets the command handlers retake
+            // the connection between iterations.
+            let mut messages = Box::pin(pubsub.on_message());
+            let step = tokio::select! {
+                cmd = cmd_rx.recv() => Step::Cmd(cmd),
+                msg = messages.next() => Step::Msg(msg),
+            };
+            drop(messages);
+            match step {
+                Step::Cmd(Some(WorkerCmd::Add(topic))) => {
+                    // Record intent first so a failed subscribe is healed
+                    // by the reconnect's full resubscribe.
+                    held.insert(Arc::clone(&topic));
+                    if let Err(e) = pubsub.subscribe(topic.as_ref()).await {
+                        tracing::warn!(id, "pub/sub subscribe failed, reconnecting: {e}");
+                        break;
+                    }
+                }
+                Step::Cmd(Some(WorkerCmd::Remove(topic))) => {
+                    held.remove(&topic);
+                    if let Err(e) = pubsub.unsubscribe(topic.as_ref()).await {
+                        tracing::warn!(id, "pub/sub unsubscribe failed, reconnecting: {e}");
+                        break;
+                    }
+                }
+                Step::Cmd(None) => return, // bus is gone: process shutdown
+                Step::Msg(Some(m)) => {
+                    let topic = Arc::from(m.get_channel_name());
+                    if let Ok(payload) = m.get_payload::<String>() {
+                        // A send error just means no live receivers right
+                        // now — the publish already happened, move on.
+                        let _ = bus_tx.send(Arc::new(BusEvent {
+                            topic,
+                            payload: Arc::from(payload),
+                        }));
+                    }
+                }
+                Step::Msg(None) => {
+                    tracing::warn!(id, "pub/sub stream ended, reconnecting");
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// One resolved event of the worker loop (avoids borrowing `pubsub` inside
+/// the select handlers).
+enum Step {
+    Cmd(Option<WorkerCmd>),
+    Msg(Option<redis::Msg>),
+}
+
+/// Per-connection pump between its home worker's broadcast ring and the
+/// writer task: owns this connection's refcounted share of the worker's
+/// topics, filters the ring down to them, and forwards payloads verbatim.
+/// Exits — releasing every held topic — when the connection loop drops
+/// `sub_tx` or the writer goes away.
+async fn run_bus_forwarder(
+    bus: &'static EventBus,
+    home: usize,
+    mut sub_rx: mpsc::Receiver<HashSet<Arc<str>>>,
+    out_tx: mpsc::Sender<WsMessage>,
+) {
+    let mut events = bus.events(home);
+    let mut held: HashSet<Arc<str>> = HashSet::new();
+    loop {
+        tokio::select! {
+            desired = sub_rx.recv() => match desired {
+                Some(desired) => bus.set_topics(home, &mut held, desired).await,
+                None => {
+                    bus.set_topics(home, &mut held, HashSet::new()).await;
+                    return;
+                }
+            },
+            event = events.recv() => match event {
+                Ok(event) => {
+                    if held.contains(event.topic.as_ref())
+                        && out_tx
+                            .send(WsMessage::Text(event.payload.as_ref().into()))
+                            .await
+                            .is_err()
+                    {
+                        bus.set_topics(home, &mut held, HashSet::new()).await;
+                        return; // writer gone -> connection over
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    // Drop-if-lagging is the bus policy: a connection this
+                    // far behind catches up via `GET /channels/{id}/messages`.
+                    tracing::debug!("gateway event bus lagged, skipped {skipped} events");
+                }
+                Err(broadcast::error::RecvError::Closed) => return,
+            },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Connection body
 // ---------------------------------------------------------------------------
+
+/// Per-connection gateway state: the channel set behind both the
+/// subscription topics and the `Typing` fast path. Everything here is
+/// derived; the DB stays the source of truth at every resync.
+struct ConnState {
+    me: i64,
+    /// Channels `me` could read as of the last successful resync (`None`
+    /// until then — `Typing` falls back to the DB check).
+    channels: Option<HashSet<i64>>,
+}
+
+impl ConnState {
+    fn new(me: i64) -> Self {
+        Self { me, channels: None }
+    }
+
+    /// Cached readability answer, or `None` when unknown (no cache yet, or
+    /// no entry for this channel — e.g. joined after the last resync).
+    /// Negative answers are never cached: a channel the DB says we cannot
+    /// read may become readable before the next resync.
+    fn channel_readable(&self, channel: i64) -> Option<bool> {
+        self.channels.as_ref().map(|set| set.contains(&channel))
+    }
+
+    /// Cache a DB-confirmed readable channel so later keystrokes skip the
+    /// DB until the next resync recomputes the whole set.
+    fn remember_readable(&mut self, channel: i64) {
+        self.channels.get_or_insert_with(HashSet::new).insert(channel);
+    }
+}
 
 async fn run_connected(state: &AppState, socket: WebSocket, me: i64) -> Result<(), ApiError> {
     // 1. Presence on + fan-out (best effort: a Redis hiccup must not kill
@@ -172,20 +525,21 @@ async fn run_connected(state: &AppState, socket: WebSocket, me: i64) -> Result<(
         .await
         .expect("writer not yet spawned; queue cannot be closed");
 
-    let (sub_tx, sub_rx) = mpsc::channel::<HashSet<String>>(4);
-    let subscriber = tokio::spawn(run_subscriber(
-        state.config.redis_url.clone(),
-        sub_rx,
-        out_tx.clone(),
-    ));
-    if let Err(e) = sync_subscriptions(state, me, &sub_tx).await {
-        tracing::warn!(me, "initial subscription sync failed: {e}");
-    }
+    let Some(bus) = event_bus() else {
+        return Err(ApiError::internal(
+            "event bus not started (start_event_bus must run in main before serving)",
+        ));
+    };
+    let (sub_tx, sub_rx) = mpsc::channel::<HashSet<Arc<str>>>(4);
+    let home = bus.assign();
+    let mut forwarder = tokio::spawn(run_bus_forwarder(bus, home, sub_rx, out_tx.clone()));
+    let mut conn = ConnState::new(me);
+    resync_now(state, &mut conn, &sub_tx).await;
 
     let (sink, mut stream) = socket.split();
     let writer = tokio::spawn(write_loop(sink, out_rx));
 
-    // 4. Main loop: socket reader + presence safety tick.
+    // 4. Main loop: socket reader and the presence safety tick.
     let mut ticker = tokio::time::interval(TICK_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let out = out_tx.clone();
@@ -199,7 +553,7 @@ async fn run_connected(state: &AppState, socket: WebSocket, me: i64) -> Result<(
             frame = stream.next() => match frame {
                 None => break, // client went away
                 Some(Ok(WsMessage::Text(txt))) => {
-                    handle_client_msg(state, &sub_tx, &out, me, txt.as_str()).await;
+                    handle_client_msg(state, &sub_tx, &out, me, txt.as_str(), &mut conn).await;
                 }
                 Some(Ok(WsMessage::Close(_))) => break,
                 Some(Err(e)) => {
@@ -213,11 +567,19 @@ async fn run_connected(state: &AppState, socket: WebSocket, me: i64) -> Result<(
         }
     }
 
-    // 5. Teardown: stop producers, let the writer drain and close.
-    subscriber.abort();
+    // 5. Teardown: dropping `sub_tx` tells the forwarder to release its
+    //    bus topics and exit (bounded wait: a wedged writer could otherwise
+    //    stall it mid-send), then let the writer drain and close.
     drop(sub_tx);
     drop(out);
     drop(out_tx);
+    if tokio::time::timeout(FORWARDER_DRAIN_TIMEOUT, &mut forwarder)
+        .await
+        .is_err()
+    {
+        forwarder.abort();
+        tracing::warn!(me, "event forwarder did not drain; its bus topics were leaked");
+    }
     let _ = writer.await;
     Ok(())
 }
@@ -270,10 +632,11 @@ async fn disconnect_cleanup(state: &AppState, me: i64) {
 
 async fn handle_client_msg(
     state: &AppState,
-    sub_tx: &mpsc::Sender<HashSet<String>>,
+    sub_tx: &mpsc::Sender<HashSet<Arc<str>>>,
     out: &mpsc::Sender<WsMessage>,
     me: i64,
     text: &str,
+    conn: &mut ConnState,
 ) {
     let msg: WsClientMsg = match serde_json::from_str(text) {
         Ok(m) => m,
@@ -292,40 +655,56 @@ async fn handle_client_msg(
         WsClientBody::Heartbeat => {
             // Refresh liveness and re-sync the subscription set: this is
             // the documented sync point after joining a guild / opening a
-            // DM (see module docs).
+            // DM (see module docs). The resync runs immediately — events on
+            // a freshly readable channel start flowing only once its topic
+            // is subscribed, so a deferred sync would drop them.
             if let Err(e) = set_presence(&state.redis, me).await {
                 tracing::warn!(me, "presence refresh failed: {e}");
             }
-            if let Err(e) = sync_subscriptions(state, me, sub_tx).await {
-                tracing::warn!(me, "subscription resync failed: {e}");
-            }
+            resync_now(state, conn, sub_tx).await;
         }
         WsClientBody::Typing { channel_id } => {
-            match crate::messages::can_read(&state.pg, me, channel_id).await {
-                Ok(true) => {
-                    if let Err(e) = crate::events::publish_to_channel(
-                        &state.redis,
-                        channel_id,
-                        &WsServerBody::Typing {
-                            channel_id,
-                            account_id: me,
-                        },
-                    )
-                    .await
-                    {
-                        tracing::warn!(me, channel_id, "typing fan-out failed: {e}");
+            // Fast path: the connection's channel set (recomputed at
+            // connect, every heartbeat resync, and voice joins) already
+            // proves readability. Only unknown channels pay a DB check —
+            // typically a join that has not seen its first post-join
+            // heartbeat yet, and a confirmed read is cached back so the
+            // rest of the burst is free.
+            let allowed = match conn.channel_readable(channel_id) {
+                Some(true) => true,
+                _ => match crate::messages::can_read(&state.pg, me, channel_id).await {
+                    Ok(false) => false,
+                    Ok(true) => {
+                        conn.remember_readable(channel_id);
+                        true
                     }
+                    Err(e) => {
+                        tracing::error!(me, "typing membership check failed: {e:#}");
+                        send_error(out, Some(msg.id), ErrorCode::Internal, "database error");
+                        return;
+                    }
+                },
+            };
+            if allowed {
+                if let Err(e) = crate::events::publish_to_channel(
+                    &state.redis_events,
+                    channel_id,
+                    WsServerBody::Typing {
+                        channel_id,
+                        account_id: me,
+                    },
+                )
+                .await
+                {
+                    tracing::warn!(me, channel_id, "typing fan-out failed: {e}");
                 }
-                Ok(false) => send_error(
+            } else {
+                send_error(
                     out,
                     Some(msg.id),
                     ErrorCode::Forbidden,
                     "not a member of this channel",
-                ),
-                Err(e) => {
-                    tracing::error!(me, "typing membership check failed: {e:#}");
-                    send_error(out, Some(msg.id), ErrorCode::Internal, "database error");
-                }
+                );
             }
         }
         WsClientBody::AckMailbox { ids } => {
@@ -360,9 +739,7 @@ async fn handle_client_msg(
                         .await;
                     // Pick up subscriptions in case the call sits in a
                     // freshly opened DM the heartbeat has not synced yet.
-                    if let Err(e) = sync_subscriptions(state, me, sub_tx).await {
-                        tracing::warn!(me, "post-join subscription resync failed: {e}");
-                    }
+                    resync_now(state, conn, sub_tx).await;
                 }
                 Err(e) => send_error(out, Some(msg.id), e.code, e.message),
             }
@@ -393,6 +770,18 @@ async fn handle_client_msg(
                 send_error(out, Some(msg.id), e.code, e.message);
             }
         }
+    }
+}
+
+/// Run one subscription resync. On failure the cached channel set is left
+/// untouched so the next heartbeat retries.
+async fn resync_now(
+    state: &AppState,
+    conn: &mut ConnState,
+    sub_tx: &mpsc::Sender<HashSet<Arc<str>>>,
+) {
+    if let Err(e) = sync_subscriptions(state, conn, sub_tx).await {
+        tracing::warn!(conn.me, "subscription resync failed: {e:#}");
     }
 }
 
@@ -436,128 +825,32 @@ async fn my_channels(pg: &PgPool, me: i64) -> sqlx::Result<Vec<i64>> {
 }
 
 /// The full pub/sub topic set for an account: the directed topic plus one
-/// topic per readable channel.
-fn subscription_names(me: i64, channels: &[i64]) -> HashSet<String> {
+/// topic per readable channel. Topic strings are identical to the ones the
+/// REST publishers in [`crate::events`] PUBLISH to.
+fn subscription_names(me: i64, channels: &HashSet<i64>) -> HashSet<Arc<str>> {
     let mut set = HashSet::with_capacity(channels.len() + 1);
-    set.insert(format!("acct:{me}"));
+    set.insert(Arc::from(format!("acct:{me}")));
     for c in channels {
-        set.insert(format!("chan:{c}"));
+        set.insert(Arc::from(format!("chan:{c}")));
     }
     set
 }
 
-/// Recompute the desired topic set and hand it to the subscription task.
+/// Recompute the desired topic set (and the Typing fast-path cache) from
+/// the database and hand the topic set to the forwarder task.
 async fn sync_subscriptions(
     state: &AppState,
-    me: i64,
-    sub_tx: &mpsc::Sender<HashSet<String>>,
+    conn: &mut ConnState,
+    sub_tx: &mpsc::Sender<HashSet<Arc<str>>>,
 ) -> sqlx::Result<()> {
-    let desired = subscription_names(me, &my_channels(&state.pg, me).await?);
-    // A send error means the subscriber is gone, i.e. the connection is
+    let channels: HashSet<i64> = my_channels(&state.pg, conn.me)
+        .await?
+        .into_iter()
+        .collect();
+    conn.channels = Some(channels.clone());
+    // A send error means the forwarder is gone, i.e. the connection is
     // already tearing down.
-    let _ = sub_tx.send(desired).await;
-    Ok(())
-}
-
-/// Owns the per-connection Redis pub/sub connection. Receives full desired
-/// topic sets, diffs them against the current one, and forwards every
-/// published payload (already-serialized `WsServerMsg` JSON, see
-/// [`crate::events`]) verbatim to the writer. Reconnects with backoff and
-/// re-establishes the full topic set if the connection drops.
-async fn run_subscriber(
-    redis_url: String,
-    mut cmd_rx: mpsc::Receiver<HashSet<String>>,
-    out_tx: mpsc::Sender<WsMessage>,
-) {
-    let client = match redis::Client::open(redis_url.as_str()) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!("invalid redis url for pub/sub: {e}");
-            return;
-        }
-    };
-
-    let mut desired: HashSet<String> = HashSet::new();
-    let mut backoff = Duration::from_secs(1);
-    loop {
-        let mut pubsub = match client.get_async_pubsub().await {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!("pub/sub connect failed, retrying in {backoff:?}: {e}");
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(Duration::from_secs(30));
-                continue;
-            }
-        };
-        backoff = Duration::from_secs(1);
-
-        // (Re)establish the entire desired set after a (re)connect.
-        if !desired.is_empty() {
-            let all: Vec<&str> = desired.iter().map(String::as_str).collect();
-            if let Err(e) = pubsub.subscribe(all).await {
-                tracing::warn!("pub/sub resubscribe failed: {e}");
-                continue;
-            }
-        }
-
-        loop {
-            // The message stream mutably borrows `pubsub` (and is not
-            // Unpin — hence the pin). Binding it per iteration and
-            // dropping it before the handlers run lets
-            // `apply_subscriptions` retake the connection between
-            // iterations.
-            let mut messages = Box::pin(pubsub.on_message());
-            let step = tokio::select! {
-                cmd = cmd_rx.recv() => Step::Cmd(cmd),
-                msg = messages.next() => Step::Msg(msg),
-            };
-            drop(messages);
-            match step {
-                Step::Cmd(Some(next)) => {
-                    if let Err(e) = apply_subscriptions(&mut pubsub, &desired, &next).await {
-                        tracing::warn!("pub/sub sync failed, reconnecting: {e}");
-                        desired = next; // keep the intended set for the reconnect
-                        break;
-                    }
-                    desired = next;
-                }
-                Step::Cmd(None) => return, // gateway connection is gone
-                Step::Msg(Some(m)) => {
-                    if let Ok(payload) = m.get_payload::<String>() {
-                        if out_tx.send(WsMessage::Text(payload.into())).await.is_err() {
-                            return; // writer gone -> connection over
-                        }
-                    }
-                }
-                Step::Msg(None) => {
-                    tracing::warn!("pub/sub stream ended, reconnecting");
-                    break;
-                }
-            }
-        }
-    }
-}
-
-/// One resolved event of the subscriber loop (avoids borrowing `pubsub`
-/// inside the select handlers).
-enum Step {
-    Cmd(Option<HashSet<String>>),
-    Msg(Option<redis::Msg>),
-}
-
-async fn apply_subscriptions(
-    pubsub: &mut redis::aio::PubSub,
-    current: &HashSet<String>,
-    desired: &HashSet<String>,
-) -> Result<(), redis::RedisError> {
-    let add: Vec<&str> = desired.difference(current).map(String::as_str).collect();
-    if !add.is_empty() {
-        pubsub.subscribe(add).await?;
-    }
-    let drop: Vec<&str> = current.difference(desired).map(String::as_str).collect();
-    if !drop.is_empty() {
-        pubsub.unsubscribe(drop).await?;
-    }
+    let _ = sub_tx.send(subscription_names(conn.me, &channels)).await;
     Ok(())
 }
 
@@ -594,20 +887,19 @@ async fn presence_audience(pg: &PgPool, me: i64) -> sqlx::Result<Vec<i64>> {
 }
 
 async fn fan_out_presence(state: &AppState, me: i64, online: bool) -> Result<(), ApiError> {
-    for id in presence_audience(&state.pg, me).await? {
-        if let Err(e) = crate::events::publish_to_account(
-            &state.redis,
-            id,
-            &WsServerBody::Presence {
-                account_id: me,
-                online,
-            },
-        )
-        .await
-        {
-            // One unreachable peer must not abort the fan-out.
-            tracing::warn!(me, "presence fan-out to {id} failed: {e}");
-        }
+    let audience = presence_audience(&state.pg, me).await?;
+    // One pipelined round trip for the whole audience (see events.rs).
+    if let Err(e) = crate::events::publish_to_accounts(
+        &state.redis_events,
+        &audience,
+        WsServerBody::Presence {
+            account_id: me,
+            online,
+        },
+    )
+    .await
+    {
+        tracing::warn!(me, "presence fan-out failed: {e}");
     }
     Ok(())
 }
@@ -651,14 +943,76 @@ struct Ready {
 async fn ready_snapshot(state: &AppState, me: i64) -> Result<Ready, ApiError> {
     let pg = &state.pg;
 
-    let row = sqlx::query(
-        "SELECT id, username, identity_key, \
-                (EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_at_ms \
-         FROM accounts WHERE id = $1",
-    )
-    .bind(me)
-    .fetch_one(pg)
-    .await?;
+    // Wave 1: every snapshot query is independent — fan them out on the
+    // pool instead of paying seven sequential round-trips. Only the
+    // guild-channel and presence lookups in wave 2 depend on these results.
+    let (
+        account_row,
+        friends_res,
+        incoming_requests_res,
+        outgoing_requests_res,
+        guild_rows_res,
+        dm_rows_res,
+        mail_rows_res,
+    ) = tokio::join!(
+        sqlx::query(
+            "SELECT id, username, identity_key, \
+                    (EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_at_ms \
+             FROM accounts WHERE id = $1",
+        )
+        .bind(me)
+        .fetch_one(pg),
+        briefs(
+            pg,
+            "SELECT a.id, a.username, a.identity_key \
+             FROM friends f \
+             JOIN accounts a ON a.id = CASE WHEN f.a = $1 THEN f.b ELSE f.a END \
+             WHERE f.a = $1 OR f.b = $1",
+            me,
+        ),
+        briefs(
+            pg,
+            "SELECT a.id, a.username, a.identity_key \
+             FROM friend_requests fr \
+             JOIN accounts a ON a.id = fr.from_id \
+             WHERE fr.to_id = $1",
+            me,
+        ),
+        briefs(
+            pg,
+            "SELECT a.id, a.username, a.identity_key \
+             FROM friend_requests fr \
+             JOIN accounts a ON a.id = fr.to_id \
+             WHERE fr.from_id = $1",
+            me,
+        ),
+        sqlx::query(
+            "SELECT g.id, g.name, g.owner_id \
+             FROM guilds g \
+             JOIN guild_members gm ON gm.guild_id = g.id \
+             WHERE gm.account_id = $1",
+        )
+        .bind(me)
+        .fetch_all(pg),
+        sqlx::query(
+            "SELECT dc.channel_id, \
+                    a.id AS peer_id, a.username AS peer_username, a.identity_key AS peer_key \
+             FROM dm_channels dc \
+             JOIN accounts a ON a.id = CASE WHEN dc.a = $1 THEN dc.b ELSE dc.a END \
+             WHERE dc.a = $1 OR dc.b = $1",
+        )
+        .bind(me)
+        .fetch_all(pg),
+        sqlx::query(
+            "SELECT id, sender_id, content, \
+                    (EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_at_ms \
+             FROM mailbox WHERE recipient_id = $1 ORDER BY id",
+        )
+        .bind(me)
+        .fetch_all(pg),
+    );
+
+    let row = account_row?;
     let account = AccountInfo {
         id: row.try_get("id")?,
         username: row.try_get("username")?,
@@ -667,44 +1021,11 @@ async fn ready_snapshot(state: &AppState, me: i64) -> Result<Ready, ApiError> {
             .unwrap_or_default(),
         created_at_ms: row.try_get("created_at_ms")?,
     };
+    let mut friends = friends_res?;
+    let mut incoming_requests = incoming_requests_res?;
+    let mut outgoing_requests = outgoing_requests_res?;
 
-    let mut friends = briefs(
-        pg,
-        "SELECT a.id, a.username, a.identity_key \
-         FROM friends f \
-         JOIN accounts a ON a.id = CASE WHEN f.a = $1 THEN f.b ELSE f.a END \
-         WHERE f.a = $1 OR f.b = $1",
-        me,
-    )
-    .await?;
-    let mut incoming_requests = briefs(
-        pg,
-        "SELECT a.id, a.username, a.identity_key \
-         FROM friend_requests fr \
-         JOIN accounts a ON a.id = fr.from_id \
-         WHERE fr.to_id = $1",
-        me,
-    )
-    .await?;
-    let mut outgoing_requests = briefs(
-        pg,
-        "SELECT a.id, a.username, a.identity_key \
-         FROM friend_requests fr \
-         JOIN accounts a ON a.id = fr.to_id \
-         WHERE fr.from_id = $1",
-        me,
-    )
-    .await?;
-
-    let guild_rows = sqlx::query(
-        "SELECT g.id, g.name, g.owner_id \
-         FROM guilds g \
-         JOIN guild_members gm ON gm.guild_id = g.id \
-         WHERE gm.account_id = $1",
-    )
-    .bind(me)
-    .fetch_all(pg)
-    .await?;
+    let guild_rows = guild_rows_res?;
     let mut guilds: Vec<GuildInfo> = guild_rows
         .iter()
         .map(|r| -> Result<GuildInfo, sqlx::Error> {
@@ -716,38 +1037,9 @@ async fn ready_snapshot(state: &AppState, me: i64) -> Result<Ready, ApiError> {
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    if !guilds.is_empty() {
-        let guild_ids: Vec<i64> = guilds.iter().map(|g| g.id).collect();
-        let chan_rows =
-            sqlx::query("SELECT id, guild_id, kind, name FROM channels WHERE guild_id = ANY($1)")
-                .bind(&guild_ids)
-                .fetch_all(pg)
-                .await?;
-        for cr in chan_rows {
-            let guild_id: i64 = cr.try_get("guild_id")?;
-            let Some(guild) = guilds.iter_mut().find(|g| g.id == guild_id) else {
-                continue;
-            };
-            guild.channels.push(ChannelInfo {
-                id: cr.try_get("id")?,
-                guild_id: Some(guild_id),
-                kind: crate::messages::parse_channel_kind(&cr.try_get::<String, _>("kind")?)
-                    .ok_or_else(|| ApiError::internal("corrupt channel kind in database"))?,
-                name: cr.try_get("name")?,
-            });
-        }
-    }
+    let guild_ids: Vec<i64> = guilds.iter().map(|g| g.id).collect();
 
-    let dm_rows = sqlx::query(
-        "SELECT dc.channel_id, \
-                a.id AS peer_id, a.username AS peer_username, a.identity_key AS peer_key \
-         FROM dm_channels dc \
-         JOIN accounts a ON a.id = CASE WHEN dc.a = $1 THEN dc.b ELSE dc.a END \
-         WHERE dc.a = $1 OR dc.b = $1",
-    )
-    .bind(me)
-    .fetch_all(pg)
-    .await?;
+    let dm_rows = dm_rows_res?;
     let mut dm_channels = Vec::with_capacity(dm_rows.len());
     for r in dm_rows {
         let peer = AccountBrief {
@@ -772,14 +1064,7 @@ async fn ready_snapshot(state: &AppState, me: i64) -> Result<Ready, ApiError> {
         });
     }
 
-    let mail_rows = sqlx::query(
-        "SELECT id, sender_id, content, \
-                (EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_at_ms \
-         FROM mailbox WHERE recipient_id = $1 ORDER BY id",
-    )
-    .bind(me)
-    .fetch_all(pg)
-    .await?;
+    let mail_rows = mail_rows_res?;
     let mut mailbox = Vec::with_capacity(mail_rows.len());
     for r in mail_rows {
         mailbox.push(MailboxItem {
@@ -802,7 +1087,37 @@ async fn ready_snapshot(state: &AppState, me: i64) -> Result<Ready, ApiError> {
         brief_ids.push(b.id);
     }
     brief_ids.extend(dm_channels.iter().map(|d| d.peer.id));
-    let online = match presence_map(&state.redis, &brief_ids).await {
+
+    // Wave 2: the guild-channel query needs the guild ids and the presence
+    // probe needs the brief ids — independent of each other, so they share
+    // one wait.
+    let (chan_rows_res, online_res) = tokio::join!(
+        async {
+            if guild_ids.is_empty() {
+                Ok(Vec::new())
+            } else {
+                sqlx::query("SELECT id, guild_id, kind, name FROM channels WHERE guild_id = ANY($1)")
+                    .bind(&guild_ids)
+                    .fetch_all(pg)
+                    .await
+            }
+        },
+        presence_map(&state.redis, &brief_ids),
+    );
+    for cr in chan_rows_res? {
+        let guild_id: i64 = cr.try_get("guild_id")?;
+        let Some(guild) = guilds.iter_mut().find(|g| g.id == guild_id) else {
+            continue;
+        };
+        guild.channels.push(ChannelInfo {
+            id: cr.try_get("id")?,
+            guild_id: Some(guild_id),
+            kind: crate::messages::parse_channel_kind(&cr.try_get::<String, _>("kind")?)
+                .ok_or_else(|| ApiError::internal("corrupt channel kind in database"))?,
+            name: cr.try_get("name")?,
+        });
+    }
+    let online = match online_res {
         Ok(m) => m,
         Err(e) => {
             tracing::warn!(
@@ -872,8 +1187,9 @@ mod tests {
 
     #[test]
     fn subscription_names_cover_direct_and_channel_topics() {
-        let set = subscription_names(7, &[10, 11, 10]);
-        assert_eq!(set.len(), 3, "duplicates collapse");
+        let channels = HashSet::from([10, 11]);
+        let set = subscription_names(7, &channels);
+        assert_eq!(set.len(), 3, "one directed + one per channel");
         assert!(set.contains("acct:7"));
         assert!(set.contains("chan:10"));
         assert!(set.contains("chan:11"));
@@ -895,12 +1211,101 @@ mod tests {
                     parsed.body,
                     WsServerBody::Presence {
                         account_id: 2,
-                        online: true
+                        online: true,
                     }
                 );
                 assert_eq!(parsed.id, None);
             }
             other => panic!("expected text frame, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn assign_is_round_robin_over_all_workers() {
+        let (bus, _rxs) = EventBus::with_workers(4);
+        let homes: Vec<usize> = (0..8).map(|_| bus.assign()).collect();
+        assert_eq!(homes, vec![0, 1, 2, 3, 0, 1, 2, 3]);
+        let (one, _rxs) = EventBus::with_workers(1);
+        for _ in 0..5 {
+            assert_eq!(one.assign(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn typing_cache_and_membership_start_empty() {
+        let conn = ConnState::new(1);
+        assert_eq!(conn.channel_readable(10), None);
+    }
+
+    fn topic_set(topics: &[&str]) -> HashSet<Arc<str>> {
+        topics.iter().map(|t| Arc::from(*t)).collect()
+    }
+
+    #[tokio::test]
+    async fn bus_subscribes_on_first_holder_and_unsubscribes_on_last() {
+        let (bus, mut worker_rxs) = EventBus::with_workers(1);
+        let mut cmds = worker_rxs.remove(0);
+
+        // First holder: everything gets subscribed.
+        let desired = topic_set(&["acct:7", "chan:10"]);
+        let mut first = HashSet::new();
+        bus.set_topics(0, &mut first, desired.clone()).await;
+        assert_eq!(first, desired);
+        let mut adds = 0;
+        while let Ok(cmd) = cmds.try_recv() {
+            assert!(matches!(cmd, WorkerCmd::Add(_)), "expected Add, got {cmd:?}");
+            adds += 1;
+        }
+        assert_eq!(adds, 2);
+
+        // A second holder of the same topics must not touch the worker,
+        // and releasing it must not unsubscribe the first.
+        let mut second = HashSet::new();
+        bus.set_topics(0, &mut second, desired.clone()).await;
+        assert!(cmds.try_recv().is_err(), "no worker traffic expected");
+        bus.set_topics(0, &mut second, HashSet::new()).await;
+        assert!(cmds.try_recv().is_err(), "no worker traffic expected");
+
+        // An unchanged desired set short-circuits entirely.
+        bus.set_topics(0, &mut first, desired.clone()).await;
+        assert!(cmds.try_recv().is_err(), "no worker traffic expected");
+
+        // Last holder out: everything gets unsubscribed.
+        bus.set_topics(0, &mut first, HashSet::new()).await;
+        let mut removes = 0;
+        while let Ok(cmd) = cmds.try_recv() {
+            assert!(
+                matches!(cmd, WorkerCmd::Remove(_)),
+                "expected Remove, got {cmd:?}"
+            );
+            removes += 1;
+        }
+        assert_eq!(removes, 2);
+    }
+
+    #[tokio::test]
+    async fn workers_track_their_holdings_independently() {
+        // The same topic homed on two workers (two connections of different
+        // homes both read it) is subscribed once per worker; the rings and
+        // refcounts never bleed across workers.
+        let (bus, mut worker_rxs) = EventBus::with_workers(2);
+        let mut cmds0 = worker_rxs.remove(0);
+        let mut cmds1 = worker_rxs.remove(0);
+
+        let desired = topic_set(&["chan:10"]);
+        let mut a = HashSet::new();
+        let mut b = HashSet::new();
+        bus.set_topics(0, &mut a, desired.clone()).await;
+        bus.set_topics(1, &mut b, desired.clone()).await;
+        assert!(matches!(cmds0.try_recv(), Ok(WorkerCmd::Add(_))));
+        assert!(matches!(cmds1.try_recv(), Ok(WorkerCmd::Add(_))));
+
+        // Releasing on one worker leaves the other's subscription intact.
+        bus.set_topics(0, &mut a, HashSet::new()).await;
+        assert!(matches!(cmds0.try_recv(), Ok(WorkerCmd::Remove(_))));
+        assert!(cmds1.try_recv().is_err(), "worker 1 must be untouched");
+
+        bus.set_topics(1, &mut b, HashSet::new()).await;
+        assert!(matches!(cmds1.try_recv(), Ok(WorkerCmd::Remove(_))));
     }
 }

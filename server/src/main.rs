@@ -37,6 +37,11 @@ async fn main() -> anyhow::Result<()> {
 
     let state = boot(&config).await?;
     db::bootstrap_admin(&state).await?;
+    // Shared gateway subscribers: a fixed pool of Redis pub/sub connections
+    // total, no matter how many WebSocket connections are live.
+    let workers = ws_event_workers();
+    ws::start_event_bus(&config.redis_url, workers);
+    tracing::info!("gateway event bus online ({workers} shared redis subscribers)");
     let app = routes::router(state);
 
     let addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
@@ -49,6 +54,18 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("bysyc-server listening on {addr}");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Gateway shared-subscriber worker count, from `WS_EVENT_WORKERS`
+/// (default 4, clamped 1..=8). Connections are homed round-robin to a
+/// worker; each worker holds exactly one Redis pub/sub connection carrying
+/// the union of its homed connections' event topics.
+fn ws_event_workers() -> usize {
+    std::env::var("WS_EVENT_WORKERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(4)
+        .clamp(1, 8)
 }
 
 async fn boot(config: &config::Config) -> anyhow::Result<AppState> {

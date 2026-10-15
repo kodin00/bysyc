@@ -229,12 +229,13 @@ async fn send_request(
         let peer_brief = peer_briefs?.pop().expect("one brief");
         let to_peer_body = WsServerBody::FriendRequestAccepted { by: my_brief };
         let to_me_body = WsServerBody::FriendRequestAccepted { by: peer_brief };
-        let (to_peer, to_me) = tokio::join!(
-            events::publish_to_account(&state.redis, peer, &to_peer_body),
-            events::publish_to_account(&state.redis, me, &to_me_body),
-        );
-        to_peer?;
-        to_me?;
+        // Both sides hear about the new friendship in one pipelined round
+        // trip.
+        events::FanOut::new()
+            .account(peer, to_peer_body)
+            .account(me, to_me_body)
+            .flush(&state.redis_events)
+            .await?;
         return Ok(Json(friend_list(&state, me).await?));
     }
 
@@ -258,9 +259,9 @@ async fn send_request(
     .await?;
     let my_brief = brief(&state, me).await?;
     events::publish_to_account(
-        &state.redis,
+        &state.redis_events,
         peer,
-        &WsServerBody::FriendRequested { from: my_brief },
+        WsServerBody::FriendRequested { from: my_brief },
     )
     .await?;
     Ok(Json(friend_list(&state, me).await?))
@@ -306,9 +307,9 @@ async fn accept(
         online: true,
     };
     events::publish_to_account(
-        &state.redis,
+        &state.redis_events,
         peer,
-        &WsServerBody::FriendRequestAccepted { by: my_brief },
+        WsServerBody::FriendRequestAccepted { by: my_brief },
     )
     .await?;
     Ok(Json(friend_list(&state, me).await?))
@@ -348,11 +349,11 @@ async fn remove(
     }
     let to_me_body = WsServerBody::FriendRemoved { account_id: peer };
     let to_peer_body = WsServerBody::FriendRemoved { account_id: me };
-    let (to_me, to_peer) = tokio::join!(
-        events::publish_to_account(&state.redis, me, &to_me_body),
-        events::publish_to_account(&state.redis, peer, &to_peer_body),
-    );
-    to_me?;
-    to_peer?;
+    // One pipelined round trip carries both removal notices.
+    events::FanOut::new()
+        .account(me, to_me_body)
+        .account(peer, to_peer_body)
+        .flush(&state.redis_events)
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }

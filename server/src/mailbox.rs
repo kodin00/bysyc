@@ -87,9 +87,9 @@ pub async fn deliver(
     };
 
     if let Err(e) = crate::events::publish_to_account(
-        &state.redis,
+        &state.redis_events,
         recipient_id,
-        &WsServerBody::MailboxAppend(item),
+        WsServerBody::MailboxAppend(item),
     )
     .await
     {

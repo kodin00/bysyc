@@ -8,8 +8,8 @@
 //! - `friends` / `dm_channels` pairs are stored normalized (`a < b`);
 //!   queries use LEAST/GREATEST.
 //! - WS events fan out once the mutation has landed; the guild member
-//!   fan-out batches [`crate::events::publish_to_account`]'s exact envelope
-//!   into a single Redis pipeline ([`publish_to_accounts`]).
+//!   fan-out goes through [`crate::events`] — one serialized payload, one
+//!   pipelined Redis round trip.
 //!
 //! Semantics pinned for v1:
 //! - Channel create/delete and invite issuance are Owner-only; anyone else
@@ -25,12 +25,13 @@ use axum::{Json, Router};
 use bysyc_common::protocol::{
     AccountBrief, ChannelInfo, ChannelKind, CreateChannelRequest, CreateGuildInviteRequest,
     CreateGuildRequest, DmChannel, ErrorCode, GuildInfo, GuildInviteDto, JoinGuildRequest,
-    OpenDmRequest, WsServerBody, WsServerMsg,
+    OpenDmRequest, WsServerBody,
 };
 use rand::distr::{Alphanumeric, SampleString};
 
 use crate::db::AppState;
 use crate::error::{ApiError, ApiResult};
+use crate::events;
 use crate::session::Authed;
 
 pub fn router() -> Router<AppState> {
@@ -84,37 +85,6 @@ async fn is_online(state: &AppState, id: i64) -> ApiResult<bool> {
         .arg(format!("presence:{id}"))
         .query_async(&mut conn)
         .await?)
-}
-
-/// The exact envelope [`crate::events::publish_to_account`] puts on the
-/// wire: `WsServerMsg { id: None }` serialized to JSON.
-fn event_json(body: &WsServerBody) -> String {
-    serde_json::to_string(&WsServerMsg {
-        id: None,
-        body: body.clone(),
-    })
-    .expect("WsServerBody serializes")
-}
-
-/// Publish one directed event to many accounts in a single Redis round
-/// trip. Same topics and payload bytes the per-account helper produces;
-/// the body is serialized once.
-async fn publish_to_accounts(
-    redis: &redis::aio::ConnectionManager,
-    accounts: &[i64],
-    body: &WsServerBody,
-) -> ApiResult<()> {
-    if accounts.is_empty() {
-        return Ok(());
-    }
-    let json = event_json(body);
-    let mut pipe = redis::Pipeline::new();
-    for id in accounts {
-        pipe.publish(format!("acct:{id}"), json.as_str());
-    }
-    let mut conn = redis.clone();
-    pipe.query_async::<()>(&mut conn).await?;
-    Ok(())
 }
 
 /// The Guild's owner id, or `None` when the Guild does not exist.
@@ -376,21 +346,23 @@ async fn join_guild(
     };
 
     // Members from *before* this join get MemberJoined; I get GuildJoined —
-    // one pipeline, one round trip.
-    let joined_json = event_json(&WsServerBody::GuildJoined {
-        guild: guild.clone(),
-    });
-    let member_json = event_json(&WsServerBody::MemberJoined {
-        guild_id,
-        account: my_brief,
-    });
-    let mut pipe = redis::Pipeline::new();
-    for member in &existing {
-        pipe.publish(format!("acct:{member}"), member_json.as_str());
-    }
-    pipe.publish(format!("acct:{me}"), joined_json.as_str());
-    let mut conn = state.redis.clone();
-    pipe.query_async::<()>(&mut conn).await?;
+    // one batch, one round trip, each payload serialized once.
+    events::FanOut::new()
+        .accounts(
+            &existing,
+            WsServerBody::MemberJoined {
+                guild_id,
+                account: my_brief,
+            },
+        )
+        .account(
+            me,
+            WsServerBody::GuildJoined {
+                guild: guild.clone(),
+            },
+        )
+        .flush(&state.redis_events)
+        .await?;
     tracing::info!(guild_id, account_id = me, "guild joined");
     Ok(Json(guild))
 }
@@ -423,10 +395,10 @@ async fn leave_guild(
             .await?;
     tx.commit().await?;
 
-    publish_to_accounts(
-        &state.redis,
+    events::publish_to_accounts(
+        &state.redis_events,
         &remaining,
-        &WsServerBody::MemberLeft {
+        WsServerBody::MemberLeft {
             guild_id,
             account_id: me,
         },
@@ -467,10 +439,10 @@ async fn create_channel(
         kind: req.kind,
         name: req.name,
     };
-    publish_to_accounts(
-        &state.redis,
+    events::publish_to_accounts(
+        &state.redis_events,
         &member_ids(&state.pg, guild_id).await?,
-        &WsServerBody::ChannelCreated {
+        WsServerBody::ChannelCreated {
             guild_id,
             channel: channel.clone(),
         },
@@ -501,10 +473,10 @@ async fn delete_channel(
         .bind(channel_id)
         .execute(&state.pg)
         .await?;
-    publish_to_accounts(
-        &state.redis,
+    events::publish_to_accounts(
+        &state.redis_events,
         &member_ids(&state.pg, guild_id).await?,
-        &WsServerBody::ChannelDeleted {
+        WsServerBody::ChannelDeleted {
             guild_id,
             channel_id,
         },

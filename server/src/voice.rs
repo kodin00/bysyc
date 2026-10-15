@@ -195,9 +195,9 @@ pub async fn relay_signal(
     }
 
     if let Err(e) = events::publish_to_account(
-        &state.redis,
+        &state.redis_events,
         to,
-        &WsServerBody::CallSignal {
+        WsServerBody::CallSignal {
             call_id,
             from,
             kind,
@@ -273,9 +273,9 @@ where
 /// briefs by value; callers that also reply with them clone once.
 async fn publish_voice_state(state: &AppState, channel_id: i64, briefs: Vec<AccountBrief>) {
     if let Err(e) = events::publish_to_channel(
-        &state.redis,
+        &state.redis_events,
         channel_id,
-        &WsServerBody::VoiceState {
+        WsServerBody::VoiceState {
             channel_id,
             participants: briefs,
         },
