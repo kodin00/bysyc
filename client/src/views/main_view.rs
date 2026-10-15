@@ -331,7 +331,7 @@ fn logout(state: &Arc<Mutex<ClientState>>, store: &Arc<Mutex<Store>>, rt: &tokio
     guard(state).sign_out_local("Signed out.");
 
     if !username.is_empty() {
-        crate::store::keyring_delete(&username);
+        crate::store::token_delete(&username);
         let s = guard(store);
         let _ = s.del_setting("username");
     }

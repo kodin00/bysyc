@@ -1,6 +1,6 @@
 //! Key material storage and pickle-key derivation.
 //!
-//! The crypto engine never touches the filesystem or the OS keychain. All
+//! The crypto engine never touches the filesystem or OS secret storage. All
 //! persistent state (pickled Olm/Megolm sessions) is written through the
 //! [`KeyStore`] trait, which the app layer implements on top of its local
 //! database. The passphrase that protects the pickles is likewise supplied
@@ -75,7 +75,7 @@ pub(crate) const EXPORT_SALT: &[u8] = b"bysyc.export.v1";
 /// (`sha2`/`argon2` should be added — see the engine report), so this uses a
 /// self-contained, fully specified SHA-256 (below) in a salted iterated
 /// construction. In production the passphrase is a high-entropy random secret
-/// from the OS keychain, for which this is more than adequate; a human-chosen
+/// from the local secrets file, for which this is more than adequate; a human-chosen
 /// passphrase (identity export) would benefit from a memory-hard KDF later.
 pub(crate) fn derive_pickle_key(passphrase: &str, salt: &[u8]) -> [u8; 32] {
     let pass = passphrase.as_bytes();

@@ -675,7 +675,7 @@ fn set_connecting(state: &Arc<Mutex<ClientState>>, ctx: &Context, msg: String) {
 }
 
 /// Tear the session down everywhere on auth failure: local state first (the
-/// generation bump stops this loop), then the keychain.
+/// generation bump stops this loop), then the saved token.
 fn sign_out_everywhere(state: &Arc<Mutex<ClientState>>, ctx: &Context, reason: &str) {
     let username = {
         let mut st = guard(state);
@@ -684,7 +684,7 @@ fn sign_out_everywhere(state: &Arc<Mutex<ClientState>>, ctx: &Context, reason: &
         u
     };
     if let Some(u) = username {
-        crate::store::keyring_delete(&u);
+        crate::store::token_delete(&u);
     }
     ctx.request_repaint();
 }

@@ -1,7 +1,7 @@
 //! Login / registration view.
 //!
 //! Submitting flips the phase to `Connecting` and runs the auth call on the
-//! tokio runtime; the task persists the token (keychain) + instance URL and
+//! tokio runtime; the task persists the token (secrets file) + instance URL and
 //! username (SQLite settings) and starts the WS gateway on success, or
 //! restores the `Disconnected` phase with an error message on failure. The
 //! UI thread never blocks.
@@ -145,8 +145,8 @@ pub fn show(app: &mut BysycApp, ui: &mut egui::Ui) {
                 rt.spawn(async move {
                     // A different account signing in on this device owns the
                     // pickled crypto state; drop it before the new engine
-                    // opens the store (the pickle passphrase is keychain
-                    // scoped per username, so a stale pickle can only fail
+                    // opens the store (the pickle passphrase is per-username
+                    // in the secrets file, so a stale pickle can only fail
                     // to decrypt). ADR 0001: one device per account.
                     {
                         let s = guard(&store);
@@ -202,7 +202,7 @@ pub fn show(app: &mut BysycApp, ui: &mut egui::Ui) {
                                 let _ = s.set_setting("server_url", &base);
                                 let _ = s.set_setting("username", &tr.account.username);
                             }
-                            let _ = store::keyring_set(&tr.account.username, &tr.token);
+                            let _ = store::token_set(&tr.account.username, &tr.token);
                             // Publish the identity key (login path; register
                             // carried it in the request body already) and a
                             // batch of one-time keys so peers can open Olm

@@ -1,13 +1,16 @@
 //! Local persistence: SQLite (rusqlite, bundled) for the world cache and
-//! message history, plus the OS keychain for the session token.
+//! message history, plus a 0600 `secrets.json` in the same data dir for the
+//! session token and pickle passphrase (deliberately not the OS keychain —
+//! no keychain access prompts; the file keeps the passphrase outside the
+//! SQLite store it encrypts, per ADR 0001).
 //!
 //! All methods take `&self`; the whole [`Store`] is shared as
 //! `Arc<Mutex<Store>>` and locked briefly from the UI and network threads.
 //! Message rows carry a `plaintext` column that stays `NULL` until C2/C3
 //! decrypt and fill it via [`Store::set_plaintext`].
 
-use std::collections::HashSet;
-use std::path::Path;
+use std::collections::{BTreeMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use bysyc_common::protocol::{
@@ -167,7 +170,7 @@ impl Store {
 
     /// Drop every pickled crypto blob. Called when a different account signs
     /// in on this device: the pickles belong to exactly one account (the
-    /// pickle passphrase is keychain-scoped per username), so keeping them
+    /// pickle passphrase is per-username in the secrets file), so keeping them
     /// would make [`Engine::new`] fail with a wrong-passphrase error.
     pub fn clear_pickles(&self) -> Result<(), String> {
         self.conn
@@ -448,42 +451,88 @@ impl Store {
 }
 
 // ---------------------------------------------------------------------------
-// Keychain (session token + pickle passphrase)
+// Local secrets file (session token + pickle passphrase)
 // ---------------------------------------------------------------------------
 
-const KEYCHAIN_SERVICE: &str = "bysyc";
-/// Separate keychain service for the pickle passphrase (ADR 0001: the
-/// passphrase never lives in the SQLite file it protects).
-const KEYCHAIN_PICKLE_SERVICE: &str = "bysyc-pickle";
+/// Session tokens live under this service key in the secrets file.
+const TOKEN_SERVICE: &str = "bysyc-session";
+/// Separate service for the pickle passphrase (ADR 0001: the passphrase
+/// never lives in the SQLite file it protects).
+const PICKLE_SERVICE: &str = "bysyc-pickle";
 
-fn keyring_get_in(service: &str, account: &str) -> Option<String> {
-    let entry = keyring::Entry::new(service, account).ok()?;
-    entry.get_password().ok()
+/// `data_dir/secrets.json` — one JSON map of `"service/username"` → secret,
+/// written with mode 0600 on unix. Anything unreadable counts as empty (the
+/// token just falls back to the login view and the passphrase regenerates).
+fn secrets_path() -> Result<PathBuf, String> {
+    directories::ProjectDirs::from("", "", "bysyc")
+        .map(|d| d.data_dir().join("secrets.json"))
+        .ok_or_else(|| "cannot determine the platform data directory".to_string())
 }
 
-fn keyring_set_in(service: &str, account: &str, secret: &str) -> Result<(), String> {
-    keyring::Entry::new(service, account)
-        .map_err(|e| format!("keychain: {e}"))?
-        .set_password(secret)
-        .map_err(|e| format!("keychain: {e}"))
+fn secrets_load() -> BTreeMap<String, String> {
+    let Ok(path) = secrets_path() else {
+        return BTreeMap::new();
+    };
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
 }
 
-/// Store the session token for `username` in the OS keychain.
-pub fn keyring_set(username: &str, token: &str) -> Result<(), String> {
-    keyring_set_in(KEYCHAIN_SERVICE, username, token)
+fn secrets_store(map: &BTreeMap<String, String>) -> Result<(), String> {
+    let path = secrets_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("secrets: {e}"))?;
+    }
+    let json = serde_json::to_string_pretty(map).map_err(|e| format!("secrets: {e}"))?;
+    std::fs::write(&path, json).map_err(|e| format!("secrets: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+fn secret_get(service: &str, account: &str) -> Option<String> {
+    secrets_load().get(&format!("{service}/{account}")).cloned()
+}
+
+fn secret_set(service: &str, account: &str, secret: &str) -> Result<(), String> {
+    let mut map = secrets_load();
+    map.insert(format!("{service}/{account}"), secret.to_string());
+    secrets_store(&map)
+}
+
+fn secret_remove(service: &str, account: &str) {
+    let mut map = secrets_load();
+    if map.remove(&format!("{service}/{account}")).is_some() {
+        let _ = secrets_store(&map);
+    }
+}
+
+/// Store the session token for `username` in the local secrets file.
+pub fn token_set(username: &str, token: &str) -> Result<(), String> {
+    secret_set(TOKEN_SERVICE, username, token)
 }
 
 /// Read the stored session token, if any.
-pub fn keyring_get(username: &str) -> Option<String> {
-    keyring_get_in(KEYCHAIN_SERVICE, username)
+pub fn token_get(username: &str) -> Option<String> {
+    secret_get(TOKEN_SERVICE, username)
 }
 
-/// Delete the stored session token (best-effort). keyring 4 renamed this
-/// from `delete_password` to `delete_credential`.
-pub fn keyring_delete(username: &str) {
-    if let Ok(entry) = keyring::Entry::new(KEYCHAIN_SERVICE, username) {
-        let _ = entry.delete_credential();
-    }
+/// Delete the stored session token (best-effort).
+pub fn token_delete(username: &str) {
+    secret_remove(TOKEN_SERVICE, username);
+}
+
+/// Remove every secrets-file entry for `username` (token + pickle
+/// passphrase). The e2e harness uses this to clean up its throwaway
+/// accounts; the login flow uses [`token_delete`] instead (the passphrase
+/// must survive logout — it still protects the pickled identity).
+pub fn secret_delete_profile(username: &str) {
+    secret_remove(TOKEN_SERVICE, username);
+    secret_remove(PICKLE_SERVICE, username);
 }
 
 // ---------------------------------------------------------------------------
@@ -522,17 +571,17 @@ fn random_hex32() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// The passphrase protecting this account's pickles: looked up in the OS
-/// keychain under [`KEYCHAIN_PICKLE_SERVICE`]/`username`, generated and stored
-/// on first login. Losing it means losing the identity (ADR 0001 accepts
-/// that: one device per account, no key export in v1), so a failed keychain
-/// *write* is an error rather than a silent disposable secret.
+/// The passphrase protecting this account's pickles: looked up in the local
+/// secrets file under `PICKLE_SERVICE`/`username`, generated and stored on
+/// first login. Losing it means losing the identity (ADR 0001 accepts that:
+/// one device per account, no key export in v1), so a failed *write* is an
+/// error rather than a silent disposable secret.
 pub fn pickle_passphrase(username: &str) -> Result<String, String> {
-    if let Some(p) = keyring_get_in(KEYCHAIN_PICKLE_SERVICE, username) {
+    if let Some(p) = secret_get(PICKLE_SERVICE, username) {
         return Ok(p);
     }
     let p = random_hex32();
-    keyring_set_in(KEYCHAIN_PICKLE_SERVICE, username, &p)?;
+    secret_set(PICKLE_SERVICE, username, &p)?;
     Ok(p)
 }
 

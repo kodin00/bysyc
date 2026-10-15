@@ -945,7 +945,7 @@ impl ClientState {
         matches!(self.phase, Phase::LoggedIn(_))
     }
 
-    /// Tear the session down locally (does not touch the keychain — the
+    /// Tear the session down locally (does not touch the saved token — the
     /// caller does that where it knows the username). Bumps
     /// `ws_generation` so the owning WS loop stops reconnecting.
     pub fn sign_out_local(&mut self, reason: &str) {

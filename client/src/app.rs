@@ -46,9 +46,9 @@ impl BysycApp {
         app
     }
 
-    /// Stored instance URL + username + keychain token: validate via
+    /// Stored instance URL + username + saved token: validate via
     /// `GET /auth/me` and open the WS gateway on success; otherwise clear
-    /// the keychain entry and fall through to the login view.
+    /// the saved token and fall through to the login view.
     fn try_restore_session(&mut self, ctx: egui::Context) {
         let base = {
             let s = state::guard(&self.store);
@@ -61,7 +61,7 @@ impl BysycApp {
         let (Some(base), Some(username)) = (base, username) else {
             return;
         };
-        let Some(token) = crate::store::keyring_get(&username) else {
+        let Some(token) = crate::store::token_get(&username) else {
             return;
         };
 
@@ -103,7 +103,7 @@ impl BysycApp {
                         }
                         Err(e) => {
                             eprintln!("bysyc: {e}");
-                            crate::store::keyring_delete(&username);
+                            crate::store::token_delete(&username);
                             {
                                 let s = state::guard(&store);
                                 let _ = s.del_setting("username");
@@ -116,7 +116,7 @@ impl BysycApp {
                     }
                 }
                 Err(_) => {
-                    crate::store::keyring_delete(&username);
+                    crate::store::token_delete(&username);
                     {
                         let s = state::guard(&store);
                         let _ = s.del_setting("username");

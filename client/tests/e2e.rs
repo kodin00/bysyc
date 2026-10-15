@@ -236,15 +236,11 @@ impl Side {
     }
 
     /// Best-effort teardown: stop the gateway, invalidate the session,
-    /// remove both keychain entries. Temp dir goes away via Drop.
+    /// remove the account's secrets-file entries. Temp dir goes away via Drop.
     async fn shutdown(self) {
         self.ws_task.abort();
         let _ = self.net.logout().await;
-        for service in ["bysyc", "bysyc-pickle"] {
-            if let Ok(entry) = keyring::Entry::new(service, &self.username) {
-                let _ = entry.delete_credential();
-            }
-        }
+        bysyc_client::store::secret_delete_profile(&self.username);
     }
 
     /// Poll `cond` every 100 ms up to [`WAIT_SECS`]; on timeout fail with
