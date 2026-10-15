@@ -40,7 +40,12 @@ async fn main() -> anyhow::Result<()> {
     let app = routes::router(state);
 
     let addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| {
+        anyhow::anyhow!(
+            "{e} — binding {addr}: another server or docker container holds the port \
+             (check `docker ps`); change BIND_ADDR in .env to pick another one"
+        )
+    })?;
     tracing::info!("bysyc-server listening on {addr}");
     axum::serve(listener, app).await?;
     Ok(())
