@@ -49,12 +49,14 @@ services:
   coturn:
     image: coturn/coturn:alpine
     # Relay for peers behind hard NATs. Forwarded packets stay E2EE —
-    # TURN never holds keys. Production on a public host: add
-    # --external-ip and a real --listening-ip.
+    # TURN never holds keys. --external-ip defaults to loopback for dev;
+    # set COTURN_EXTERNAL_IP to the VPS public IP in .env for production.
     command: >
       -n --realm=bysyc --fingerprint --lt-cred-mech
       --user=bysyc:${TURN_PASSWORD:?set in .env}
       --min-port=49160 --max-port=49200
+      --external-ip=${COTURN_EXTERNAL_IP:-127.0.0.1}
+      --listening-ip=0.0.0.0
     ports:
       - "3478:3478/udp"
       - "3478:3478/tcp"

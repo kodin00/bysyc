@@ -13,5 +13,8 @@ RUN cargo build --release -p bysyc-server
 # bookworm's 2.36 fails with "GLIBC_2.38 not found").
 FROM debian:trixie-slim
 COPY --from=build /build/target/release/bysyc-server /usr/local/bin/bysyc-server
+# Drop root at runtime — state lives in Postgres/Redis/S3, never the fs.
+RUN useradd -r -u 1000 -M -s /usr/sbin/nologin bysyc
+USER bysyc
 EXPOSE 8080
 ENTRYPOINT ["bysyc-server"]

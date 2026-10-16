@@ -10,6 +10,7 @@ mod keys;
 mod mailbox;
 mod messages;
 mod passwd;
+mod rate_limit;
 mod routes;
 mod s3;
 mod session;
@@ -52,7 +53,11 @@ async fn main() -> anyhow::Result<()> {
         )
     })?;
     tracing::info!("bysyc-server listening on {addr}");
-    axum::serve(listener, app).await?;
+    // into_make_service_with_connect_info injects the peer's SocketAddr into
+    // request extensions, so the auth rate-limiter (rate_limit.rs) can key on
+    // the real client IP even without a reverse proxy setting X-Forwarded-For.
+    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
+        .await?;
     Ok(())
 }
 

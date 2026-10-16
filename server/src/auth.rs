@@ -2,8 +2,13 @@
 //!
 //! Sessions and the [`Authed`] extractor live in [`crate::session`].
 
-use axum::extract::State;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
+
+use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::middleware::{from_fn_with_state, Next};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use bysyc_common::protocol::{
@@ -13,14 +18,46 @@ use bysyc_common::protocol::{
 use crate::db::AppState;
 use crate::error::{ApiError, ApiResult};
 use crate::passwd;
+use crate::rate_limit::RateLimiter;
 use crate::session::{self, Authed};
 
-pub fn router() -> Router<AppState> {
+pub fn router(rate_limiter: Arc<RateLimiter>) -> Router<AppState> {
+    // rate_layer only covers routes added before it (register/login);
+    // logout and me are appended afterwards and stay unthrottled.
     Router::new()
         .route("/auth/register", post(register))
         .route("/auth/login", post(login))
+        .route_layer(from_fn_with_state(rate_limiter, rate_limit_middleware))
         .route("/auth/logout", post(logout))
         .route("/auth/me", get(me))
+}
+
+/// Per-IP throttle on the login/register routes. ConnectInfo is the direct
+/// peer when present (local dev); behind Caddy the real client is the first
+/// hop of `X-Forwarded-For`. No IP at all means allow — don't break local dev
+/// without connect-info serving.
+async fn rate_limit_middleware(
+    State(rl): State<Arc<RateLimiter>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if let Some(ip) = client_ip(&req) {
+        if !rl.check(ip) {
+            return (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response();
+        }
+    }
+    next.run(req).await
+}
+
+fn client_ip(req: &Request) -> Option<IpAddr> {
+    if let Some(ci) = req.extensions().get::<ConnectInfo<SocketAddr>>() {
+        return Some(ci.0.ip());
+    }
+    req.headers()
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .and_then(|s| s.trim().parse::<IpAddr>().ok())
 }
 
 /// (id, username, identity_key, created_at_ms)
