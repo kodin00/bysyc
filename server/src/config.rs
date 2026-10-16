@@ -12,9 +12,6 @@ pub struct Config {
     pub turn_addr: String,
     pub turn_user: String,
     pub turn_password: String,
-    /// First-boot admin account (created only when the accounts table is empty).
-    pub admin_username: Option<String>,
-    pub admin_password: Option<String>,
     /// Ciphertext-size cap per attachment, from `ATTACHMENT_MAX_MB` (default 50).
     pub attachment_max_bytes: u64,
     /// Postgres pool ceiling, from `DB_MAX_CONNECTIONS` (default 16).
@@ -33,12 +30,6 @@ impl Config {
             turn_addr: env("TURN_ADDR", "localhost:3478"),
             turn_user: env("TURN_USER", "bysyc"),
             turn_password: env("TURN_PASSWORD", "bysyc"),
-            admin_username: std::env::var("ADMIN_USERNAME")
-                .ok()
-                .filter(|s| !s.is_empty()),
-            admin_password: std::env::var("ADMIN_PASSWORD")
-                .ok()
-                .filter(|s| !s.is_empty()),
             attachment_max_bytes: env("ATTACHMENT_MAX_MB", "50").parse::<u64>().unwrap_or(50)
                 * 1024
                 * 1024,

@@ -95,6 +95,8 @@ pub struct AccountInfo {
     pub identity_key: String,
     /// When the Account was created, Unix epoch milliseconds.
     pub created_at_ms: i64,
+    /// True for the Instance's single admin (the first account to register).
+    pub is_admin: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -902,6 +904,7 @@ mod tests {
             username: "alice".into(),
             identity_key: "aWRlbnRpdHlLZXk=".into(),
             created_at_ms: 1_700_000_000_000,
+            is_admin: true,
         }
     }
 

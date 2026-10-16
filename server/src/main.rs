@@ -37,7 +37,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let state = boot(&config).await?;
-    db::bootstrap_admin(&state).await?;
+    db::bootstrap(&state).await?;
     // Shared gateway subscribers: a fixed pool of Redis pub/sub connections
     // total, no matter how many WebSocket connections are live.
     let workers = ws_event_workers();

@@ -30,6 +30,7 @@ pub fn router(rate_limiter: Arc<RateLimiter>) -> Router<AppState> {
         .route_layer(from_fn_with_state(rate_limiter, rate_limit_middleware))
         .route("/auth/logout", post(logout))
         .route("/auth/me", get(me))
+        .route("/auth/invites", post(create_invite))
 }
 
 /// Per-IP throttle on the login/register routes. ConnectInfo is the direct
@@ -60,15 +61,16 @@ fn client_ip(req: &Request) -> Option<IpAddr> {
         .and_then(|s| s.trim().parse::<IpAddr>().ok())
 }
 
-/// (id, username, identity_key, created_at_ms)
-type AccountRow = (i64, String, Option<String>, i64);
+/// (id, username, identity_key, created_at_ms, is_admin)
+type AccountRow = (i64, String, Option<String>, i64, bool);
 
-fn account_info((id, username, identity_key, created_at_ms): AccountRow) -> AccountInfo {
+fn account_info((id, username, identity_key, created_at_ms, is_admin): AccountRow) -> AccountInfo {
     AccountInfo {
         id,
         username,
         identity_key: identity_key.unwrap_or_default(),
         created_at_ms,
+        is_admin,
     }
 }
 
@@ -140,14 +142,25 @@ async fn register(
         ));
     }
 
+    // First account to register becomes the Instance's single admin. The
+    // invite FOR UPDATE lock above serializes redemptions of the one
+    // first-registration token bootstrap minted, so on a fresh DB exactly one
+    // registration observes count == 0.
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM accounts")
+        .fetch_one(&mut *tx)
+        .await?;
+    let is_admin = count == 0;
+
     let row: AccountRow = sqlx::query_as(
-        "INSERT INTO accounts (username, password_hash, identity_key) \
-         VALUES ($1, $2, $3) \
-         RETURNING id, username, identity_key, (EXTRACT(EPOCH FROM created_at) * 1000)::bigint",
+        "INSERT INTO accounts (username, password_hash, identity_key, is_admin) \
+         VALUES ($1, $2, $3, $4) \
+         RETURNING id, username, identity_key, \
+                   (EXTRACT(EPOCH FROM created_at) * 1000)::bigint, is_admin",
     )
     .bind(&req.username)
     .bind(&password_hash)
     .bind(&req.identity_key)
+    .bind(is_admin)
     .fetch_one(&mut *tx)
     .await?;
 
@@ -158,7 +171,12 @@ async fn register(
         .await?;
 
     tx.commit().await?;
-    tracing::info!(account_id = row.0, username = %req.username, "account registered");
+    tracing::info!(
+        account_id = row.0,
+        username = %req.username,
+        admin = is_admin,
+        "account registered"
+    );
 
     let token = session::create(&state.redis, row.0).await?;
     Ok(Json(TokenResponse {
@@ -172,15 +190,15 @@ async fn login(
     Json(req): Json<LoginRequest>,
 ) -> ApiResult<Json<TokenResponse>> {
     // Unknown user and wrong password are indistinguishable on the wire.
-    let row: Option<(i64, String, String, Option<String>, i64)> = sqlx::query_as(
+    let row: Option<(i64, String, String, Option<String>, i64, bool)> = sqlx::query_as(
         "SELECT id, username, password_hash, identity_key, \
-                (EXTRACT(EPOCH FROM created_at) * 1000)::bigint \
+                (EXTRACT(EPOCH FROM created_at) * 1000)::bigint, is_admin \
          FROM accounts WHERE username = $1",
     )
     .bind(&req.username)
     .fetch_optional(&state.pg)
     .await?;
-    let Some((id, username, password_hash, identity_key, created_at_ms)) = row else {
+    let Some((id, username, password_hash, identity_key, created_at_ms, is_admin)) = row else {
         tracing::info!(username = %req.username, "login failed: unknown account");
         return Err(ApiError::unauthorized("invalid credentials"));
     };
@@ -203,6 +221,7 @@ async fn login(
             username,
             identity_key: identity_key.unwrap_or_default(),
             created_at_ms,
+            is_admin,
         },
     }))
 }
@@ -225,7 +244,8 @@ async fn logout(
 
 async fn me(State(state): State<AppState>, Authed(me): Authed) -> ApiResult<Json<AccountInfo>> {
     let row: Option<AccountRow> = sqlx::query_as(
-        "SELECT id, username, identity_key, (EXTRACT(EPOCH FROM created_at) * 1000)::bigint \
+        "SELECT id, username, identity_key, \
+                  (EXTRACT(EPOCH FROM created_at) * 1000)::bigint, is_admin \
          FROM accounts WHERE id = $1",
     )
     .bind(me)
@@ -233,4 +253,26 @@ async fn me(State(state): State<AppState>, Authed(me): Authed) -> ApiResult<Json
     .await?;
     let row = row.ok_or_else(|| ApiError::unauthorized("account no longer exists"))?;
     Ok(Json(account_info(row)))
+}
+
+/// `POST /auth/invites` — admin-only: mint a fresh registration invite code.
+/// Non-admins (or a stale session whose account was deleted) get 403.
+async fn create_invite(
+    State(state): State<AppState>,
+    Authed(me): Authed,
+) -> ApiResult<Json<serde_json::Value>> {
+    let is_admin: Option<bool> =
+        sqlx::query_scalar("SELECT is_admin FROM accounts WHERE id = $1")
+            .bind(me)
+            .fetch_optional(&state.pg)
+            .await?;
+    if is_admin != Some(true) {
+        return Err(ApiError::forbidden("admin only"));
+    }
+    let code = crate::db::new_invite_code();
+    sqlx::query("INSERT INTO registration_invites(code) VALUES ($1)")
+        .bind(&code)
+        .execute(&state.pg)
+        .await?;
+    Ok(Json(serde_json::json!({ "code": code })))
 }

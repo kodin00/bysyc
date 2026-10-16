@@ -80,12 +80,11 @@ POSTGRES_PASSWORD=<strong random>
 TURN_PASSWORD=<strong random>
 S3_ACCESS_KEY=<strong random>
 S3_SECRET_KEY=<strong random>
-ADMIN_USERNAME=admin
-ADMIN_PASSWORD=<strong random>
 
-# The public hostname clients dial the TURN relay on — must be reachable
-# from the public internet, not localhost:
+# Public address clients dial the TURN relay on (reachable from the internet):
 TURN_ADDR=bysyc.example.com:3478
+# coturn advertises this as its relay candidate address (the VPS public IP):
+COTURN_EXTERNAL_IP=<VPS PUBLIC IP>
 ```
 
 Put the **same** `S3_ACCESS_KEY` / `S3_SECRET_KEY` into the SeaweedFS S3
@@ -164,14 +163,16 @@ docker compose ps              # all services healthy/started
 curl -s https://bysyc.example.com/healthz   # → ok
 ```
 
-First boot against a fresh database creates the admin account from `.env` and
-logs one invite code — grab it from the logs:
+First boot against a fresh database prints a first-registration token to the
+server logs — the first person to register with it becomes the Instance
+admin:
 
 ```bash
-docker compose logs server | grep -i invite
+docker compose logs server | grep -i "first-registration"
 ```
 
-Mint more invites anytime:
+The admin can then mint further single-use invite codes from the client's
+Settings → Invites panel. The operator can also mint one from the host:
 
 ```bash
 set -a; . ./.env; set +a
@@ -237,9 +238,9 @@ on the edge first.
 - All secrets in `.env` are real — `chmod 600 .env` (the client already keeps
   its secrets in a 0600 file; do the same server-side). For real rotation,
   encrypt at rest with `sops`/`age` so a disk-image leak doesn't hand over all
-  five. Back `.env` up somewhere safe; losing `POSTGRES_PASSWORD` locks you
+  four. Back `.env` up somewhere safe; losing `POSTGRES_PASSWORD` locks you
   out of your own DB.
-- **Rotate on compromise:** all 5 secrets. `POSTGRES_PASSWORD` rotation also
+- **Rotate on compromise:** all 4 secrets. `POSTGRES_PASSWORD` rotation also
   needs `ALTER USER bysyc PASSWORD '...'` in the DB — changing `.env` alone
   won't update the existing role.
 - The TURN credential is one static shared user (`bysyc` / `TURN_PASSWORD`).

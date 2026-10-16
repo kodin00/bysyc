@@ -335,7 +335,7 @@ pub fn show(app: &mut BysycApp, ui: &mut egui::Ui) {
     invite_window(state, &ctx);
 
     // Audio device settings (output/input pickers).
-    crate::views::settings::settings_window(&ctx, state, store, &mut main_view.settings_open);
+    crate::views::settings::settings_window(&ctx, state, store, rt, &mut main_view.settings_open);
 
     // C5 renders the call overlay from here.
     crate::call::ui::overlay(&ctx, state, rt);

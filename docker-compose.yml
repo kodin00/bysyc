@@ -76,8 +76,6 @@ services:
       S3_SECRET_KEY: ${S3_SECRET_KEY:?set in .env}
       TURN_ADDR: ${TURN_ADDR:-localhost:3478}
       TURN_PASSWORD: ${TURN_PASSWORD:?set in .env}
-      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
-      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?set in .env}
     depends_on:
       postgres:
         condition: service_healthy

@@ -977,7 +977,8 @@ async fn ready_snapshot(state: &AppState, me: i64) -> Result<Ready, ApiError> {
     ) = tokio::join!(
         sqlx::query(
             "SELECT id, username, identity_key, \
-                    (EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_at_ms \
+                    (EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_at_ms, \
+                    is_admin \
              FROM accounts WHERE id = $1",
         )
         .bind(me)
@@ -1040,6 +1041,7 @@ async fn ready_snapshot(state: &AppState, me: i64) -> Result<Ready, ApiError> {
             .try_get::<Option<String>, _>("identity_key")?
             .unwrap_or_default(),
         created_at_ms: row.try_get("created_at_ms")?,
+        is_admin: row.try_get("is_admin")?,
     };
     let mut friends = friends_res?;
     let mut incoming_requests = incoming_requests_res?;

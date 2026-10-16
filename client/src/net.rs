@@ -23,6 +23,7 @@
 //! | `POST /auth/login` | [`LoginRequest`] → [`TokenResponse`] |
 //! | `POST /auth/logout` | invalidate the session token |
 //! | `GET /auth/me` | [`AccountInfo`] (session validation) |
+//! | `POST /auth/invites` | admin-only: mint a single-use registration invite → `{ "code": <string> }` |
 //! | `GET /accounts/by-username/{username}` | username lookup → [`AccountBrief`] |
 //! | `GET /friends` | [`FriendList`] |
 //! | `PUT /keys/identity` | `{"identity_key":<b64>}` → 204 (keep the published key fresh) |
@@ -192,6 +193,17 @@ impl Net {
     pub async fn me(&self) -> Result<bysyc_common::protocol::AccountInfo, String> {
         self.exec(self.authed(reqwest::Method::GET, "/auth/me"))
             .await
+    }
+
+    /// Admin-only: mint a single-use registration invite code. Returns the
+    /// bare code; non-admin callers get a 403 from the server.
+    pub async fn create_invite(&self) -> Result<String, String> {
+        let v: serde_json::Value =
+            self.exec(self.authed(reqwest::Method::POST, "/auth/invites")).await?;
+        v.get("code")
+            .and_then(|c| c.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| "invite response missing code".into())
     }
 
     /// Resolve a username to its [`AccountBrief`] (client-assumed endpoint —

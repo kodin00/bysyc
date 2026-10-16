@@ -3,7 +3,6 @@
 //! bodies are owned by S1 and replace the no-op stubs below.
 
 use crate::config::Config;
-use crate::passwd;
 use rand::distr::{Alphanumeric, SampleString};
 
 #[derive(Clone)]
@@ -85,9 +84,22 @@ CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_id);
 CREATE INDEX IF NOT EXISTS idx_voice_participants_account ON voice_participants(account_id);
 "#;
 
+/// Migration 4: `is_admin` flag on accounts. The first account to register
+/// (against the boot-minted first-registration token) is the Instance's
+/// single admin; `DEFAULT FALSE` backfills every existing row as a normal
+/// account, so upgrading an already-populated instance changes nothing.
+const MIGRATION_4: &str = r#"
+ALTER TABLE accounts ADD COLUMN is_admin BOOLEAN NOT NULL DEFAULT FALSE;
+"#;
+
 /// Every migration in application order: `(version, sql)`. Append-only —
 /// never edit or reorder a shipped entry.
-const MIGRATIONS: &[(i64, &str)] = &[(1, MIGRATION_1), (2, MIGRATION_2), (3, MIGRATION_3)];
+const MIGRATIONS: &[(i64, &str)] = &[
+    (1, MIGRATION_1),
+    (2, MIGRATION_2),
+    (3, MIGRATION_3),
+    (4, MIGRATION_4),
+];
 
 /// S1: apply all embedded migrations in order, guarded by schema_migrations.
 ///
@@ -134,12 +146,12 @@ pub async fn migrate(pool: &sqlx::PgPool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// S1: when accounts is empty and ADMIN_USERNAME/ADMIN_PASSWORD are set,
-/// create the admin account plus a registration invite printed to stdout.
-///
-/// No-op once any account exists; warns (and does nothing) when the table is
-/// empty but the credentials are only partially configured.
-pub async fn bootstrap_admin(state: &AppState) -> anyhow::Result<()> {
+/// On a fresh database (no accounts yet), mint the single first-registration
+/// token and print it. The operator hands it to whoever should become the
+/// admin; redeeming it via `POST /auth/register` makes that account the admin
+/// (first registrant wins, see `auth::register`). Never reprints once any
+/// account exists — an already-bootstrapped instance is left alone.
+pub async fn bootstrap(state: &AppState) -> anyhow::Result<()> {
     let accounts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM accounts")
         .fetch_one(&state.pg)
         .await?;
@@ -147,31 +159,19 @@ pub async fn bootstrap_admin(state: &AppState) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let (username, password) = match (&state.config.admin_username, &state.config.admin_password) {
-        (Some(u), Some(p)) => (u.as_str(), p.as_str()),
-        _ => {
-            tracing::warn!(
-                "accounts table is empty but ADMIN_USERNAME/ADMIN_PASSWORD are not both set; \
-                 no admin account was created"
-            );
-            return Ok(());
-        }
-    };
-
-    let mut tx = state.pg.begin().await?;
-    sqlx::query("INSERT INTO accounts(username, password_hash) VALUES ($1, $2)")
-        .bind(username)
-        .bind(passwd::hash_password(password))
-        .execute(&mut *tx)
-        .await?;
     let code = new_invite_code();
+    let mut tx = state.pg.begin().await?;
     sqlx::query("INSERT INTO registration_invites(code) VALUES ($1)")
         .bind(&code)
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
 
-    tracing::info!("admin \"{username}\" created; registration invite code: {code}");
+    // Bare line on stdout so the operator can copy it straight out of
+    // `docker compose logs` without scrubbing prose; the tracing line is
+    // for structured logs / log shippers.
+    println!("first-registration token (sign up with it to become the admin): {code}");
+    tracing::info!("first-registration token: {code}");
     Ok(())
 }
 
@@ -191,7 +191,7 @@ pub async fn make_invite(state: &AppState) -> anyhow::Result<()> {
 /// Fresh invite code: 22 chars from `[a-zA-Z0-9]` via the OS CSPRNG
 /// (62^22 ≈ 2^131 — collision with an existing code is not a practical
 /// concern).
-fn new_invite_code() -> String {
+pub(crate) fn new_invite_code() -> String {
     Alphanumeric.sample_string(&mut rand::rng(), 22)
 }
 

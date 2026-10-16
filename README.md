@@ -14,7 +14,7 @@ Everything in Docker:
 ```
 mise install
 cp .env.example .env      # set POSTGRES_PASSWORD, TURN_PASSWORD, S3 keys,
-                          # ADMIN_USERNAME/PASSWORD, TURN_ADDR
+                          # TURN_ADDR (and COTURN_EXTERNAL_IP on a VPS)
 # put the same S3 keys into deploy/seaweedfs/s3.json (accessKey/secretKey)
 docker compose up -d --build
 curl localhost:8080/healthz   # → ok
@@ -33,8 +33,11 @@ mise run dev-client       # another terminal
 ## Adding people
 
 Registration is invite-gated; every code works exactly once. First boot
-against a fresh database creates the admin account from `.env` and logs one
-invite code — check the server logs. Mint more from the repo root:
+against a fresh database prints a first-registration token to the server
+logs (`docker compose logs server`) — the first person to register with it
+becomes the Instance admin. The admin mints further single-use invite codes
+from the client's Settings → Invites panel; the operator can also mint one
+from the host:
 
 ```
 set -a; . ./.env; set +a; cargo run -q -p bysyc-server -- make-invite

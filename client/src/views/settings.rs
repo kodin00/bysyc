@@ -19,6 +19,7 @@ pub fn settings_window(
     ctx: &egui::Context,
     state: &Arc<Mutex<ClientState>>,
     store: &Arc<Mutex<Store>>,
+    rt: &tokio::runtime::Handle,
     open: &mut bool,
 ) {
     let mut esc = false;
@@ -91,6 +92,47 @@ pub fn settings_window(
 
             ui.add_space(8.0);
             ui.weak("Changes apply to the next call.");
+
+            // ---- Invites (admin only) ----
+            let is_admin = guard(state).main().map_or(false, |m| m.account.is_admin);
+            if is_admin {
+                ui.add_space(10.0);
+                ui.heading("Invites");
+                ui.add_space(4.0);
+                ui.label("Mint a single-use code a friend can register with.");
+                let code = guard(state).main().and_then(|m| m.reg_invite.clone());
+                if let Some(code) = code.as_deref() {
+                    ui.horizontal(|ui| {
+                        ui.monospace(code);
+                        if ui.button("Copy").clicked() {
+                            ui.ctx().output_mut(|o| {
+                                o.commands.push(egui::OutputCommand::CopyText(code.to_string()));
+                            });
+                        }
+                    });
+                }
+                if ui.button("Create invite").clicked() {
+                    if let Some(h) = crate::views::main_view::net_handle(state) {
+                        let s = Arc::clone(state);
+                        let c = ctx.clone();
+                        rt.spawn(async move {
+                            match h.net.create_invite().await {
+                                Ok(code) => {
+                                    if let Some(m) = guard(&s).main_mut() {
+                                        m.reg_invite = Some(code);
+                                    }
+                                }
+                                Err(e) => {
+                                    if let Some(m) = guard(&s).main_mut() {
+                                        m.notice = Some(e);
+                                    }
+                                }
+                            }
+                            c.request_repaint();
+                        });
+                    }
+                }
+            }
         });
     if esc {
         *open = false;

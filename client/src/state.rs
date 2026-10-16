@@ -224,6 +224,8 @@ pub struct MainState {
     pub audio_input: Option<String>,
     /// Chosen speaker/output device name (None = system default).
     pub audio_output: Option<String>,
+    /// Last admin-minted registration invite code (shown + copied in Settings).
+    pub reg_invite: Option<String>,
 }
 
 impl MainState {
@@ -277,6 +279,7 @@ impl MainState {
             img_failed: HashSet::new(),
             audio_input: None,
             audio_output: None,
+            reg_invite: None,
         }
     }
 
@@ -678,6 +681,7 @@ mod tests {
             username: name.into(),
             identity_key: format!("identity-{id}"),
             created_at_ms: 0,
+            is_admin: false,
         }
     }
 
