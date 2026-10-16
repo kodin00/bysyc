@@ -168,6 +168,7 @@ pub fn join_voice_channel(
         return;
     };
     let me_id = main.account.id;
+    let (audio_in, audio_out) = (main.audio_input_device(), main.audio_output_device());
     let Some(net) = main.net.clone() else {
         return;
     };
@@ -188,6 +189,8 @@ pub fn join_voice_channel(
             private_peer: None,
             auto_offer_private: false,
             initial_offer: None,
+            input: audio_in,
+            output: audio_out,
             net,
             rt: Some(rt.clone()),
         },
@@ -215,6 +218,7 @@ pub fn start_private_call(
         return;
     };
     let me_id = main.account.id;
+    let (audio_in, audio_out) = (main.audio_input_device(), main.audio_output_device());
     let Some(net) = main.net.clone() else {
         return;
     };
@@ -233,6 +237,8 @@ pub fn start_private_call(
             // simultaneous case either way).
             auto_offer_private: true,
             initial_offer: None,
+            input: audio_in,
+            output: audio_out,
             net,
             rt: Some(rt.clone()),
         },
@@ -254,6 +260,7 @@ pub fn accept_incoming(state: &Arc<Mutex<ClientState>>, rt: &tokio::runtime::Han
         return;
     };
     let me_id = main.account.id;
+    let (audio_in, audio_out) = (main.audio_input_device(), main.audio_output_device());
     let Some(net) = main.net.clone() else {
         return;
     };
@@ -295,6 +302,8 @@ pub fn accept_incoming(state: &Arc<Mutex<ClientState>>, rt: &tokio::runtime::Han
             private_peer: Some(from),
             auto_offer_private: false,
             initial_offer: Some((from_id, sdp)),
+            input: audio_in,
+            output: audio_out,
             net,
             rt: Some(rt.clone()),
         },

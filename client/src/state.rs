@@ -218,6 +218,12 @@ pub struct MainState {
     /// Attachment ids whose fetch or decode failed terminally (render an
     /// "unavailable" note instead of retrying every frame).
     pub img_failed: HashSet<i64>,
+    /// Chosen microphone device name (None = system default). Loaded from
+    /// the local store at login and edited by the settings view; read by
+    /// the call engine when it opens its cpal streams.
+    pub audio_input: Option<String>,
+    /// Chosen speaker/output device name (None = system default).
+    pub audio_output: Option<String>,
 }
 
 impl MainState {
@@ -269,7 +275,21 @@ impl MainState {
             uploads: Vec::new(),
             img_inflight: HashSet::new(),
             img_failed: HashSet::new(),
+            audio_input: None,
+            audio_output: None,
         }
+    }
+
+    /// The persisted microphone device name, if the user picked one in
+    /// settings (None = system default). Read by [`crate::call`] when it
+    /// opens its input stream.
+    pub fn audio_input_device(&self) -> Option<String> {
+        self.audio_input.clone()
+    }
+
+    /// The persisted speaker/output device name, if the user picked one.
+    pub fn audio_output_device(&self) -> Option<String> {
+        self.audio_output.clone()
     }
 
     /// The channel id the main view should render, if any.
@@ -1550,6 +1570,11 @@ pub fn apply_server_msg(
             }
             if let Some(m) = st.main_mut() {
                 m.seed_world();
+                // Load the user's audio device picks (set in the settings
+                // view) so the call engine honours them when it next opens
+                // its cpal streams. None => system default.
+                m.audio_input = guard(store).audio_input();
+                m.audio_output = guard(store).audio_output();
                 // The crypto tail stages onto the worker, in the order the
                 // synchronous path used to run it: the engine must exist
                 // before the mailbox is processed (session shares ride in

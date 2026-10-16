@@ -56,7 +56,7 @@ fn main() -> eframe::Result<()> {
         .with_inner_size([480.0, 560.0])
         // Floor for the three-column layout + composer: below this the
         // side columns (each ≥ 140 px) starve the chat area.
-        .with_min_inner_size([480.0, 360.0])
+        .with_min_inner_size([820.0, 520.0])
         .with_title("bysyc");
     let options = eframe::NativeOptions {
         // See `load_icon` for the macOS caveat (icon applies on Windows/Linux).

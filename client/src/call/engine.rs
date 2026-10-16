@@ -38,7 +38,7 @@
 use std::cell::Cell;
 use std::io::ErrorKind;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -114,6 +114,9 @@ pub struct UiState {
     /// even a panic unwind). The overlay polls it and tears the registry
     /// entry down, so the chrome cannot linger over a dead session.
     pub finished: AtomicBool,
+    /// Max round-trip time across peers (str0m PeerStats), published every
+    /// stats interval; 0 until the first report arrives.
+    pub rtt_ms: AtomicU64,
 }
 
 impl UiState {
@@ -127,6 +130,7 @@ impl UiState {
             status: Mutex::new(String::new()),
             relayed: AtomicBool::new(false),
             finished: AtomicBool::new(false),
+            rtt_ms: AtomicU64::new(0),
         }
     }
 
@@ -180,6 +184,10 @@ pub struct SessionConfig {
     pub initial_offer: Option<(i64, String)>,
     pub net: NetHandle,
     pub rt: Option<tokio::runtime::Handle>,
+    /// Preferred audio input device name (cpal), if any.
+    pub input: Option<String>,
+    /// Preferred audio output device name (cpal), if any.
+    pub output: Option<String>,
 }
 
 /// Signal the core wants relayed to a peer.
@@ -208,6 +216,8 @@ struct Peer {
     decoder: Option<PeerDecoder>,
     sink: Arc<PeerSink>,
     connected: bool,
+    /// Latest RTT from str0m PeerStats; None until the first report.
+    rtt: Option<Duration>,
     /// Candidates received before negotiation completed; flushed on
     /// `MediaAdded`.
     remote_candidates: Vec<String>,
@@ -373,6 +383,7 @@ impl SessionCore {
             .set_rtp_mode(true)
             .clear_codecs()
             .enable_opus(true, false)
+            .set_stats_interval(Some(std::time::Duration::from_secs(1)))
             .build(self.clock0);
         let sink = PeerSink::new();
         let mut peer = Peer {
@@ -384,6 +395,7 @@ impl SessionCore {
             decoder: None,
             sink: sink.clone(),
             connected: false,
+            rtt: None,
             remote_candidates: Vec::new(),
         };
         seed_candidates(
@@ -465,6 +477,7 @@ impl SessionCore {
             .set_rtp_mode(true)
             .clear_codecs()
             .enable_opus(true, false)
+            .set_stats_interval(Some(std::time::Duration::from_secs(1)))
             .build(self.clock0);
         let sink = PeerSink::new();
         let mut peer = Peer {
@@ -476,6 +489,7 @@ impl SessionCore {
             decoder: None,
             sink: sink.clone(),
             connected: false,
+            rtt: None,
             remote_candidates: Vec::new(),
         };
         seed_candidates(
@@ -782,6 +796,11 @@ impl SessionCore {
             Event::Closed => {
                 peer.connected = false;
             }
+            Event::PeerStats(p) => {
+                if let Some(rtt) = p.rtt {
+                    peer.rtt = Some(rtt);
+                }
+            }
             _ => {}
         }
         let _ = now;
@@ -1081,7 +1100,7 @@ fn run(cfg: SessionConfig, rx: std::sync::mpsc::Receiver<SessionCmd>, ui: Arc<Ui
 
     // Audio graph. The mute flag is owned by the UiState and shared with the
     // input callback, so the overlay toggle takes effect at the source.
-    let audio = match AudioIo::open(ui.muted.clone()) {
+    let audio = match AudioIo::open(ui.muted.clone(), cfg.input.clone(), cfg.output.clone()) {
         Ok(a) => {
             ui.set_audio_error(None);
             Some(a)
@@ -1362,6 +1381,13 @@ fn refresh_ui(
         connected: parts.iter().filter(|p| p.connected).count(),
     };
     *ui.participants.lock().unwrap_or_else(|p| p.into_inner()) = parts;
+    let max_rtt_ms = core
+        .peers
+        .iter()
+        .filter_map(|p| p.rtt.as_ref().map(|d| d.as_millis() as u64))
+        .max()
+        .unwrap_or(0);
+    ui.rtt_ms.store(max_rtt_ms, Ordering::Relaxed);
     if *last_key == Some(key) {
         return;
     }

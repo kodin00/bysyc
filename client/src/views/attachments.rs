@@ -1461,14 +1461,42 @@ pub fn image_popup(
     };
 
     let mut open = true;
+    // Fit the lightbox to a large fraction of the screen (not a fixed px
+    // cap) so big images stop getting cut off on smaller windows. Resizable
+    // lets the user pull it wider/taller; default_size sets the first-frame
+    // size before content layout takes over.
+    // egui 0.36 exposes the window content rect via InputState, not a
+    // Context::screen_rect; inner_rect is the viewport's content area (None
+    // on Android/Wayland), so fall back to the legacy px cap there.
+    let screen_max = ctx
+        .input(|i| i.viewport().inner_rect)
+        .map(|r| r.size() * 0.85)
+        .unwrap_or(POPUP_IMAGE_PX);
+    // ESC intent is stashed here and applied after `.show`, because `.open`
+    // already holds `&mut open` for the window's lifetime — the closure can't
+    // also borrow `open` mutably. A separate flag sidesteps that.
+    let mut esc = false;
     egui::Window::new(popup.name.as_str())
         .id(egui::Id::new(("attachment_popup", att_id)))
         .open(&mut open)
         .collapsible(false)
+        .default_size(screen_max)
+        .resizable(true)
         .show(ctx, |ui| {
+            // ESC closes the lightbox; consume_key so it doesn't leak to
+            // other handlers. We set `esc` (not `open`) here — see the note
+            // above; `open` is borrowed by `.open`. The `!open` guard below
+            // clears popup state once `esc` is folded back into `open`.
+            if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+                esc = true;
+            }
             if let Some(tex) = mv.image_cache.get(&att_id).cloned() {
                 mv.touch_image(att_id);
-                ui.add(egui::Image::new(&tex).max_size(POPUP_IMAGE_PX));
+                // Fit the image to the live window content area minus the
+                // Save/Open button row below. Image::max_size preserves
+                // aspect ratio and never upscales, so it can't overflow.
+                let avail = ui.available_size() - egui::vec2(0.0, 40.0);
+                ui.add(egui::Image::new(&tex).max_size(avail));
             } else {
                 let (inflight, failed) = {
                     let st = guard(state);
@@ -1505,6 +1533,9 @@ pub fn image_popup(
                 }
             });
         });
+    if esc {
+        open = false;
+    }
     if !open {
         mv.image_popup = None;
     }

@@ -141,6 +141,33 @@ impl Store {
         Ok(())
     }
 
+    // -- audio device preferences -----------------------------------------
+
+    /// Persisted chosen microphone device name (None = system default).
+    pub fn audio_input(&self) -> Option<String> {
+        self.setting("audio_input")
+    }
+
+    /// Persisted chosen speaker/output device name (None = system default).
+    pub fn audio_output(&self) -> Option<String> {
+        self.setting("audio_output")
+    }
+
+    /// `None` clears the stored preference (revert to default).
+    pub fn set_audio_input(&self, name: Option<&str>) -> Result<(), String> {
+        match name {
+            Some(v) => self.set_setting("audio_input", v),
+            None => self.del_setting("audio_input"),
+        }
+    }
+
+    pub fn set_audio_output(&self, name: Option<&str>) -> Result<(), String> {
+        match name {
+            Some(v) => self.set_setting("audio_output", v),
+            None => self.del_setting("audio_output"),
+        }
+    }
+
     // -- pickles (C2: generic encrypted-key-pickle store) --------------------
 
     /// Load the pickled blob stored under `scope` (e.g. an account-scoped

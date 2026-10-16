@@ -375,11 +375,79 @@ pub struct AudioIo {
     _output: cpal::Stream,
 }
 
+// ---------------------------------------------------------------------------
+// Device enumeration / lookup
+// ---------------------------------------------------------------------------
+
+/// `(name, name)` pairs — the device name is used both as the display
+/// label and as the persistence key. None => system default.
+pub fn output_devices() -> Vec<(String, String)> {
+    enumerate(|host| host.output_devices())
+}
+
+pub fn input_devices() -> Vec<(String, String)> {
+    enumerate(|host| host.input_devices())
+}
+
+fn enumerate<F, I>(devices: F) -> Vec<(String, String)>
+where
+    F: FnOnce(&cpal::Host) -> Result<I, cpal::Error>,
+    I: Iterator<Item = cpal::Device>,
+{
+    let host = cpal::default_host();
+    let mut out = Vec::new();
+    if let Ok(iter) = devices(&host) {
+        for d in iter {
+            if let Some(name) = dev_name(&d) {
+                out.push((name.clone(), name));
+            }
+        }
+    }
+    out
+}
+
+/// A device's human-readable name via the non-deprecated cpal 0.18
+/// `description().name()` API, falling back to `Display` if the structured
+/// description is unavailable (e.g. device disconnected mid-enumeration).
+fn dev_name(d: &cpal::Device) -> Option<String> {
+    d.description()
+        .ok()
+        .map(|desc| desc.name().to_string())
+        .or_else(|| Some(d.to_string()))
+}
+
+/// Find an output device by name, falling back to the default.
+fn find_output(host: &cpal::Host, name: Option<&str>) -> Option<cpal::Device> {
+    match name {
+        Some(n) => host
+            .output_devices()
+            .ok()
+            .and_then(|mut it| it.find(|d| dev_name(&d).as_deref() == Some(n)))
+            .or_else(|| host.default_output_device()),
+        None => host.default_output_device(),
+    }
+}
+
+fn find_input(host: &cpal::Host, name: Option<&str>) -> Option<cpal::Device> {
+    match name {
+        Some(n) => host
+            .input_devices()
+            .ok()
+            .and_then(|mut it| it.find(|d| dev_name(&d).as_deref() == Some(n)))
+            .or_else(|| host.default_input_device()),
+        None => host.default_input_device(),
+    }
+}
+
 impl AudioIo {
-    pub fn open(mute: Arc<AtomicBool>) -> Result<AudioIo, String> {
+    pub fn open(
+        mute: Arc<AtomicBool>,
+        input: Option<String>,
+        output: Option<String>,
+    ) -> Result<AudioIo, String> {
         let host = cpal::default_host();
-        let in_dev = host.default_input_device().ok_or("no microphone device")?;
-        let out_dev = host.default_output_device().ok_or("no speaker device")?;
+        let in_dev = find_input(&host, input.as_deref()).ok_or("no microphone device")?;
+        let out_dev = find_output(&host, output.as_deref()).ok_or("no speaker device")?;
 
         // ---- input: prefer f32 @ 48 kHz, fall back to any f32 range ----
         let in_cfg = in_dev

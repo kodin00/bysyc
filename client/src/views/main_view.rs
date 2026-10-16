@@ -64,6 +64,11 @@ pub struct MainView {
     pub new_channel_voice: bool,
     /// "+ dm" friend picker open?
     pub dm_picker: bool,
+    /// Settings window open (audio device pickers etc.).
+    pub settings_open: bool,
+    /// (channel, when) of the last auto-triggered "Load older" fetch — a
+    /// cooldown so scrolling to the top doesn't fire a fetch every frame.
+    pub last_load_attempt: Option<(i64, Instant)>,
     /// Decoded-and-downscaled attachment images by attachment id. UI-thread
     /// only (textures cannot be created elsewhere); never persisted.
     pub image_cache: HashMap<i64, egui::TextureHandle>,
@@ -197,6 +202,8 @@ impl MainView {
             new_channel_name: String::new(),
             new_channel_voice: false,
             dm_picker: false,
+            settings_open: false,
+            last_load_attempt: None,
             image_cache: HashMap::new(),
             image_tx,
             image_rx,
@@ -302,7 +309,7 @@ pub fn show(app: &mut BysycApp, ui: &mut egui::Ui) {
     // small windows (min) up to wide ones (max).
     egui::Panel::left("nav")
         .resizable(true)
-        .default_size(190.0)
+        .default_size(140.0)
         .min_size(140.0)
         .max_size(400.0)
         .show(ui, |ui| nav(ui, state, store, rt, main_view, &ctx, snap.as_ref()));
@@ -326,6 +333,9 @@ pub fn show(app: &mut BysycApp, ui: &mut egui::Ui) {
 
     // Transient popups driven by background tasks (invite codes).
     invite_window(state, &ctx);
+
+    // Audio device settings (output/input pickers).
+    crate::views::settings::settings_window(&ctx, state, store, &mut main_view.settings_open);
 
     // C5 renders the call overlay from here.
     crate::call::ui::overlay(&ctx, state, rt);
@@ -496,6 +506,9 @@ fn nav(
         if ui.button("Log out").clicked() {
             logout(state, store, rt);
         }
+        if ui.button("Settings").clicked() {
+            mv.settings_open = !mv.settings_open;
+        }
     });
 
     guild_popup(state, rt, mv, ctx);
@@ -653,11 +666,15 @@ fn dm_picker(
     };
     let mut open = mv.dm_picker;
     let mut close = false;
+    let mut esc = false;
     egui::Window::new("Start a direct message")
         .id(egui::Id::new("dm_picker"))
         .open(&mut open)
         .collapsible(false)
         .show(ctx, |ui| {
+            if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+                esc = true;
+            }
             if friends.is_empty() {
                 ui.weak("no friends yet — add some on the Friends page");
             }
@@ -668,7 +685,7 @@ fn dm_picker(
                 }
             }
         });
-    mv.dm_picker = open && !close;
+    mv.dm_picker = open && !close && !esc;
 }
 
 /// Open (or reuse) a DM with `peer_id` and select it.
@@ -1343,7 +1360,7 @@ const IMAGE_CACHE_CAP: usize = 48;
 const ROW_OVERDRAW_PX: f32 = 96.0;
 /// One side of a message row's hover-action gutter: largest the bare hover
 /// icons get; rows shorter than this shrink the icons to fit.
-const MSG_ACTION_SIZE: f32 = 26.0;
+const MSG_ACTION_SIZE: f32 = 18.0;
 /// Width reserved on the right of EVERY message row (hovered or not) so
 /// the hover-revealed reply/delete buttons appearing there never shift
 /// the content: two [`MSG_ACTION_SIZE`] buttons plus their gap.
@@ -1495,31 +1512,7 @@ fn chat(
         .main()
         .and_then(|m| m.has_more.get(&ch).copied())
         .unwrap_or(true);
-    if has_more && ui.button("Load older").clicked() {
-        let oldest = guard(state).main().and_then(|m| {
-            m.messages
-                .get(&ch)
-                .and_then(|v| v.iter().position(|x| x.id > 0).map(|idx| (v[idx].id, idx)))
-        });
-        if !mv.chat_at_bottom
-            && let Some((id, idx)) = oldest
-        {
-            mv.load_anchor = Some(LoadAnchor {
-                channel: ch,
-                msg_id: id,
-                idx_armed: idx,
-                armed_at: Instant::now(),
-            });
-        }
-        match oldest.map(|(id, _)| id) {
-            Some(before) => fetch_history(state, store, rt, ctx, mv, ch, Some(before)),
-            None => {
-                if let Some(m) = guard(state).main_mut() {
-                    m.has_more.insert(ch, false);
-                }
-            }
-        }
-    }
+    let load_clicked = has_more && ui.button("Load older").clicked();
 
     // Composer strip, carved out as a bottom panel BEFORE the history
     // ScrollArea: a vertical ScrollArea claims all remaining height of its
@@ -1761,12 +1754,7 @@ fn chat(
             .auto_shrink([false, false])
             .stick_to_bottom(true)
             .id_salt(("chat_scroll", ch));
-        if scroll_reset {
-            // A large finite offset clamps to the bottom inside the
-            // ScrollArea itself; f32::INFINITY would poison the offset
-            // math.
-            list = list.vertical_scroll_offset(1.0e9);
-        } else if let Some(i) = anchor_offset {
+        if let Some(i) = anchor_offset {
             // Aim the viewport near the anchor row so it renders this
             // frame; `message_row` pins it exactly once laid out. Rows
             // above the anchor contribute measured heights, with
@@ -1927,6 +1915,20 @@ fn chat(
             // but with per-message measured heights (an image row is ~15×
             // the fixed 18 px slot the old reservation assumed).
             ui.set_height(total);
+            if scroll_reset {
+                // A fresh channel: land on the newest row this frame with no
+                // animated jump (a fresh scroll state's offset otherwise
+                // renders from the top for one frame before clamping down).
+                let bottom = egui::Rect::from_min_size(
+                    egui::pos2(ui.max_rect().left(), top + total),
+                    egui::Vec2::splat(1.0),
+                );
+                ui.scroll_to_rect_animation(
+                    bottom,
+                    Some(egui::Align::BOTTOM),
+                    egui::style::ScrollAnimation::none(),
+                );
+            }
             if rows.is_empty() {
                 return;
             }
@@ -1946,6 +1948,43 @@ fn chat(
         // the older page prepends.
         mv.chat_at_bottom =
             scrolled.state.offset.y + 1.0 >= scrolled.content_size.y - scrolled.inner_rect.height();
+
+        // Lazy scroll: reaching the top (or clicking "Load older") fetches
+        // the page before the oldest message we hold. A cooldown stops a
+        // held scroll-top from firing every frame; the anchor holds the
+        // reading position as older rows prepend. Skipped on the channel-
+        // switch frame (scroll_reset) so the bottom-landing pin above isn't
+        // mistaken for a scroll-to-top.
+        let at_top = scrolled.state.offset.y <= 1.0;
+        let cooldown = mv
+            .last_load_attempt
+            .map_or(true, |(_, t)| t.elapsed() > std::time::Duration::from_millis(800));
+        if load_clicked || (has_more && at_top && !scroll_reset && cooldown) {
+            let oldest = guard(state).main().and_then(|m| {
+                m.messages
+                    .get(&ch)
+                    .and_then(|v| v.iter().position(|x| x.id > 0).map(|idx| (v[idx].id, idx)))
+            });
+            if !mv.chat_at_bottom
+                && let Some((id, idx)) = oldest
+            {
+                mv.load_anchor = Some(LoadAnchor {
+                    channel: ch,
+                    msg_id: id,
+                    idx_armed: idx,
+                    armed_at: Instant::now(),
+                });
+            }
+            match oldest.map(|(id, _)| id) {
+                Some(before) => fetch_history(state, store, rt, ctx, mv, ch, Some(before)),
+                None => {
+                    if let Some(m) = guard(state).main_mut() {
+                        m.has_more.insert(ch, false);
+                    }
+                }
+            }
+            mv.last_load_attempt = Some((ch, Instant::now()));
+        }
     }
 
     // The open lightbox outranks the LRU, and its texture counts as used.
@@ -2184,7 +2223,7 @@ fn message_row(
             if hovered || armed {
                 let size = egui::Vec2::splat(row_rect.height().min(MSG_ACTION_SIZE));
                 let cy = row_rect.center().y;
-                let mut right = row_rect.right() - 2.0;
+                let mut right = row_rect.right() - 12.0;
                 let place = |right: &mut f32| {
                     let rect =
                         egui::Rect::from_center_size(egui::pos2(*right - size.x * 0.5, cy), size);
@@ -2595,11 +2634,16 @@ fn icon_button(
     tooltip: &str,
 ) -> egui::Response {
     let tint = ui.visuals().widgets.inactive.fg_stroke.color;
-    ui.add(egui::Button::image(
+    // Bare icon, no Button frame: zero vertical padding so the composer
+    // row hugs its text height. A click sense + pointer cursor keep it
+    // discoverable, matching the row hover-action icons.
+    ui.add(
         egui::Image::from_bytes(uri, svg)
             .fit_to_exact_size(egui::Vec2::splat(14.0))
-            .tint(tint),
-    ))
+            .tint(tint)
+            .sense(egui::Sense::click()),
+    )
+    .on_hover_cursor(egui::CursorIcon::PointingHand)
     .on_hover_text(tooltip)
 }
 

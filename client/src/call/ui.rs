@@ -149,6 +149,10 @@ fn call_window(
             if !status.is_empty() {
                 ui.weak(status);
             }
+            let rtt = ui_state.rtt_ms.load(Ordering::Relaxed);
+            if rtt > 0 {
+                ui.weak(format!("latency: {rtt}ms"));
+            }
             if let Some(err) = ui_state
                 .audio_error
                 .lock()
