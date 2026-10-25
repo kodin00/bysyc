@@ -16,7 +16,7 @@ jobs:
     name: fmt & clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # cpal -> alsa-sys links libasound via pkg-config. (opus is vendored
       # via opusic-sys+cmake, rfd uses ashpd, glutin/winit dlopen GL/X11.)
@@ -75,7 +75,7 @@ jobs:
       TURN_USER: bysyc
       TURN_PASSWORD: bysyc
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install native build deps
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
@@ -136,7 +136,7 @@ jobs:
       TURN_PASSWORD: bysyc
       BIND_ADDR: 127.0.0.1:8080
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install native build deps
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
@@ -203,7 +203,7 @@ jobs:
     name: cargo-deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Runs cargo deny check (advisories, bans, licenses, sources) against
       # deny.toml. Vulnerability advisories always fail; the rest is tuned
       # to warn rather than block the current workspace.
