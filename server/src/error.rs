@@ -6,6 +6,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use bysyc_common::protocol::{ApiError as ApiErrorDto, ErrorCode};
 
+#[derive(Debug)]
 pub struct ApiError {
     pub status: StatusCode,
     pub code: ErrorCode,
