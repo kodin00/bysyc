@@ -59,7 +59,10 @@ fn kind_str(kind: &ChannelKind) -> &'static str {
     match kind {
         ChannelKind::Text => "text",
         ChannelKind::Voice => "voice",
-        ChannelKind::Dm => "dm",
+        // `ChannelKind` is `#[non_exhaustive]`; Dm is server-created only and
+        // Unknown (or any future variant) never reaches here — `create_channel`
+        // rejects everything but Text/Voice before calling this.
+        _ => "text",
     }
 }
 
@@ -423,9 +426,14 @@ async fn create_channel(
     Path(guild_id): Path<i64>,
     Json(req): Json<CreateChannelRequest>,
 ) -> ApiResult<Json<ChannelInfo>> {
-    if matches!(req.kind, ChannelKind::Dm) {
+    // Only Text and Voice are client-creatable: Dm is server-created via
+    // `POST /dms`, and Unknown (a `#[serde(other)]` fallback from a newer peer)
+    // or any future non_exhaustive variant is a malformed request. The DB's
+    // `channels.kind` CHECK only allows 'text'|'voice', so this also prevents
+    // a CHECK-violation 500 on an unknown kind.
+    if !matches!(req.kind, ChannelKind::Text | ChannelKind::Voice) {
         return Err(ApiError::invalid(
-            "dm channels are server-created via POST /dms, not here",
+            "only text and voice channels may be created here (dm is server-created)",
         ));
     }
     require_owner(&state.pg, guild_id, me).await?;

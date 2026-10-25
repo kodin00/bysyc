@@ -34,6 +34,25 @@ type BriefRow = (i64, String, Option<String>);
 
 const BRIEF_SQL: &str = "SELECT id, username, identity_key FROM accounts WHERE id = $1";
 
+/// One row of the combined `send_request` decision query: the peer's brief
+/// columns plus the three flags the handler branches on. Folds what used to
+/// be four sequential round trips (peer existence, already-friends,
+/// reverse-request, outgoing-request) into a single CTE so one round trip
+/// decides accept-vs-reject-vs-insert.
+type SendRequestRow = (i64, String, Option<String>, bool, bool, bool);
+
+const SEND_REQUEST_SQL: &str = "\
+WITH peer AS ( \
+    SELECT id, username, identity_key FROM accounts WHERE id = $2 \
+), fr AS ( \
+    SELECT \
+        EXISTS(SELECT 1 FROM friends WHERE a = LEAST($1, $2) AND b = GREATEST($1, $2)) AS already_friends, \
+        EXISTS(SELECT 1 FROM friend_requests WHERE from_id = $2 AND to_id = $1) AS reverse_present, \
+        EXISTS(SELECT 1 FROM friend_requests WHERE from_id = $1 AND to_id = $2) AS outgoing_present \
+) \
+SELECT p.id, p.username, p.identity_key, fr.already_friends, fr.reverse_present, fr.outgoing_present \
+FROM peer p CROSS JOIN fr";
+
 /// Attach online flags to a batch of account rows with one Redis pipeline.
 /// Online = `EXISTS presence:{id}` (the WS gateway maintains those keys).
 async fn with_online(state: &AppState, rows: Vec<BriefRow>) -> Result<Vec<AccountBrief>, ApiError> {
@@ -166,31 +185,26 @@ async fn send_request(
     if peer == me {
         return Err(ApiError::invalid("cannot send yourself a friend request"));
     }
-    let peer_row: BriefRow = sqlx::query_as(BRIEF_SQL)
+
+    // One round trip resolves the peer's existence + brief columns AND the
+    // three flags the handler branches on (already-friends, reverse-request
+    // present, outgoing-request present). The previous shape paid four
+    // sequential round trips here before any write. `peer` is empty in the
+    // CTE when the account does not exist, so CROSS JOIN yields nothing and
+    // fetch_optional comes back None -> NotFound.
+    let row: Option<SendRequestRow> = sqlx::query_as(SEND_REQUEST_SQL)
+        .bind(me)
         .bind(peer)
         .fetch_optional(&state.pg)
-        .await?
-        .ok_or_else(|| ApiError::not_found("no such account"))?;
-
-    let friends: Option<i64> = sqlx::query_scalar(
-        "SELECT a FROM friends WHERE a = LEAST($1, $2) AND b = GREATEST($1, $2)",
-    )
-    .bind(me)
-    .bind(peer)
-    .fetch_optional(&state.pg)
-    .await?;
-    if friends.is_some() {
+        .await?;
+    let (peer_id, peer_username, peer_identity_key, already_friends, reverse_present, outgoing_present) =
+        row.ok_or_else(|| ApiError::not_found("no such account"))?;
+    if already_friends {
         return Err(ApiError::invalid("already friends with this account"));
     }
 
     // The peer already asked us: sending back auto-accepts both requests.
-    let reverse: Option<i32> =
-        sqlx::query_scalar("SELECT 1 FROM friend_requests WHERE from_id = $1 AND to_id = $2")
-            .bind(peer)
-            .bind(me)
-            .fetch_optional(&state.pg)
-            .await?;
-    if reverse.is_some() {
+    if reverse_present {
         let mut tx = state.pg.begin().await?;
         sqlx::query(
             "DELETE FROM friend_requests \
@@ -212,7 +226,10 @@ async fn send_request(
 
         // Our own row and the peer's presence flag are independent; fetch
         // them concurrently. The caller's brief is definitionally online —
-        // this request proves it — so skip the Redis probe for it.
+        // this request proves it — so skip the Redis probe for it. The peer's
+        // brief columns came back on the decision query above, so only the
+        // online flag still needs Redis.
+        let peer_row: BriefRow = (peer_id, peer_username, peer_identity_key);
         let (my_row, peer_briefs) = tokio::join!(
             sqlx::query_as::<_, BriefRow>(BRIEF_SQL)
                 .bind(me)
@@ -240,13 +257,7 @@ async fn send_request(
     }
 
     // We already asked them: idempotent no-op.
-    let outgoing: Option<i32> =
-        sqlx::query_scalar("SELECT 1 FROM friend_requests WHERE from_id = $1 AND to_id = $2")
-            .bind(me)
-            .bind(peer)
-            .fetch_optional(&state.pg)
-            .await?;
-    if outgoing.is_some() {
+    if outgoing_present {
         return Ok(Json(friend_list(&state, me).await?));
     }
 

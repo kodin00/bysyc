@@ -203,11 +203,9 @@ async fn register(
         "account registered"
     );
 
-    let token = session::create(&state.redis, row.0).await?;
-    Ok(Json(TokenResponse {
-        token,
-        account: account_info(row),
-    }))
+    let info = account_info(row);
+    let token = session::create(&state.redis, info.id, &info).await?;
+    Ok(Json(TokenResponse { token, account: info }))
 }
 
 async fn login(
@@ -238,17 +236,15 @@ async fn login(
     }
 
     tracing::info!(account_id = id, "login ok");
-    let token = session::create(&state.redis, id).await?;
-    Ok(Json(TokenResponse {
-        token,
-        account: AccountInfo {
-            id,
-            username,
-            identity_key: identity_key.unwrap_or_default(),
-            created_at_ms,
-            is_admin,
-        },
-    }))
+    let info = AccountInfo {
+        id,
+        username,
+        identity_key: identity_key.unwrap_or_default(),
+        created_at_ms,
+        is_admin,
+    };
+    let token = session::create(&state.redis, info.id, &info).await?;
+    Ok(Json(TokenResponse { token, account: info }))
 }
 
 async fn logout(
@@ -267,17 +263,42 @@ async fn logout(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn me(State(state): State<AppState>, Authed(me): Authed) -> ApiResult<Json<AccountInfo>> {
+/// Fetch the caller's [`AccountInfo`] from Postgres. Shared by [`me`] (the
+/// cache-miss read-through path) and `keys::put_identity` (cache refresh
+/// after an identity-key upload). `None` means the account no longer exists.
+pub(crate) async fn fetch_account_info(
+    pg: &sqlx::PgPool,
+    account_id: i64,
+) -> Result<Option<AccountInfo>, ApiError> {
     let row: Option<AccountRow> = sqlx::query_as(
         "SELECT id, username, identity_key, \
                   (EXTRACT(EPOCH FROM created_at) * 1000)::bigint, is_admin \
          FROM accounts WHERE id = $1",
     )
-    .bind(me)
-    .fetch_optional(&state.pg)
+    .bind(account_id)
+    .fetch_optional(pg)
     .await?;
-    let row = row.ok_or_else(|| ApiError::unauthorized("account no longer exists"))?;
-    Ok(Json(account_info(row)))
+    Ok(row.map(account_info))
+}
+
+async fn me(State(state): State<AppState>, Authed(me): Authed) -> ApiResult<Json<AccountInfo>> {
+    // Hot path: the AccountInfo was cached alongside the session at login
+    // (or by a prior read-through); serve it from Redis without a Postgres
+    // hit, so /auth/me resolves at the same cost as the session lookup that
+    // Authed already did.
+    if let Some(info) = session::account_info(&state.redis, me).await? {
+        return Ok(Json(info));
+    }
+    // Cache miss: read Postgres and re-cache so the next /me is hot again.
+    let Some(info) = fetch_account_info(&state.pg, me).await? else {
+        return Err(ApiError::unauthorized("account no longer exists"));
+    };
+    // Best-effort re-cache: a Redis hiccup just means the next /me falls
+    // through to Postgres again, not a request failure.
+    if let Err(e) = session::cache_account_info(&state.redis, me, &info).await {
+        tracing::warn!(me, "account info cache re-fill failed: {e}");
+    }
+    Ok(Json(info))
 }
 
 /// `POST /auth/invites` — admin-only: mint a fresh registration invite code.

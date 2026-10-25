@@ -551,7 +551,6 @@ async fn run_connected(state: &AppState, socket: WebSocket, me: i64) -> Result<(
     let (out_tx, out_rx) = mpsc::channel::<WsMessage>(OUT_QUEUE_DEPTH);
     out_tx
         .send(frame_msg(WsServerMsg {
-            id: None,
             body: WsServerBody::Ready {
                 account: ready.account,
                 friends: ready.friends,
@@ -774,7 +773,6 @@ async fn handle_client_msg(
                     // VoiceState that voice::join publishes to the channel.
                     let _ = out
                         .send(frame_msg(WsServerMsg {
-                            id: None,
                             body: WsServerBody::VoiceState {
                                 channel_id,
                                 participants,
@@ -819,6 +817,11 @@ async fn handle_client_msg(
                 send_error(out, Some(msg.id), e.code, e.message);
             }
         }
+        // `WsClientBody` is `#[non_exhaustive]` with a `#[serde(other)] Unknown`
+        // fallback; the wire contract is "server logs and ignores, never errors
+        // for an unknown tag", so unknown variants (and any future variant this
+        // version does not know) are dropped here without a reply.
+        _ => tracing::debug!(me, "ignoring unrecognized ws client body"),
     }
 }
 
@@ -841,7 +844,6 @@ fn send_error(
     message: impl Into<String>,
 ) {
     let msg = WsServerMsg {
-        id: None,
         body: WsServerBody::Error {
             reply_to,
             code,
@@ -1154,12 +1156,20 @@ async fn ready_snapshot(state: &AppState, me: i64) -> Result<Ready, ApiError> {
         },
         presence_map(&state.redis, &brief_ids),
     );
+    // Build a guild_id -> index map once so per-channel attachment is O(1)
+    // instead of an O(guilds.len()) linear scan per channel (the previous
+    // `find` made snapshot assembly O(guilds * channels) on this loop).
+    let guild_idx: HashMap<i64, usize> = guilds
+        .iter()
+        .enumerate()
+        .map(|(i, g)| (g.id, i))
+        .collect();
     for cr in chan_rows_res? {
         let guild_id: i64 = cr.try_get("guild_id")?;
-        let Some(guild) = guilds.iter_mut().find(|g| g.id == guild_id) else {
+        let Some(&idx) = guild_idx.get(&guild_id) else {
             continue;
         };
-        guild.channels.push(ChannelInfo {
+        guilds[idx].channels.push(ChannelInfo {
             id: cr.try_get("id")?,
             guild_id: Some(guild_id),
             kind: crate::messages::parse_channel_kind(&cr.try_get::<String, _>("kind")?)
@@ -1246,7 +1256,6 @@ mod tests {
     #[test]
     fn frame_msg_encodes_msgpack_envelope() {
         let frame = frame_msg(WsServerMsg {
-            id: None,
             body: WsServerBody::Presence {
                 account_id: 2,
                 online: true,
@@ -1263,7 +1272,6 @@ mod tests {
                         online: true,
                     }
                 );
-                assert_eq!(parsed.id, None);
             }
             other => panic!("expected binary frame, got {other:?}"),
         }
@@ -1272,7 +1280,7 @@ mod tests {
     #[test]
     fn event_frame_transcodes_pubsub_json_to_msgpack() {
         // The exact bytes `crate::events` puts on Redis (its pinned envelope).
-        let payload = r#"{"id":null,"body":{"presence":{"account_id":2,"online":true}}}"#;
+        let payload = r#"{"body":{"presence":{"account_id":2,"online":true}}}"#;
         let frame = event_frame(payload).expect("pubsub payload transcodes");
         let WsMessage::Binary(data) = frame else {
             panic!("expected binary frame, got {frame:?}");
@@ -1281,7 +1289,6 @@ mod tests {
         assert_eq!(
             parsed,
             WsServerMsg {
-                id: None,
                 body: WsServerBody::Presence {
                     account_id: 2,
                     online: true,

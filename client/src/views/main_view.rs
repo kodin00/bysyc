@@ -875,6 +875,11 @@ fn middle_min_width(ctx: &egui::Context, style: &egui::Style, snap: &PanelSnap) 
                     None => format!("(v) {} — 0 in call", c.name),
                 },
                 ChannelKind::Dm => continue,
+                // `ChannelKind` is `#[non_exhaustive]`; `Unknown` (a
+                // `#[serde(other)]` fallback from a newer server) or any
+                // future variant is not rendered here — skip it like Dm,
+                // which lives in its own panel.
+                _ => continue,
             };
             let mut row = text_w(&label, &body) + pad; // selectable_label
             if g.owner_id == my_id {
@@ -1079,6 +1084,11 @@ fn middle(
                             });
                         }
                         ChannelKind::Dm => {}
+                        // `ChannelKind` is `#[non_exhaustive]`; `Unknown`
+                        // (a `#[serde(other)]` fallback from a newer server)
+                        // or any future variant renders nothing here, matching
+                        // Dm (which is listed in its own panel).
+                        _ => {}
                     }
                 }
                 channel_popup(state, rt, mv, ctx, g.id, is_owner);

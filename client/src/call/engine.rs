@@ -571,6 +571,11 @@ impl SessionCore {
                     keep
                 });
             }
+            // Forward-compat `Unknown` (or a newer peer's signal this client
+            // does not know): drop silently. The wire contract is "log and
+            // ignore, never tear the call down"; see the `#[serde(other)]`
+            // notes on [`CallSignalKind`].
+            _ => {}
         }
     }
 
@@ -863,9 +868,11 @@ impl SessionCore {
             return;
         }
         // Cut frames through a stack buffer: copy the head out, then drop
-        // it from the accumulator — no fresh Vec per 20 ms frame. The Opus
-        // packet scratch is reused across frames; str0m's RtpWrite takes an
-        // owned Vec per peer, so that per-peer clone stays.
+        // it from the accumulator, no fresh Vec per 20 ms frame. The Opus
+        // packet scratch is reused across frames; `RtpWrite::new` takes
+        // `impl Into<Arc<[u8]>>`, so the encoded bytes are shared once per
+        // frame via an `Arc<[u8]>` and each peer does a refcount-only clone
+        // instead of a byte copy on the 20 ms send path.
         let mut frame = [0f32; FRAME_SAMPLES];
         let mut packet = std::mem::take(&mut self.tx_packet);
         while self.frame_acc.len() >= FRAME_SAMPLES {
@@ -880,6 +887,9 @@ impl SessionCore {
             {
                 break; // stop the burst on encoder failure; mic data is lost
             }
+            // One Arc conversion per frame; the per-peer clones below are
+            // cheap refcount bumps, not byte copies.
+            let shared: Arc<[u8]> = Arc::from(packet.as_slice());
             for peer in &mut self.peers {
                 if !peer.connected {
                     continue;
@@ -892,7 +902,7 @@ impl SessionCore {
                     mid,
                     ..Default::default()
                 };
-                let write = RtpWrite::new(pt, SeqNo::from(seq as u64), time, now, packet.clone())
+                let write = RtpWrite::new(pt, SeqNo::from(seq as u64), time, now, shared.clone())
                     .ext_vals(ext);
                 if let Some(stream) = peer.rtc.direct_api().stream_tx(&ssrc) {
                     stream.write_rtp(write);
