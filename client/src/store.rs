@@ -128,7 +128,22 @@ impl Store {
 
     /// Open (and migrate) the store at an explicit path.
     pub fn open(path: &Path) -> Result<Self, String> {
-        let write = Connection::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        // `:memory:` is private per connection, so the read partner would
+        // see an empty, unmigrated database. Map it to a uniquely named
+        // shared-cache in-memory URI that both connections attach to (and
+        // that stays isolated from every other `Store`).
+        let target = if path.as_os_str() == ":memory:" {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            std::borrow::Cow::Owned(std::path::PathBuf::from(format!(
+                "file:bysyc-mem-{}-{n}?mode=memory&cache=shared",
+                std::process::id()
+            )))
+        } else {
+            std::borrow::Cow::Borrowed(path)
+        };
+        let write =
+            Connection::open(&target).map_err(|e| format!("open {}: {e}", path.display()))?;
         // WAL lets the read-only partner serve a consistent snapshot
         // alongside one writer, and NORMAL sync under WAL trades a crash's
         // very last commits for far faster writes, fine for a cache
@@ -140,7 +155,7 @@ impl Store {
         // schema; `query_only = ON` turns any accidental write on this
         // connection into a hard error rather than a silent mutation.
         let read =
-            Connection::open(path).map_err(|e| format!("open read {}: {e}", path.display()))?;
+            Connection::open(&target).map_err(|e| format!("open read {}: {e}", path.display()))?;
         let _ = read.execute_batch("PRAGMA query_only = ON;");
         Ok(Store {
             write: Mutex::new(write),

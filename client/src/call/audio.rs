@@ -214,10 +214,10 @@ pub struct LinearResampler {
     last: f32,
     /// Fractional position within the virtual source stream since `last`.
     frac: f32,
-    /// One-pole low-pass state for downsampling anti-aliasing (see
-    /// [`LinearResampler::process_into`]). Only touched when
-    /// `from_rate > SAMPLE_RATE`.
-    lp_state: f32,
+    /// Anti-aliasing low-pass state: two cascaded biquad sections, each with
+    /// two delay taps (see [`LinearResampler::process_into`]). Only touched
+    /// when `from_rate > SAMPLE_RATE`.
+    lp_state: [[f32; 2]; 2],
     /// Reused scratch holding the low-passed input (no steady-state alloc).
     lp_scratch: Vec<f32>,
 }
@@ -229,11 +229,12 @@ impl LinearResampler {
     /// 48 kHz) the input is borrowed directly, no copy at all.
     ///
     /// When *downsampling* (`from_rate > SAMPLE_RATE`) the input is run
-    /// through a one-pole IIR low-pass (cutoff at the new Nyquist,
-    /// `SAMPLE_RATE / 2`) before the linear interpolation/decimation, so
-    /// energy above the new Nyquist does not fold back into the passband as
-    /// aliasing. The filter state carries across calls alongside `last` and
-    /// `frac`, so the streaming fractional read position is preserved.
+    /// through a 4th-order Butterworth low-pass (see [`lp_coeffs`]) with its
+    /// cutoff just under the new Nyquist (`SAMPLE_RATE / 2`) before the
+    /// linear interpolation/decimation, so energy above the new Nyquist does
+    /// not fold back into the passband as aliasing. The filter state carries
+    /// across calls alongside `last` and `frac`, so the streaming fractional
+    /// read position is preserved.
     /// Upsampling needs no filter: the original signal is already below the
     /// new, higher Nyquist.
     pub fn process_into<'a>(
@@ -250,16 +251,20 @@ impl LinearResampler {
             return input;
         }
         let (new_frac, new_last) = if from_rate > SAMPLE_RATE {
-            let a = lp_coeff(from_rate);
-            let mut prev = self.lp_state;
+            let coeffs = lp_coeffs(from_rate);
             self.lp_scratch.clear();
             self.lp_scratch.reserve(input.len());
             for &s in input {
-                // y[n] = (1-a)*x[n] + a*y[n-1]; DC gain 1.
-                prev = (1.0 - a) * s + a * prev;
-                self.lp_scratch.push(prev);
+                let mut x = s;
+                for (c, z) in coeffs.iter().zip(self.lp_state.iter_mut()) {
+                    // Transposed direct form II biquad.
+                    let y = c.b0 * x + z[0];
+                    z[0] = c.b1 * x - c.a1 * y + z[1];
+                    z[1] = c.b2 * x - c.a2 * y;
+                    x = y;
+                }
+                self.lp_scratch.push(x);
             }
-            self.lp_state = prev;
             interpolate(&self.lp_scratch, self.last, self.frac, from_rate, out)
         } else {
             interpolate(input, self.last, self.frac, from_rate, out)
@@ -270,15 +275,39 @@ impl LinearResampler {
     }
 }
 
-/// One-pole low-pass feedback coefficient for the anti-aliasing filter run at
-/// `from_rate`, with -3 dB point at the new Nyquist (`SAMPLE_RATE / 2`). The
-/// filter is `y[n] = (1-a)*x[n] + a*y[n-1]` (DC gain 1); `a` near 1 is heavy
-/// filtering, near 0 is near-transparent. A one-pole rolls off at only
-/// 6 dB/octave, so this is gentle anti-aliasing, far cheaper than a proper
-/// FIR and a large improvement over none.
-fn lp_coeff(from_rate: u32) -> f32 {
-    // a = exp(-2*pi*f_c/fs), with f_c = SAMPLE_RATE/2 and fs = from_rate.
-    (-std::f32::consts::PI * SAMPLE_RATE as f32 / from_rate as f32).exp()
+/// Normalized (a0 = 1) biquad section coefficients.
+#[derive(Clone, Copy)]
+struct Biquad {
+    b0: f32,
+    b1: f32,
+    b2: f32,
+    a1: f32,
+    a2: f32,
+}
+
+/// 4th-order Butterworth low-pass (two cascaded RBJ biquads) for the
+/// anti-aliasing filter run at `from_rate`. The -3 dB point sits at 0.4 x
+/// `SAMPLE_RATE` (19.2 kHz), a little under the new Nyquist, so the
+/// transition band finishes before the Nyquist instead of straddling it: a
+/// one-pole at the Nyquist is only 3 dB down there and barely touches
+/// content just above it. Voice sits far below the cutoff.
+fn lp_coeffs(from_rate: u32) -> [Biquad; 2] {
+    // Butterworth section Q values for order 4.
+    const QS: [f32; 2] = [0.541_196_1, 1.306_563];
+    let w0 = 2.0 * std::f32::consts::PI * (0.4 * SAMPLE_RATE as f32) / from_rate as f32;
+    let (sin, cos) = w0.sin_cos();
+    QS.map(|q| {
+        let alpha = sin / (2.0 * q);
+        let a0 = 1.0 + alpha;
+        let b = (1.0 - cos) / a0;
+        Biquad {
+            b0: b / 2.0,
+            b1: b,
+            b2: b / 2.0,
+            a1: -2.0 * cos / a0,
+            a2: (1.0 - alpha) / a0,
+        }
+    })
 }
 
 /// Linear-interpolate `src` (sampled at `from_rate`) into `out` at
