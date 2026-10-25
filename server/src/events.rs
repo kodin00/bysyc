@@ -12,11 +12,12 @@
 
 use bysyc_common::protocol::{WsServerBody, WsServerMsg};
 
-/// The exact envelope every publish here puts on the wire:
-/// `WsServerMsg { id: None }` serialized to JSON. One call per broadcast —
-/// callers never re-serialize per recipient.
+/// The exact envelope every publish here puts on the wire: a `WsServerMsg`
+/// (body only — the envelope carries no server-side sequence number since
+/// protocol v2 dropped `WsServerMsg.id`) serialized to JSON. One call per
+/// broadcast — callers never re-serialize per recipient.
 fn event_json(body: WsServerBody) -> String {
-    serde_json::to_string(&WsServerMsg { id: None, body }).expect("WsServerBody serializes")
+    serde_json::to_string(&WsServerMsg { body }).expect("WsServerBody serializes")
 }
 
 /// Serialize and publish a directed event to every live connection of `account_id`.
@@ -130,7 +131,7 @@ mod tests {
         });
         assert_eq!(
             json,
-            r#"{"id":null,"body":{"presence":{"account_id":2,"online":true}}}"#
+            r#"{"body":{"presence":{"account_id":2,"online":true}}}"#
         );
     }
 }

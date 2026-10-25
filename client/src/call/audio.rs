@@ -19,7 +19,7 @@
 //! The rings are single-producer/single-consumer with Acquire/Release
 //! indices — the weakest obviously-correct ordering for SPSC (the producer
 //! publishes samples with a Release tail store, the consumer publishes
-//! reads with a Release head store). Per-peer prebuffering (32 ms) keeps a
+//! reads with a Release head store). Per-peer prebuffering (10 ms) keeps a
 //! new stream from crackling before it has jitter margin; overflow drops
 //! the oldest samples to bound latency.
 
@@ -34,8 +34,12 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 pub const FRAME_SAMPLES: usize = 960;
 /// Ring capacity per direction: 400 ms at 48 kHz (power of two).
 const RING_SAMPLES: usize = 1 << 15; // 32768
-/// Samples buffered before a peer starts playing (jitter margin).
-const PREBUFFER_SAMPLES: usize = 1536; // 32 ms
+/// Samples buffered before a peer starts playing (jitter margin). Kept low
+/// (~10 ms) so the initial playout gap is roughly one Opus frame, not a
+/// whole 32 ms on top of the codec frame; the SPSC ring still absorbs
+/// jitter after that; overflow drops the oldest, never blocking the
+/// writer.
+const PREBUFFER_SAMPLES: usize = 480; // 10 ms
 /// Session sample rate; Opus requires 48 kHz.
 pub const SAMPLE_RATE: u32 = 48_000;
 
@@ -201,13 +205,28 @@ pub struct LinearResampler {
     last: f32,
     /// Fractional position within the virtual source stream since `last`.
     frac: f32,
+    /// One-pole low-pass state for downsampling anti-aliasing (see
+    /// [`LinearResampler::process_into`]). Only touched when
+    /// `from_rate > SAMPLE_RATE`.
+    lp_state: f32,
+    /// Reused scratch holding the low-passed input (no steady-state alloc).
+    lp_scratch: Vec<f32>,
 }
 
 impl LinearResampler {
     /// `input` is mono at `from_rate`. Resampled 48 kHz samples are appended
     /// to `out` (caller-owned scratch, so nothing allocates once warm) and
     /// the slice to push is returned. On passthrough (`from_rate` is already
-    /// 48 kHz) the input is borrowed directly — no copy at all.
+    /// 48 kHz) the input is borrowed directly, no copy at all.
+    ///
+    /// When *downsampling* (`from_rate > SAMPLE_RATE`) the input is run
+    /// through a one-pole IIR low-pass (cutoff at the new Nyquist,
+    /// `SAMPLE_RATE / 2`) before the linear interpolation/decimation, so
+    /// energy above the new Nyquist does not fold back into the passband as
+    /// aliasing. The filter state carries across calls alongside `last` and
+    /// `frac`, so the streaming fractional read position is preserved.
+    /// Upsampling needs no filter: the original signal is already below the
+    /// new, higher Nyquist.
     pub fn process_into<'a>(
         &mut self,
         input: &'a [f32],
@@ -221,22 +240,64 @@ impl LinearResampler {
             self.last = *input.last().unwrap();
             return input;
         }
-        let step = from_rate as f32 / SAMPLE_RATE as f32;
-        out.clear();
-        out.reserve((input.len() as f32 / step).ceil() as usize + 1);
-        let mut pos = self.frac; // position (in samples) relative to input[0]
-        while pos < input.len() as f32 {
-            let i = pos.floor() as usize;
-            let a = if i == 0 { self.last } else { input[i - 1] };
-            let b = input[i.min(input.len() - 1)];
-            let t = pos - i as f32;
-            out.push(a + (b - a) * t);
-            pos += step;
-        }
-        self.frac = pos - input.len() as f32;
-        self.last = *input.last().unwrap();
+        let (new_frac, new_last) = if from_rate > SAMPLE_RATE {
+            let a = lp_coeff(from_rate);
+            let mut prev = self.lp_state;
+            self.lp_scratch.clear();
+            self.lp_scratch.reserve(input.len());
+            for &s in input {
+                // y[n] = (1-a)*x[n] + a*y[n-1]; DC gain 1.
+                prev = (1.0 - a) * s + a * prev;
+                self.lp_scratch.push(prev);
+            }
+            self.lp_state = prev;
+            interpolate(&self.lp_scratch, self.last, self.frac, from_rate, out)
+        } else {
+            interpolate(input, self.last, self.frac, from_rate, out)
+        };
+        self.frac = new_frac;
+        self.last = new_last;
         out
     }
+}
+
+/// One-pole low-pass feedback coefficient for the anti-aliasing filter run at
+/// `from_rate`, with -3 dB point at the new Nyquist (`SAMPLE_RATE / 2`). The
+/// filter is `y[n] = (1-a)*x[n] + a*y[n-1]` (DC gain 1); `a` near 1 is heavy
+/// filtering, near 0 is near-transparent. A one-pole rolls off at only
+/// 6 dB/octave, so this is gentle anti-aliasing, far cheaper than a proper
+/// FIR and a large improvement over none.
+fn lp_coeff(from_rate: u32) -> f32 {
+    // a = exp(-2*pi*f_c/fs), with f_c = SAMPLE_RATE/2 and fs = from_rate.
+    (-std::f32::consts::PI * SAMPLE_RATE as f32 / from_rate as f32).exp()
+}
+
+/// Linear-interpolate `src` (sampled at `from_rate`) into `out` at
+/// [`SAMPLE_RATE`], returning the carried fractional position and last
+/// sample for the next call. Split out of [`LinearResampler::process_into`]
+/// so the read loop can run against either the raw input or the low-passed
+/// scratch without holding `&mut self` for the duration.
+fn interpolate(
+    src: &[f32],
+    last: f32,
+    frac: f32,
+    from_rate: u32,
+    out: &mut Vec<f32>,
+) -> (f32, f32) {
+    let step = from_rate as f32 / SAMPLE_RATE as f32;
+    out.clear();
+    out.reserve((src.len() as f32 / step).ceil() as usize + 1);
+    let mut pos = frac; // position (in samples) relative to src[0]
+    while pos < src.len() as f32 {
+        let i = pos.floor() as usize;
+        let a = if i == 0 { last } else { src[i - 1] };
+        let b = src[i.min(src.len() - 1)];
+        let t = pos - i as f32;
+        out.push(a + (b - a) * t);
+        pos += step;
+    }
+    let new_last = src.last().copied().unwrap_or(last);
+    (pos - src.len() as f32, new_last)
 }
 
 /// Average interleaved channels down to mono, appending to `out` (caller
@@ -567,7 +628,12 @@ impl AudioIo {
                         }
                     }
                     for (frame, s) in data.chunks_exact_mut(out_channels).zip(mix_scratch.iter()) {
-                        let s = s.clamp(-1.0, 1.0);
+                        // Soft-limit the mix (tanh): with N peers summing,
+                        // peaks run well past 1.0, and tanh compresses the
+                        // sum smoothly instead of the harsh discontinuity a
+                        // hard clamp would impose on every overlap. Quiet
+                        // speech (|s| << 1) passes through ~unchanged.
+                        let s = s.tanh();
                         for ch in frame.iter_mut() {
                             *ch = s;
                         }
@@ -758,6 +824,71 @@ mod tests {
         // Length ratio is ~48/44.1.
         let ratio = out.len() as f32 / input.len() as f32;
         assert!((ratio - 48_000.0 / 44_100.0).abs() < 0.02, "ratio {ratio}");
+    }
+
+    #[test]
+    fn resampler_downsamples_with_low_pass() {
+        // 220 Hz sine at 96 kHz → 48 kHz: well below the new Nyquist
+        // (24 kHz), so the tone must survive the anti-aliasing low-pass
+        // intact, and the output length is ~half the input (2:1 downsample).
+        let from = 96_000u32;
+        let secs = 2.0f32;
+        let n = (from as f32 * secs) as usize;
+        let input: Vec<f32> = (0..n)
+            .map(|i| (2.0 * std::f32::consts::PI * 220.0 * i as f32 / from as f32).sin())
+            .collect();
+        let mut r = LinearResampler::default();
+        let mut out = Vec::new();
+        r.process_into(&input, from, &mut out);
+        let ratio = out.len() as f32 / input.len() as f32;
+        assert!(
+            (ratio - 0.5).abs() < 0.02,
+            "downsample ratio should be ~0.5, got {ratio}"
+        );
+        let crossings = out
+            .windows(2)
+            .filter(|w| (w[0] < 0.0) != (w[1] < 0.0))
+            .count() as f32;
+        let hz = crossings / 2.0 / (out.len() as f32 / SAMPLE_RATE as f32);
+        assert!(
+            (hz - 220.0).abs() < 6.0,
+            "downsampled tone drifted: {hz:.1} Hz"
+        );
+    }
+
+    #[test]
+    fn resampler_low_pass_attenuates_above_new_nyquist() {
+        // A tone above the new Nyquist (24 kHz) sampled at 96 kHz must be
+        // attenuated by the anti-aliasing low-pass: compare its output
+        // amplitude to a below-Nyquist control of the same input amplitude.
+        // Without the filter, the 30 kHz tone would alias into the passband
+        // and survive at near-full amplitude.
+        let from = 96_000u32;
+        let secs = 1.0f32;
+        let n = (from as f32 * secs) as usize;
+        let control: Vec<f32> = (0..n)
+            .map(|i| (2.0 * std::f32::consts::PI * 1_000.0 * i as f32 / from as f32).sin())
+            .collect();
+        let hot: Vec<f32> = (0..n)
+            .map(|i| (2.0 * std::f32::consts::PI * 30_000.0 * i as f32 / from as f32).sin())
+            .collect();
+        let mut r = LinearResampler::default();
+        let mut control_out = Vec::new();
+        r.process_into(&control, from, &mut control_out);
+        let control_rms =
+            (control_out.iter().map(|s| s * s).sum::<f32>() / control_out.len() as f32).sqrt();
+        // Fresh resampler so the hot tone is not colored by the control's
+        // filter state.
+        let mut r = LinearResampler::default();
+        let mut hot_out = Vec::new();
+        r.process_into(&hot, from, &mut hot_out);
+        let hot_rms =
+            (hot_out.iter().map(|s| s * s).sum::<f32>() / hot_out.len() as f32).sqrt();
+        assert!(
+            hot_rms < control_rms * 0.5,
+            "30 kHz tone should be attenuated below 1 kHz control: \
+             hot {hot_rms:.3} control {control_rms:.3}"
+        );
     }
 
     #[test]

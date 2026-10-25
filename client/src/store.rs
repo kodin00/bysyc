@@ -4,8 +4,15 @@
 //! no keychain access prompts; the file keeps the passphrase outside the
 //! SQLite store it encrypts, per ADR 0001).
 //!
-//! All methods take `&self`; the whole [`Store`] is shared as
-//! `Arc<Mutex<Store>>` and locked briefly from the UI and network threads.
+//! All methods take `&self` and lock one of two interior connections: a
+//! write [`Connection`] for mutating methods, and a read-only partner
+//! (`PRAGMA query_only = 1`) for queries, so a UI-thread read never waits
+//! on a network-thread write; SQLite WAL serves it a consistent snapshot
+//! alongside one active writer. The whole [`Store`] is shared as
+//! `Arc<Mutex<Store>>` and locked briefly from the UI and network threads;
+//! because the Store is `Send + Sync` on its own, that outer `Mutex` can be
+//! retired to `Arc<Store>` (letting reads and writes progress on separate
+//! threads with no outer lock at all) without touching the methods.
 //! Message rows carry a `plaintext` column that stays `NULL` until C2/C3
 //! decrypt and fill it via [`Store::set_plaintext`].
 
@@ -25,7 +32,17 @@ use crate::state::guard;
 // Schema
 // ---------------------------------------------------------------------------
 
-const SCHEMA: &str = "
+/// Numbered migrations applied in order on open; each step bumps
+/// `PRAGMA user_version` so it runs exactly once per database. This
+/// replaces the old "CREATE TABLE IF NOT EXISTS + best-effort ALTER"
+/// pattern, which could silently skip a column add when the table
+/// pre-existed and left no record of what had been applied.
+///
+/// v1 is the original schema (the `messages` table predates the `deleted`
+/// column); v2 is the `ALTER TABLE` that was previously swallowed by a
+/// best-effort `execute` whose error meant "already there".
+const MIGRATIONS: &[(u32, &str)] = &[
+    (1, "
 CREATE TABLE IF NOT EXISTS settings(
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -43,8 +60,7 @@ CREATE TABLE IF NOT EXISTS messages(
     reply_to       INTEGER NULL,
     attachment_json TEXT NULL,
     created_at_ms  INTEGER NOT NULL,
-    plaintext      TEXT NULL,
-    deleted        INTEGER NOT NULL DEFAULT 0
+    plaintext      TEXT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel_id);
 CREATE TABLE IF NOT EXISTS file_envelopes(
@@ -71,14 +87,26 @@ CREATE TABLE IF NOT EXISTS dm(
     channel_id INTEGER PRIMARY KEY,
     peer_id    INTEGER NOT NULL
 );
-";
+"),
+    (2, "ALTER TABLE messages ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0"),
+];
 
 // ---------------------------------------------------------------------------
 // Store
 // ---------------------------------------------------------------------------
 
+/// Local SQLite store: one write connection and one read-only partner on
+/// the same file. Reads lock only the read connection (`PRAGMA query_only =
+/// 1`), so a UI-thread query never waits on a network-thread write; SQLite
+/// WAL serves it a consistent snapshot alongside one active writer. Both
+/// connections sit behind `Mutex`es only because `rusqlite::Connection` is
+/// `!Sync`; the SQLite library itself is the real serialization point for
+/// writers. The Store is `Send + Sync`, so callers may retire the legacy
+/// `Arc<Mutex<Store>>` wrapper in favor of `Arc<Store>` to let reads and
+/// writes progress on separate threads without any outer lock at all.
 pub struct Store {
-    conn: Connection,
+    write: Mutex<Connection>,
+    read: Mutex<Connection>,
 }
 
 impl Store {
@@ -94,28 +122,37 @@ impl Store {
 
     /// Open (and migrate) the store at an explicit path.
     pub fn open(path: &Path) -> Result<Self, String> {
-        let conn = Connection::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
-        // WAL lets UI-thread reads run off the write lock, and NORMAL sync
-        // under WAL trades a crash's very last commits for far faster
-        // writes — fine for a cache (secrets live in their own file).
-        // Best-effort: a filesystem that cannot do WAL still works as before.
-        let _ = conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;");
-        conn.execute_batch(SCHEMA)
-            .map_err(|e| format!("migrate {}: {e}", path.display()))?;
-        // `CREATE TABLE IF NOT EXISTS` does not extend an existing table with
-        // new columns; add them best-effort (an error means "already there").
-        let _ = conn.execute(
-            "ALTER TABLE messages ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0",
-            [],
-        );
-        Ok(Store { conn })
+        let write = Connection::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        // WAL lets the read-only partner serve a consistent snapshot
+        // alongside one writer, and NORMAL sync under WAL trades a crash's
+        // very last commits for far faster writes, fine for a cache
+        // (secrets live in their own file). Best-effort: a filesystem that
+        // cannot do WAL still works as before.
+        let _ = write.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;");
+        run_migrations(&write).map_err(|e| format!("migrate {}: {e}", path.display()))?;
+        // Open the read partner AFTER migrating so it observes the final
+        // schema; `query_only = ON` turns any accidental write on this
+        // connection into a hard error rather than a silent mutation.
+        let read = Connection::open(path).map_err(|e| format!("open read {}: {e}", path.display()))?;
+        let _ = read.execute_batch("PRAGMA query_only = ON;");
+        Ok(Store {
+            write: Mutex::new(write),
+            read: Mutex::new(read),
+        })
+    }
+
+    /// Guard on the read-only connection, for ad-hoc queries that should not
+    /// block a writer. Recovers from poisoning so one panicking thread
+    /// cannot take the store down with it.
+    pub fn read(&self) -> std::sync::MutexGuard<'_, Connection> {
+        guard(&self.read)
     }
 
     // -- settings ----------------------------------------------------------
 
     pub fn setting(&self, key: &str) -> Option<String> {
-        self.conn
-            .prepare_cached("SELECT value FROM settings WHERE key = ?1")
+        let conn = guard(&self.read);
+        conn.prepare_cached("SELECT value FROM settings WHERE key = ?1")
             .and_then(|mut stmt| stmt.query_row(params![key], |r| r.get(0)))
             .optional()
             .ok()
@@ -123,19 +160,19 @@ impl Store {
     }
 
     pub fn set_setting(&self, key: &str, value: &str) -> Result<(), String> {
-        self.conn
-            .prepare_cached(
-                "INSERT INTO settings(key, value) VALUES(?1, ?2)
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            )
-            .and_then(|mut stmt| stmt.execute(params![key, value]))
-            .map_err(|e| format!("settings: {e}"))?;
+        let conn = guard(&self.write);
+        conn.prepare_cached(
+            "INSERT INTO settings(key, value) VALUES(?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .and_then(|mut stmt| stmt.execute(params![key, value]))
+        .map_err(|e| format!("settings: {e}"))?;
         Ok(())
     }
 
     pub fn del_setting(&self, key: &str) -> Result<(), String> {
-        self.conn
-            .prepare_cached("DELETE FROM settings WHERE key = ?1")
+        let conn = guard(&self.write);
+        conn.prepare_cached("DELETE FROM settings WHERE key = ?1")
             .and_then(|mut stmt| stmt.execute(params![key]))
             .map_err(|e| format!("settings: {e}"))?;
         Ok(())
@@ -173,8 +210,8 @@ impl Store {
     /// Load the pickled blob stored under `scope` (e.g. an account-scoped
     /// pickle name C2 chooses).
     pub fn pickle(&self, scope: &str) -> Option<Vec<u8>> {
-        self.conn
-            .prepare_cached("SELECT pickle FROM keys WHERE scope = ?1")
+        let conn = guard(&self.read);
+        conn.prepare_cached("SELECT pickle FROM keys WHERE scope = ?1")
             .and_then(|mut stmt| stmt.query_row(params![scope], |r| r.get(0)))
             .optional()
             .ok()
@@ -182,23 +219,24 @@ impl Store {
     }
 
     pub fn put_pickle(&self, scope: &str, pickle: &[u8]) -> Result<(), String> {
-        self.conn
-            .prepare_cached(
-                "INSERT INTO keys(scope, pickle) VALUES(?1, ?2)
-                 ON CONFLICT(scope) DO UPDATE SET pickle = excluded.pickle",
-            )
-            .and_then(|mut stmt| stmt.execute(params![scope, pickle]))
-            .map_err(|e| format!("keys: {e}"))?;
+        let conn = guard(&self.write);
+        conn.prepare_cached(
+            "INSERT INTO keys(scope, pickle) VALUES(?1, ?2)
+             ON CONFLICT(scope) DO UPDATE SET pickle = excluded.pickle",
+        )
+        .and_then(|mut stmt| stmt.execute(params![scope, pickle]))
+        .map_err(|e| format!("keys: {e}"))?;
         Ok(())
     }
 
     /// Persist several pickles in one transaction — the crypto engine's
     /// multi-table persist pays one WAL fsync instead of one per scope.
     pub fn put_pickle_batch(&self, puts: &[(&str, &[u8])]) -> Result<(), String> {
+        let conn = guard(&self.write);
         let run = || -> rusqlite::Result<()> {
-            let tx = self.conn.unchecked_transaction()?;
+            let tx = conn.unchecked_transaction()?;
             {
-                let mut stmt = self.conn.prepare_cached(
+                let mut stmt = conn.prepare_cached(
                     "INSERT INTO keys(scope, pickle) VALUES(?1, ?2)
                      ON CONFLICT(scope) DO UPDATE SET pickle = excluded.pickle",
                 )?;
@@ -212,8 +250,8 @@ impl Store {
     }
 
     pub fn del_pickle(&self, scope: &str) -> Result<(), String> {
-        self.conn
-            .prepare_cached("DELETE FROM keys WHERE scope = ?1")
+        let conn = guard(&self.write);
+        conn.prepare_cached("DELETE FROM keys WHERE scope = ?1")
             .and_then(|mut stmt| stmt.execute(params![scope]))
             .map_err(|e| format!("keys: {e}"))?;
         Ok(())
@@ -224,8 +262,8 @@ impl Store {
     /// pickle passphrase is per-username in the secrets file), so keeping them
     /// would make [`Engine::new`] fail with a wrong-passphrase error.
     pub fn clear_pickles(&self) -> Result<(), String> {
-        self.conn
-            .execute("DELETE FROM keys", [])
+        let conn = guard(&self.write);
+        conn.execute("DELETE FROM keys", [])
             .map_err(|e| format!("keys: {e}"))?;
         Ok(())
     }
@@ -252,9 +290,10 @@ impl Store {
     /// row. Re-inserting an existing id is a no-op, like
     /// [`Store::append_message`].
     pub fn insert_message_page(&self, dtos: &[MessageDto]) -> rusqlite::Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
+        let conn = guard(&self.write);
+        let tx = conn.unchecked_transaction()?;
         {
-            let mut stmt = self.conn.prepare_cached(Self::INSERT_MESSAGE)?;
+            let mut stmt = conn.prepare_cached(Self::INSERT_MESSAGE)?;
             for m in dtos {
                 let attachment_json = match &m.attachment {
                     Some(a) => Some(serde_json::to_string(a).unwrap_or_default()),
@@ -283,7 +322,8 @@ impl Store {
         before: Option<i64>,
         limit: u32,
     ) -> Vec<MessageDto> {
-        let mut stmt = match self.conn.prepare_cached(
+        let conn = guard(&self.read);
+        let mut stmt = match conn.prepare_cached(
             "SELECT id, channel_id, sender_id, kind, content, reply_to,
                     attachment_json, created_at_ms
              FROM messages
@@ -319,8 +359,8 @@ impl Store {
 
     /// Fill in the decrypted plaintext for a message (C2/C3 call this).
     pub fn set_plaintext(&self, msg_id: i64, text: &str) -> Result<(), String> {
-        self.conn
-            .prepare_cached("UPDATE messages SET plaintext = ?2 WHERE id = ?1")
+        let conn = guard(&self.write);
+        conn.prepare_cached("UPDATE messages SET plaintext = ?2 WHERE id = ?1")
             .and_then(|mut stmt| stmt.execute(params![msg_id, text]))
             .map_err(|e| format!("messages: {e}"))?;
         Ok(())
@@ -328,8 +368,8 @@ impl Store {
 
     /// The decrypted plaintext of a message, if any (C3 renders from this).
     pub fn plaintext(&self, msg_id: i64) -> Option<String> {
-        self.conn
-            .prepare_cached("SELECT plaintext FROM messages WHERE id = ?1")
+        let conn = guard(&self.read);
+        conn.prepare_cached("SELECT plaintext FROM messages WHERE id = ?1")
             .and_then(|mut stmt| {
                 stmt.query_row(params![msg_id], |r| r.get::<_, Option<String>>(0))
             })
@@ -343,8 +383,8 @@ impl Store {
     /// peers to hide it). Queries filter deleted rows out; the ciphertext
     /// stays for audit.
     pub fn delete_message(&self, msg_id: i64) -> Result<(), String> {
-        self.conn
-            .prepare_cached("UPDATE messages SET deleted = 1 WHERE id = ?1")
+        let conn = guard(&self.write);
+        conn.prepare_cached("UPDATE messages SET deleted = 1 WHERE id = ?1")
             .and_then(|mut stmt| stmt.execute(params![msg_id]))
             .map_err(|e| format!("messages: {e}"))?;
         Ok(())
@@ -354,7 +394,8 @@ impl Store {
     /// have no decrypted plaintext — the retry set for history backfill once
     /// a Megolm session share arrives.
     pub fn undecrypted(&self, channel_id: i64) -> Vec<(i64, i64, String)> {
-        let Ok(mut stmt) = self.conn.prepare_cached(
+        let conn = guard(&self.read);
+        let Ok(mut stmt) = conn.prepare_cached(
             "SELECT id, sender_id, content FROM messages
              WHERE channel_id = ?1 AND deleted = 0 AND plaintext IS NULL
              ORDER BY id",
@@ -378,13 +419,13 @@ impl Store {
     /// sender's own rows cannot be re-decrypted at all (the engine holds
     /// no Megolm self-import).
     pub fn set_file_envelope(&self, msg_id: i64, envelope: &str) -> Result<(), String> {
-        self.conn
-            .prepare_cached(
-                "INSERT INTO file_envelopes(message_id, envelope) VALUES(?1, ?2)
-                 ON CONFLICT(message_id) DO UPDATE SET envelope = excluded.envelope",
-            )
-            .and_then(|mut stmt| stmt.execute(params![msg_id, envelope]))
-            .map_err(|e| format!("file_envelopes: {e}"))?;
+        let conn = guard(&self.write);
+        conn.prepare_cached(
+            "INSERT INTO file_envelopes(message_id, envelope) VALUES(?1, ?2)
+             ON CONFLICT(message_id) DO UPDATE SET envelope = excluded.envelope",
+        )
+        .and_then(|mut stmt| stmt.execute(params![msg_id, envelope]))
+        .map_err(|e| format!("file_envelopes: {e}"))?;
         Ok(())
     }
 
@@ -392,7 +433,8 @@ impl Store {
     /// in a channel that has a persisted File envelope — the rebuild set
     /// for [`crate::state::MainState::file_meta`] after a restart.
     pub fn file_envelopes(&self, channel_id: i64) -> Vec<(i64, String)> {
-        let Ok(mut stmt) = self.conn.prepare_cached(
+        let conn = guard(&self.read);
+        let Ok(mut stmt) = conn.prepare_cached(
             "SELECT fe.message_id, fe.envelope FROM file_envelopes fe
              JOIN messages m ON m.id = fe.message_id
              WHERE m.channel_id = ?1 AND m.deleted = 0",
@@ -431,13 +473,10 @@ impl Store {
         // One transaction for the whole list: per-row autocommit would pay
         // a WAL fsync per friend. `unchecked_transaction` is the `&self`
         // form (the Store is shared behind a Mutex, never `&mut`).
-        let tx = self
-            .conn
-            .unchecked_transaction()
-            .map_err(|e| format!("friends: {e}"))?;
+        let conn = guard(&self.write);
+        let tx = conn.unchecked_transaction().map_err(|e| format!("friends: {e}"))?;
         {
-            let mut stmt = self
-                .conn
+            let mut stmt = conn
                 .prepare_cached(
                     "INSERT INTO friends(id, username, identity_key) VALUES(?1,?2,?3)
                      ON CONFLICT(id) DO UPDATE SET username = excluded.username,
@@ -453,8 +492,8 @@ impl Store {
     }
 
     pub fn friends(&self) -> Vec<AccountBrief> {
-        let Ok(mut stmt) = self
-            .conn
+        let conn = guard(&self.read);
+        let Ok(mut stmt) = conn
             .prepare_cached("SELECT id, username, identity_key FROM friends ORDER BY username")
         else {
             return Vec::new();
@@ -475,21 +514,17 @@ impl Store {
     pub fn upsert_guilds(&self, guilds: &[GuildInfo]) -> Result<(), String> {
         // One transaction across every guild and channel row (see
         // [`Store::upsert_friends`]).
-        let tx = self
-            .conn
-            .unchecked_transaction()
-            .map_err(|e| format!("guilds: {e}"))?;
+        let conn = guard(&self.write);
+        let tx = conn.unchecked_transaction().map_err(|e| format!("guilds: {e}"))?;
         {
-            let mut guild_stmt = self
-                .conn
+            let mut guild_stmt = conn
                 .prepare_cached(
                     "INSERT INTO guilds(id, name, owner_id) VALUES(?1,?2,?3)
                      ON CONFLICT(id) DO UPDATE SET name = excluded.name,
                          owner_id = excluded.owner_id",
                 )
                 .map_err(|e| format!("guilds: {e}"))?;
-            let mut channel_stmt = self
-                .conn
+            let mut channel_stmt = conn
                 .prepare_cached(
                     "INSERT INTO channels(id, guild_id, kind, name) VALUES(?1,?2,?3,?4)
                      ON CONFLICT(id) DO UPDATE SET guild_id = excluded.guild_id,
@@ -511,9 +546,9 @@ impl Store {
     }
 
     pub fn guilds(&self) -> Vec<GuildInfo> {
+        let conn = guard(&self.read);
         let mut out: Vec<GuildInfo> = Vec::new();
-        let Ok(mut stmt) = self
-            .conn
+        let Ok(mut stmt) = conn
             .prepare_cached("SELECT id, name, owner_id FROM guilds ORDER BY name")
         else {
             return out;
@@ -531,10 +566,9 @@ impl Store {
         for g in rows.filter_map(|r| r.ok()) {
             out.push(g);
         }
-        if let Ok(mut stmt) = self
-            .conn
-            .prepare_cached("SELECT id, guild_id, kind, name FROM channels ORDER BY name")
-        {
+        if let Ok(mut stmt) = conn.prepare_cached(
+            "SELECT id, guild_id, kind, name FROM channels ORDER BY name",
+        ) {
             if let Ok(rows) = stmt.query_map([], |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
@@ -559,13 +593,13 @@ impl Store {
     }
 
     pub fn upsert_dm(&self, dm: &DmChannel) -> Result<(), String> {
-        self.conn
-            .prepare_cached(
-                "INSERT INTO dm(channel_id, peer_id) VALUES(?1,?2)
-                 ON CONFLICT(channel_id) DO UPDATE SET peer_id = excluded.peer_id",
-            )
-            .and_then(|mut stmt| stmt.execute(params![dm.channel.id, dm.peer.id]))
-            .map_err(|e| format!("dm: {e}"))?;
+        let conn = guard(&self.write);
+        conn.prepare_cached(
+            "INSERT INTO dm(channel_id, peer_id) VALUES(?1,?2)
+             ON CONFLICT(channel_id) DO UPDATE SET peer_id = excluded.peer_id",
+        )
+        .and_then(|mut stmt| stmt.execute(params![dm.channel.id, dm.peer.id]))
+        .map_err(|e| format!("dm: {e}"))?;
         Ok(())
     }
 
@@ -735,16 +769,62 @@ pub fn bootstrap_engine(
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Apply every migration whose version is above the database's
+/// `PRAGMA user_version`, in order, bumping the version after each step so
+/// a migration runs exactly once per database. A pre-migration database
+/// (`user_version = 0`) created by the old `SCHEMA` constant already had
+/// the `deleted` column folded in; detect that and fast-forward so the v2
+/// `ALTER TABLE` does not fail on the existing column.
+fn run_migrations(write: &Connection) -> rusqlite::Result<()> {
+    let latest = MIGRATIONS.last().map(|(v, _)| *v).unwrap_or(0);
+    let mut current: u32 = write.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if current == 0 && has_column(write, "messages", "deleted")? {
+        // Old code created `messages` with `deleted` already present but
+        // never set user_version; skip ahead to the latest migration's
+        // end state instead of re-ALTERing the column.
+        write.execute_batch(&format!("PRAGMA user_version = {latest}"))?;
+        current = latest;
+    }
+    for &(version, sql) in MIGRATIONS {
+        if version > current {
+            write.execute_batch(sql)?;
+            // `PRAGMA user_version = N` does not accept a bound parameter;
+            // the integer is a compile-time constant formatted in.
+            write.execute_batch(&format!("PRAGMA user_version = {version}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether `table` has a column named `col`. SQLite pragmas do not accept
+/// bound parameters for the table name, so the identifier is interpolated
+/// from a compile-time literal, never user input.
+fn has_column(conn: &Connection, table: &str, col: &str) -> rusqlite::Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+    for r in rows {
+        if r? == col {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn kind_str(k: &MessageKind) -> &'static str {
     match k {
         MessageKind::Chat => "chat",
         MessageKind::Control => "control",
+        // `Unknown` (forward-compat `#[serde(other)]` fallback) and any
+        // future variant: persist as "unknown" so a round-trip through the
+        // store does not downgrade it to "chat".
+        _ => "unknown",
     }
 }
 
 fn parse_kind(s: &str) -> MessageKind {
     match s {
         "control" => MessageKind::Control,
+        "unknown" => MessageKind::Unknown,
         _ => MessageKind::Chat,
     }
 }
@@ -754,6 +834,7 @@ fn kind_str_channel(k: &bysyc_common::protocol::ChannelKind) -> &'static str {
         bysyc_common::protocol::ChannelKind::Text => "text",
         bysyc_common::protocol::ChannelKind::Voice => "voice",
         bysyc_common::protocol::ChannelKind::Dm => "dm",
+        _ => "unknown",
     }
 }
 
@@ -761,6 +842,7 @@ fn parse_kind_channel(s: &str) -> bysyc_common::protocol::ChannelKind {
     match s {
         "voice" => bysyc_common::protocol::ChannelKind::Voice,
         "dm" => bysyc_common::protocol::ChannelKind::Dm,
+        "unknown" => bysyc_common::protocol::ChannelKind::Unknown,
         _ => bysyc_common::protocol::ChannelKind::Text,
     }
 }
@@ -905,5 +987,72 @@ mod tests {
         assert_eq!(h.len(), 64);
         assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(h, random_hex32());
+    }
+
+    #[test]
+    fn migrations_run_on_fresh_db() {
+        let s = tmp_store("fresh");
+        // Opening a brand-new DB runs every migration and lands at the
+        // latest user_version.
+        let latest = MIGRATIONS.last().unwrap().0;
+        let v: u32 = s.read().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, latest);
+        // The v2 column is present and defaults to 0 (filterable).
+        assert!(has_column(&s.read(), "messages", "deleted").unwrap());
+        // End-to-end: a write then a read both work on the migrated schema.
+        s.append_message(&msg(1, 10)).unwrap();
+        assert_eq!(s.messages_for(10, None, 50).len(), 1);
+    }
+
+    #[test]
+    fn migrations_skip_on_reopen() {
+        let path = std::env::temp_dir().join(format!(
+            "bysyc-test-reopen-{}-{}.db",
+            std::process::id(),
+            now_tag()
+        ));
+        let s = Store::open(&path).expect("open");
+        let first: u32 = s.read().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        drop(s);
+        // Reopening an already-migrated DB must not re-run migrations.
+        let s = Store::open(&path).expect("reopen");
+        let second: u32 = s.read().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first, MIGRATIONS.last().unwrap().0);
+    }
+
+    #[test]
+    fn migrations_fast_forward_pre_migration_db() {
+        // Simulate a database created by the old code: the full schema with
+        // `deleted` already folded in, but user_version left at 0 (the old
+        // code never set it). Opening must fast-forward rather than re-ALTER
+        // the existing column (which would error with "duplicate column").
+        let path = std::env::temp_dir().join(format!(
+            "bysyc-test-premig-{}-{}.db",
+            std::process::id(),
+            now_tag()
+        ));
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE messages(
+                    id INTEGER PRIMARY KEY, channel_id INTEGER NOT NULL,
+                    sender_id INTEGER NOT NULL, kind TEXT NOT NULL,
+                    content TEXT NOT NULL, reply_to INTEGER NULL,
+                    attachment_json TEXT NULL, created_at_ms INTEGER NOT NULL,
+                    plaintext TEXT NULL,
+                    deleted INTEGER NOT NULL DEFAULT 0
+                );",
+            )
+            .unwrap();
+            // Deliberately do NOT set user_version.
+        }
+        let s = Store::open(&path).expect("open pre-migration store");
+        let latest = MIGRATIONS.last().unwrap().0;
+        let v: u32 = s.read().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, latest);
+        // And the store is usable after the fast-forward.
+        s.append_message(&msg(1, 10)).unwrap();
+        assert_eq!(s.messages_for(10, None, 50).len(), 1);
     }
 }
