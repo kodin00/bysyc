@@ -1417,6 +1417,7 @@ dependencies = [
  "base64 0.23.1",
  "bysyc-common",
  "futures-util",
+ "hex",
  "rand 0.10.3",
  "redis",
  "reqwest",

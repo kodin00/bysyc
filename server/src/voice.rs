@@ -17,9 +17,8 @@
 //!     current participants, or
 //!   * `call_id` is a **DM channel** (Private Call): `from`/`to` must be
 //!     exactly the channel's `dm_channels` pair,
-//!
-//!   anything else is `Forbidden`. The signal is then published to
-//!   `acct:{to}` with `from` set to the sender.
+//!     anything else is `Forbidden`. The signal is then published to
+//!     `acct:{to}` with `from` set to the sender.
 //!
 //! REST surface: `GET /turn` hands clients the static TURN credentials.
 
@@ -106,8 +105,13 @@ pub async fn join(
     .await?;
 
     let flag = |name: &str| -> ApiResult<bool> {
-        sqlx::Row::try_get(&verdict, name)
-            .map_err(|e| ApiError::internal(format!("corrupt join verdict: {e}")))
+        sqlx::Row::try_get(&verdict, name).map_err(|e| {
+            // Log the row-level detail, then return a fixed generic message —
+            // mirrors From<sqlx::Error> so a corrupt verdict never leaks the
+            // sqlx error through the wire envelope.
+            tracing::error!("corrupt join verdict for column {name}: {e:#}");
+            ApiError::internal("database error")
+        })
     };
     if !flag("joined")? {
         // Map a zero-row insert to its cause by elimination: channel missing
@@ -146,6 +150,7 @@ pub async fn join(
 
 /// Leave a voice channel and publish the updated VoiceState snapshot.
 /// Leaving while not in the channel is a no-op success (no event).
+#[allow(dead_code)] // the WS gateway uses the bulk-delete + publish_channel_snapshot path; this primitive is exercised only by the ignored voice integration test
 pub async fn leave(state: &AppState, channel_id: i64, account_id: i64) -> ApiResult<()> {
     let deleted =
         sqlx::query("DELETE FROM voice_participants WHERE channel_id = $1 AND account_id = $2")
@@ -288,6 +293,19 @@ async fn publish_voice_state(state: &AppState, channel_id: i64, briefs: Vec<Acco
     .await
     {
         tracing::warn!(channel_id, "voice state publish failed: {e}");
+    }
+}
+
+/// Read the current participant snapshot for `channel_id` and publish it to
+/// the channel topic. Used by the WS gateway after a bulk delete of an
+/// account's `voice_participants` rows (reconnect sweep, VoiceLeave-all,
+/// disconnect cleanup) where the deletes already ran in one statement and
+/// only the per-channel publish remains. Best-effort like `leave`: a Redis
+/// or read hiccup degrades to the next snapshot, never surfaces to the caller.
+pub(crate) async fn publish_channel_snapshot(state: &AppState, channel_id: i64) {
+    match participants(state, channel_id, &state.pg).await {
+        Ok(ps) => publish_voice_state(state, channel_id, ps).await,
+        Err(e) => tracing::warn!(channel_id, "voice snapshot read failed: {}", e.message),
     }
 }
 

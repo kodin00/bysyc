@@ -1,0 +1,210 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: fmt & clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # cpal -> alsa-sys links libasound via pkg-config. (opus is vendored
+      # via opusic-sys+cmake, rfd uses ashpd, glutin/winit dlopen GL/X11.)
+      - name: Install native build deps
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.99.0"
+          components: rustfmt, clippy
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          key: lint
+
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  check-test:
+    name: check & test
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: bysyc
+          POSTGRES_PASSWORD: bysyc
+          POSTGRES_DB: bysyc
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U bysyc -d bysyc"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://bysyc:bysyc@localhost/bysyc
+      REDIS_URL: redis://localhost/1
+      S3_ACCESS_KEY: bysyc
+      S3_SECRET_KEY: bysyc
+      S3_BUCKET: bysyc
+      S3_ENDPOINT: http://localhost:8333
+      TURN_ADDR: localhost:3478
+      TURN_USER: bysyc
+      TURN_PASSWORD: bysyc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install native build deps
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.99.0"
+          components: rustfmt, clippy
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          key: check-test
+
+      - name: cargo check
+        run: cargo check --workspace
+
+      # Non-ignored unit tests only; the #[ignore]-gated e2e lives in the
+      # e2e job below (and is double-gated by BYSYC_E2E=1 on top of --ignored).
+      - name: cargo test
+        run: cargo test --workspace
+
+  e2e:
+    name: e2e (best-effort)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: bysyc
+          POSTGRES_PASSWORD: bysyc
+          POSTGRES_DB: bysyc
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U bysyc -d bysyc"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://bysyc:bysyc@localhost/bysyc
+      REDIS_URL: redis://localhost/1
+      S3_ACCESS_KEY: bysyc
+      S3_SECRET_KEY: bysyc
+      S3_BUCKET: bysyc
+      S3_ENDPOINT: http://localhost:8333
+      TURN_ADDR: localhost:3478
+      TURN_USER: bysyc
+      TURN_PASSWORD: bysyc
+      BIND_ADDR: 127.0.0.1:8080
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install native build deps
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.99.0"
+          components: rustfmt, clippy
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          key: e2e
+
+      - name: Build server binary
+        run: cargo build -p bysyc-server
+
+      - name: Start server
+        run: |
+          nohup ./target/debug/bysyc-server > server.log 2>&1 &
+          echo $! > server.pid
+
+      - name: Wait for healthz
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8080/healthz >/dev/null; then
+              echo "server healthy after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "server did not become healthy within 30s" >&2
+          exit 1
+
+      # Mint two registration invites; the first account to register becomes
+      # the Instance admin (count == 0 in auth::register), so A is admin, B
+      # is a normal user — the same shape the dev Instance ends up in.
+      - name: Mint registration invites
+        id: invites
+        run: |
+          a=$(./target/debug/bysyc-server make-invite)
+          b=$(./target/debug/bysyc-server make-invite)
+          echo "invite_a=$a" >> "$GITHUB_OUTPUT"
+          echo "invite_b=$b" >> "$GITHUB_OUTPUT"
+
+      - name: Run e2e (bysyc-client)
+        env:
+          BYSYC_E2E: "1"
+          INVITE_A: ${{ steps.invites.outputs.invite_a }}
+          INVITE_B: ${{ steps.invites.outputs.invite_b }}
+        run: cargo test -p bysyc-client --test e2e -- --ignored --nocapture
+
+      - name: Dump server log
+        if: always()
+        run: cat server.log 2>/dev/null || true
+
+      - name: Stop server
+        if: always()
+        run: |
+          if [ -f server.pid ]; then
+            kill "$(cat server.pid)" 2>/dev/null || true
+          fi
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Runs cargo deny check (advisories, bans, licenses, sources) against
+      # deny.toml. Vulnerability advisories always fail; the rest is tuned
+      # to warn rather than block the current workspace.
+      - uses: EmbarkStudios/cargo-deny-action@v2

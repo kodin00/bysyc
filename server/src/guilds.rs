@@ -32,6 +32,7 @@ use rand::distr::{Alphanumeric, SampleString};
 use crate::db::AppState;
 use crate::error::{ApiError, ApiResult};
 use crate::events;
+use crate::s3;
 use crate::session::Authed;
 
 pub fn router() -> Router<AppState> {
@@ -58,7 +59,10 @@ fn kind_str(kind: &ChannelKind) -> &'static str {
     match kind {
         ChannelKind::Text => "text",
         ChannelKind::Voice => "voice",
-        ChannelKind::Dm => "dm",
+        // `ChannelKind` is `#[non_exhaustive]`; Dm is server-created only and
+        // Unknown (or any future variant) never reaches here — `create_channel`
+        // rejects everything but Text/Voice before calling this.
+        _ => "text",
     }
 }
 
@@ -67,9 +71,10 @@ fn parse_kind(kind: &str) -> ApiResult<ChannelKind> {
         "text" => Ok(ChannelKind::Text),
         "voice" => Ok(ChannelKind::Voice),
         "dm" => Ok(ChannelKind::Dm),
-        other => Err(ApiError::internal(format!(
-            "unknown channel kind in db: {other}"
-        ))),
+        other => {
+            tracing::error!("unknown channel kind in db: {other}");
+            Err(ApiError::internal("database error"))
+        }
     }
 }
 
@@ -122,7 +127,10 @@ async fn member_ids(pool: &sqlx::PgPool, guild_id: i64) -> ApiResult<Vec<i64>> {
 /// `guilds LEFT JOIN channels` query — the same shape list_guilds folds.
 #[allow(clippy::type_complexity)]
 async fn guild_info(pool: &sqlx::PgPool, guild_id: i64) -> ApiResult<GuildInfo> {
-    let rows: Vec<(String, i64, Option<i64>, Option<String>, Option<String>)> = sqlx::query_as(
+    // (guild name, owner id, channel id, channel kind, channel name): one row
+    // per channel, plus a single all-NULL channel row for an empty guild.
+    type Row = (String, i64, Option<i64>, Option<String>, Option<String>);
+    let rows: Vec<Row> = sqlx::query_as(
         "SELECT g.name, g.owner_id, c.id, c.kind, c.name \
          FROM guilds g LEFT JOIN channels c ON c.guild_id = g.id \
          WHERE g.id = $1 ORDER BY c.id",
@@ -419,9 +427,14 @@ async fn create_channel(
     Path(guild_id): Path<i64>,
     Json(req): Json<CreateChannelRequest>,
 ) -> ApiResult<Json<ChannelInfo>> {
-    if matches!(req.kind, ChannelKind::Dm) {
+    // Only Text and Voice are client-creatable: Dm is server-created via
+    // `POST /dms`, and Unknown (a `#[serde(other)]` fallback from a newer peer)
+    // or any future non_exhaustive variant is a malformed request. The DB's
+    // `channels.kind` CHECK only allows 'text'|'voice', so this also prevents
+    // a CHECK-violation 500 on an unknown kind.
+    if !matches!(req.kind, ChannelKind::Text | ChannelKind::Voice) {
         return Err(ApiError::invalid(
-            "dm channels are server-created via POST /dms, not here",
+            "only text and voice channels may be created here (dm is server-created)",
         ));
     }
     require_owner(&state.pg, guild_id, me).await?;
@@ -469,11 +482,38 @@ async fn delete_channel(
     let guild_id = guild_id.ok_or_else(|| ApiError::not_found("no such channel"))?;
 
     require_owner(&state.pg, guild_id, me).await?;
-    // Messages cascade via FK; attachments' message links become NULL.
+
+    // Collect S3 keys before the cascade: DELETE FROM channels cascades
+    // messages (and ON DELETE SET NULL severs the attachments' link) but
+    // never removes the S3 objects, so we best-effort delete them after.
+    let keys: Vec<String> = sqlx::query_scalar(
+        "SELECT s3_key FROM attachments \
+         WHERE message_id IN (SELECT id FROM messages WHERE channel_id = $1)",
+    )
+    .bind(channel_id)
+    .fetch_all(&state.pg)
+    .await?;
+
     sqlx::query("DELETE FROM channels WHERE id = $1")
         .bind(channel_id)
         .execute(&state.pg)
         .await?;
+
+    // Best-effort object removal: the rows are gone (or their message
+    // links NULL), so a leftover object behind an unguessable key is the
+    // only consequence of a failure here. Never fail the request.
+    for key in &keys {
+        let key = key.as_str();
+        if let Err(e) = s3::delete_object(&state, key).await {
+            tracing::warn!(
+                channel_id,
+                key,
+                "channel deleted but object removal failed: {}",
+                e.message
+            );
+        }
+    }
+
     events::publish_to_accounts(
         &state.redis_events,
         &member_ids(&state.pg, guild_id).await?,

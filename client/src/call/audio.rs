@@ -14,18 +14,18 @@
 //!   thread fills with decoded frames). The session thread publishes the
 //!   peer list as an immutable snapshot (`arc-swap`); the cpal output
 //!   callback takes one lock-free snapshot load, bulk-pops every started
-//!   sink into per-peer scratch and mixes with saturation.
+//!   sink into per-peer scratch and mixes with a tanh soft limiter.
 //!
 //! The rings are single-producer/single-consumer with Acquire/Release
 //! indices — the weakest obviously-correct ordering for SPSC (the producer
 //! publishes samples with a Release tail store, the consumer publishes
-//! reads with a Release head store). Per-peer prebuffering (32 ms) keeps a
+//! reads with a Release head store). Per-peer prebuffering (10 ms) keeps a
 //! new stream from crackling before it has jitter margin; overflow drops
 //! the oldest samples to bound latency.
 
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -34,8 +34,12 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 pub const FRAME_SAMPLES: usize = 960;
 /// Ring capacity per direction: 400 ms at 48 kHz (power of two).
 const RING_SAMPLES: usize = 1 << 15; // 32768
-/// Samples buffered before a peer starts playing (jitter margin).
-const PREBUFFER_SAMPLES: usize = 1536; // 32 ms
+/// Samples buffered before a peer starts playing (jitter margin). Kept low
+/// (~10 ms) so the initial playout gap is roughly one Opus frame, not a
+/// whole 32 ms on top of the codec frame; the SPSC ring still absorbs
+/// jitter after that; overflow drops the oldest, never blocking the
+/// writer.
+const PREBUFFER_SAMPLES: usize = 480; // 10 ms
 /// Session sample rate; Opus requires 48 kHz.
 pub const SAMPLE_RATE: u32 = 48_000;
 
@@ -122,7 +126,10 @@ impl SpscRing {
     /// Consumer side: pop up to `out.len()` samples, returning how many
     /// were filled. The remainder is left untouched.
     pub fn pop_into(&self, out: &mut [f32]) -> usize {
-        let head = self.head.load(Ordering::Relaxed); // consumer-owned
+        // Acquire pairs with the producer's Release store of `head` on overflow,
+        // so the slots it dropped (advancing head past) are visible before we
+        // read past them; loading Relaxed here would race the producer.
+        let head = self.head.load(Ordering::Acquire);
         let tail = self.tail.load(Ordering::Acquire);
         let avail = (tail - head) as usize;
         let n = avail.min(out.len());
@@ -212,13 +219,29 @@ pub struct LinearResampler {
     last: f32,
     /// Fractional position within the virtual source stream since `last`.
     frac: f32,
+    /// Anti-aliasing low-pass state: two cascaded biquad sections, each with
+    /// two delay taps (see [`LinearResampler::process_into`]). Only touched
+    /// when `from_rate > SAMPLE_RATE`.
+    lp_state: [[f32; 2]; 2],
+    /// Reused scratch holding the low-passed input (no steady-state alloc).
+    lp_scratch: Vec<f32>,
 }
 
 impl LinearResampler {
     /// `input` is mono at `from_rate`. Resampled 48 kHz samples are appended
     /// to `out` (caller-owned scratch, so nothing allocates once warm) and
     /// the slice to push is returned. On passthrough (`from_rate` is already
-    /// 48 kHz) the input is borrowed directly — no copy at all.
+    /// 48 kHz) the input is borrowed directly, no copy at all.
+    ///
+    /// When *downsampling* (`from_rate > SAMPLE_RATE`) the input is run
+    /// through a 4th-order Butterworth low-pass (see [`lp_coeffs`]) with its
+    /// cutoff just under the new Nyquist (`SAMPLE_RATE / 2`) before the
+    /// linear interpolation/decimation, so energy above the new Nyquist does
+    /// not fold back into the passband as aliasing. The filter state carries
+    /// across calls alongside `last` and `frac`, so the streaming fractional
+    /// read position is preserved.
+    /// Upsampling needs no filter: the original signal is already below the
+    /// new, higher Nyquist.
     pub fn process_into<'a>(
         &mut self,
         input: &'a [f32],
@@ -232,22 +255,92 @@ impl LinearResampler {
             self.last = *input.last().unwrap();
             return input;
         }
-        let step = from_rate as f32 / SAMPLE_RATE as f32;
-        out.clear();
-        out.reserve((input.len() as f32 / step).ceil() as usize + 1);
-        let mut pos = self.frac; // position (in samples) relative to input[0]
-        while pos < input.len() as f32 {
-            let i = pos.floor() as usize;
-            let a = if i == 0 { self.last } else { input[i - 1] };
-            let b = input[i.min(input.len() - 1)];
-            let t = pos - i as f32;
-            out.push(a + (b - a) * t);
-            pos += step;
-        }
-        self.frac = pos - input.len() as f32;
-        self.last = *input.last().unwrap();
+        let (new_frac, new_last) = if from_rate > SAMPLE_RATE {
+            let coeffs = lp_coeffs(from_rate);
+            self.lp_scratch.clear();
+            self.lp_scratch.reserve(input.len());
+            for &s in input {
+                let mut x = s;
+                for (c, z) in coeffs.iter().zip(self.lp_state.iter_mut()) {
+                    // Transposed direct form II biquad.
+                    let y = c.b0 * x + z[0];
+                    z[0] = c.b1 * x - c.a1 * y + z[1];
+                    z[1] = c.b2 * x - c.a2 * y;
+                    x = y;
+                }
+                self.lp_scratch.push(x);
+            }
+            interpolate(&self.lp_scratch, self.last, self.frac, from_rate, out)
+        } else {
+            interpolate(input, self.last, self.frac, from_rate, out)
+        };
+        self.frac = new_frac;
+        self.last = new_last;
         out
     }
+}
+
+/// Normalized (a0 = 1) biquad section coefficients.
+#[derive(Clone, Copy)]
+struct Biquad {
+    b0: f32,
+    b1: f32,
+    b2: f32,
+    a1: f32,
+    a2: f32,
+}
+
+/// 4th-order Butterworth low-pass (two cascaded RBJ biquads) for the
+/// anti-aliasing filter run at `from_rate`. The -3 dB point sits at 0.4 x
+/// `SAMPLE_RATE` (19.2 kHz), a little under the new Nyquist, so the
+/// transition band finishes before the Nyquist instead of straddling it: a
+/// one-pole at the Nyquist is only 3 dB down there and barely touches
+/// content just above it. Voice sits far below the cutoff.
+fn lp_coeffs(from_rate: u32) -> [Biquad; 2] {
+    // Butterworth section Q values for order 4.
+    const QS: [f32; 2] = [0.541_196_1, 1.306_563];
+    let w0 = 2.0 * std::f32::consts::PI * (0.4 * SAMPLE_RATE as f32) / from_rate as f32;
+    let (sin, cos) = w0.sin_cos();
+    QS.map(|q| {
+        let alpha = sin / (2.0 * q);
+        let a0 = 1.0 + alpha;
+        let b = (1.0 - cos) / a0;
+        Biquad {
+            b0: b / 2.0,
+            b1: b,
+            b2: b / 2.0,
+            a1: -2.0 * cos / a0,
+            a2: (1.0 - alpha) / a0,
+        }
+    })
+}
+
+/// Linear-interpolate `src` (sampled at `from_rate`) into `out` at
+/// [`SAMPLE_RATE`], returning the carried fractional position and last
+/// sample for the next call. Split out of [`LinearResampler::process_into`]
+/// so the read loop can run against either the raw input or the low-passed
+/// scratch without holding `&mut self` for the duration.
+fn interpolate(
+    src: &[f32],
+    last: f32,
+    frac: f32,
+    from_rate: u32,
+    out: &mut Vec<f32>,
+) -> (f32, f32) {
+    let step = from_rate as f32 / SAMPLE_RATE as f32;
+    out.clear();
+    out.reserve((src.len() as f32 / step).ceil() as usize + 1);
+    let mut pos = frac; // position (in samples) relative to src[0]
+    while pos < src.len() as f32 {
+        let i = pos.floor() as usize;
+        let a = if i == 0 { last } else { src[i - 1] };
+        let b = src[i.min(src.len() - 1)];
+        let t = pos - i as f32;
+        out.push(a + (b - a) * t);
+        pos += step;
+    }
+    let new_last = src.last().copied().unwrap_or(last);
+    (pos - src.len() as f32, new_last)
 }
 
 /// Average interleaved channels down to mono, appending to `out` (caller
@@ -367,7 +460,8 @@ impl PeerDecoder {
 // ---------------------------------------------------------------------------
 
 /// Mix every started peer sink into `out` (an interleaved f32 device
-/// buffer), saturating each frame to [-1, 1]. A sink starts only once it
+/// buffer), soft-limiting each frame with `tanh` (output stays strictly
+/// inside (-1, 1); quiet speech passes ~unchanged). A sink starts only once it
 /// holds [`PREBUFFER_SAMPLES`] of jitter margin (see [`PeerSink::started`]).
 /// `mix` (one sample per frame) and `peer_scratch` (one buffer per peer) are
 /// caller-owned scratch, grown once and reused so nothing allocates in the
@@ -410,13 +504,16 @@ fn mix_peers_into(
         }
     }
     for (frame, s) in out.chunks_exact_mut(channels).zip(mix.iter()) {
-        let s = s.clamp(-1.0, 1.0);
+        // Soft-limit the mix (tanh): with N peers summing, peaks run well
+        // past 1.0, and tanh compresses the sum smoothly instead of the
+        // harsh discontinuity a hard clamp would impose on every overlap.
+        // Quiet speech (|s| << 1) passes through ~unchanged.
+        let s = s.tanh();
         for ch in frame.iter_mut() {
             *ch = s;
         }
     }
 }
-
 
 /// Open capture + playback and return the shared handles.
 ///
@@ -793,6 +890,70 @@ mod tests {
     }
 
     #[test]
+    fn resampler_downsamples_with_low_pass() {
+        // 220 Hz sine at 96 kHz → 48 kHz: well below the new Nyquist
+        // (24 kHz), so the tone must survive the anti-aliasing low-pass
+        // intact, and the output length is ~half the input (2:1 downsample).
+        let from = 96_000u32;
+        let secs = 2.0f32;
+        let n = (from as f32 * secs) as usize;
+        let input: Vec<f32> = (0..n)
+            .map(|i| (2.0 * std::f32::consts::PI * 220.0 * i as f32 / from as f32).sin())
+            .collect();
+        let mut r = LinearResampler::default();
+        let mut out = Vec::new();
+        r.process_into(&input, from, &mut out);
+        let ratio = out.len() as f32 / input.len() as f32;
+        assert!(
+            (ratio - 0.5).abs() < 0.02,
+            "downsample ratio should be ~0.5, got {ratio}"
+        );
+        let crossings = out
+            .windows(2)
+            .filter(|w| (w[0] < 0.0) != (w[1] < 0.0))
+            .count() as f32;
+        let hz = crossings / 2.0 / (out.len() as f32 / SAMPLE_RATE as f32);
+        assert!(
+            (hz - 220.0).abs() < 6.0,
+            "downsampled tone drifted: {hz:.1} Hz"
+        );
+    }
+
+    #[test]
+    fn resampler_low_pass_attenuates_above_new_nyquist() {
+        // A tone above the new Nyquist (24 kHz) sampled at 96 kHz must be
+        // attenuated by the anti-aliasing low-pass: compare its output
+        // amplitude to a below-Nyquist control of the same input amplitude.
+        // Without the filter, the 30 kHz tone would alias into the passband
+        // and survive at near-full amplitude.
+        let from = 96_000u32;
+        let secs = 1.0f32;
+        let n = (from as f32 * secs) as usize;
+        let control: Vec<f32> = (0..n)
+            .map(|i| (2.0 * std::f32::consts::PI * 1_000.0 * i as f32 / from as f32).sin())
+            .collect();
+        let hot: Vec<f32> = (0..n)
+            .map(|i| (2.0 * std::f32::consts::PI * 30_000.0 * i as f32 / from as f32).sin())
+            .collect();
+        let mut r = LinearResampler::default();
+        let mut control_out = Vec::new();
+        r.process_into(&control, from, &mut control_out);
+        let control_rms =
+            (control_out.iter().map(|s| s * s).sum::<f32>() / control_out.len() as f32).sqrt();
+        // Fresh resampler so the hot tone is not colored by the control's
+        // filter state.
+        let mut r = LinearResampler::default();
+        let mut hot_out = Vec::new();
+        r.process_into(&hot, from, &mut hot_out);
+        let hot_rms = (hot_out.iter().map(|s| s * s).sum::<f32>() / hot_out.len() as f32).sqrt();
+        assert!(
+            hot_rms < control_rms * 0.5,
+            "30 kHz tone should be attenuated below 1 kHz control: \
+             hot {hot_rms:.3} control {control_rms:.3}"
+        );
+    }
+
+    #[test]
     fn opus_roundtrip_preserves_energy() {
         // Sine at 48 kHz, encode/decode a few frames, compare RMS energy
         // (Opus is lossy; require the envelope, not the samples).
@@ -894,7 +1055,11 @@ mod tests {
         // 2-channel interleaved: the same mono sample fills both channels.
         let sink = sink_with(&[0.25f32; 960], true);
         let out = mix(2, &[sink], 960);
-        assert!(out.iter().all(|s| *s == 0.25), "single sink passes through");
+        let want = 0.25f32.tanh();
+        assert!(
+            out.iter().all(|s| *s == want),
+            "single sink passes through the soft limiter"
+        );
     }
 
     #[test]
@@ -902,20 +1067,32 @@ mod tests {
         let a = sink_with(&[0.4f32; 32], true);
         let b = sink_with(&[0.5f32; 32], true);
         let out = mix(1, &[a, b], 32);
-        assert!(out.iter().all(|s| *s == 0.9), "two sinks sum per frame");
+        let want = 0.9f32.tanh();
+        assert!(
+            out.iter().all(|s| (*s - want).abs() < 1e-6),
+            "two sinks sum per frame, then soft-limit"
+        );
     }
 
     #[test]
-    fn mix_saturates_above_unity_and_below_neg_unity() {
-        // 0.8 + 0.8 = 1.6 → clamp to +1.0.
+    fn mix_soft_limits_above_unity_and_below_neg_unity() {
+        // 0.8 + 0.8 = 1.6 → tanh(1.6): compressed, strictly below +1.0.
         let a = sink_with(&[0.8f32; 16], true);
         let b = sink_with(&[0.8f32; 16], true);
         let out = mix(1, &[a, b], 16);
-        assert!(out.iter().all(|s| *s == 1.0), "positive saturation to +1.0");
-        // A single sink at -1.5 clamps to -1.0.
+        let want = 1.6f32.tanh();
+        assert!(
+            out.iter().all(|s| (*s - want).abs() < 1e-6 && *s < 1.0),
+            "positive peaks soft-limit below +1.0"
+        );
+        // A single sink at -1.5 maps to tanh(-1.5), strictly above -1.0.
         let c = sink_with(&[-1.5f32; 16], true);
         let out = mix(1, &[c], 16);
-        assert!(out.iter().all(|s| *s == -1.0), "negative saturation to -1.0");
+        let want = (-1.5f32).tanh();
+        assert!(
+            out.iter().all(|s| (*s - want).abs() < 1e-6 && *s > -1.0),
+            "negative peaks soft-limit above -1.0"
+        );
     }
 
     #[test]
@@ -924,7 +1101,10 @@ mod tests {
         // prebuffer gate keeps it silent.
         let sink = sink_with(&[1.0f32; 100], false);
         let out = mix(1, std::slice::from_ref(&sink), 100);
-        assert!(out.iter().all(|s| *s == 0.0), "below-prebuffer sink must not play");
+        assert!(
+            out.iter().all(|s| *s == 0.0),
+            "below-prebuffer sink must not play"
+        );
         assert!(
             !sink.started.load(Ordering::Relaxed),
             "below PREBUFFER the gate must not auto-start"
@@ -932,8 +1112,15 @@ mod tests {
         // Once the ring holds PREBUFFER_SAMPLES the same call auto-starts it.
         let full = sink_with(&[1.0f32; PREBUFFER_SAMPLES], false);
         let out = mix(1, std::slice::from_ref(&full), 64);
-        assert!(full.started.load(Ordering::Relaxed), ">= PREBUFFER auto-starts");
-        assert!(out.iter().all(|s| *s == 1.0), "auto-started sink plays");
+        assert!(
+            full.started.load(Ordering::Relaxed),
+            ">= PREBUFFER auto-starts"
+        );
+        let want = 1.0f32.tanh();
+        assert!(
+            out.iter().all(|s| (*s - want).abs() < 1e-6),
+            "auto-started sink plays"
+        );
     }
 
     #[test]
@@ -942,7 +1129,10 @@ mod tests {
         // the sink contributes nothing, output stays silent.
         let sink = sink_with(&[], true);
         let out = mix(1, std::slice::from_ref(&sink), 64);
-        assert!(out.iter().all(|s| *s == 0.0), "empty started sink is silent");
+        assert!(
+            out.iter().all(|s| *s == 0.0),
+            "empty started sink is silent"
+        );
         assert!(
             sink.ring.underflow_count() > 0,
             "an empty started sink must count the underflow"
@@ -962,8 +1152,9 @@ mod tests {
 
         let out = mix(1, &[sink], RING_SAMPLES);
         assert_eq!(out.len(), RING_SAMPLES);
-        assert_eq!(out[0], 1.0, "head is the surviving 1.0");
-        assert_eq!(out[RING_SAMPLES - 960], 0.5, "the pushed 0.5 begins here");
-        assert_eq!(out[RING_SAMPLES - 1], 0.5, "tail is the newest 0.5");
+        let (hi, lo) = (1.0f32.tanh(), 0.5f32.tanh());
+        assert_eq!(out[0], hi, "head is the surviving 1.0");
+        assert_eq!(out[RING_SAMPLES - 960], lo, "the pushed 0.5 begins here");
+        assert_eq!(out[RING_SAMPLES - 1], lo, "tail is the newest 0.5");
     }
 }

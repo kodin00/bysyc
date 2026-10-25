@@ -94,6 +94,10 @@ async fn create_attachment(
     s3::ensure_bucket(&state).await?;
     let s3_key = format!("att/{}", Alphanumeric.sample_string(&mut rand::rng(), 32));
 
+    // Presign the PUT before inserting the row, so a signing failure
+    // leaves no dangling attachment record pointing at an unsigned key.
+    let upload_url = s3::presign_put(&state, &s3_key, UPLOAD_URL_TTL).await?;
+
     let row = sqlx::query(
         "INSERT INTO attachments(name, size, nonce, s3_key, uploader_id) \
                            VALUES ($1, $2, $3, $4, $5) RETURNING id",
@@ -105,10 +109,7 @@ async fn create_attachment(
     .bind(me)
     .fetch_one(&state.pg)
     .await?;
-    let id: i64 = sqlx::Row::try_get(&row, "id")
-        .map_err(|e| ApiError::internal(format!("reading attachment id: {e}")))?;
-
-    let upload_url = s3::presign_put(&state, &s3_key, UPLOAD_URL_TTL).await?;
+    let id: i64 = sqlx::Row::try_get(&row, "id")?;
 
     Ok(Json(CreateAttachmentResponse {
         attachment: AttachmentMeta {
@@ -181,9 +182,26 @@ async fn upload_image(
     .bind(me)
     .bind(false)
     .fetch_one(&state.pg)
-    .await?;
-    let id: i64 = sqlx::Row::try_get(&row, "id")
-        .map_err(|e| ApiError::internal(format!("reading attachment id: {e}")))?;
+    .await;
+    let row = match row {
+        Ok(r) => r,
+        Err(e) => {
+            // The object is already in storage; if the row INSERT failed we
+            // must not leave an orphaned object behind an unindexed key.
+            // Best-effort cleanup, then surface a generic database error;
+            // the raw sqlx error never reaches the response body.
+            tracing::error!(key = %s3_key, "db error: {e:#}");
+            if let Err(del) = s3::delete_object(&state, &s3_key).await {
+                tracing::warn!(
+                    key = %s3_key,
+                    "image stored but object removal failed: {}",
+                    del.message
+                );
+            }
+            return Err(ApiError::internal("database error"));
+        }
+    };
+    let id: i64 = sqlx::Row::try_get(&row, "id")?;
 
     Ok(Json(ImageUploadResponse {
         attachment: AttachmentMeta {
@@ -196,24 +214,42 @@ async fn upload_image(
     }))
 }
 
-/// GET /attachments/{id}/download-url — short-lived presigned GET.
+/// GET /attachments/{id}/download-url: short-lived presigned GET.
 ///
-/// v1 membership model: any authenticated Account can mint a download URL
-/// for any attachment id. This is deliberate — the s3 key is unguessable
-/// (128 random hex chars), the URL expires in 10 minutes, and the bytes it
-/// serves are ciphertext only this account's peers can decrypt anyway.
-/// Message visibility (who learns an attachment id at all) is already
-/// gated by channel membership in messages/guild endpoints.
+/// Membership-gated before signing. The caller must be the uploader of an
+/// unclaimed attachment (one not yet sent) or a reader of the channel the
+/// attachment's message lives in. Image attachments are plaintext WebP, so
+/// without this check any authenticated account could enumerate ids and
+/// mint a GET for another member's images.
 async fn download_url(
     State(state): State<AppState>,
-    Authed(_me): Authed,
+    Authed(me): Authed,
     Path(id): Path<i64>,
 ) -> ApiResult<Json<DownloadUrlResponse>> {
-    let s3_key: Option<String> = sqlx::query_scalar("SELECT s3_key FROM attachments WHERE id = $1")
-        .bind(id)
-        .fetch_optional(&state.pg)
-        .await?;
-    let s3_key = s3_key.ok_or_else(|| ApiError::not_found("no such attachment"))?;
+    let row: Option<(String, Option<i64>, i64)> =
+        sqlx::query_as("SELECT s3_key, message_id, uploader_id FROM attachments WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&state.pg)
+            .await?;
+    let Some((s3_key, message_id, uploader_id)) = row else {
+        return Err(ApiError::not_found("no such attachment"));
+    };
+
+    if let Some(msg_id) = message_id {
+        // The attachment is claimed by a message; the caller must be a
+        // reader of the channel that message lives in.
+        let channel_id: i64 = sqlx::query_scalar("SELECT channel_id FROM messages WHERE id = $1")
+            .bind(msg_id)
+            .fetch_one(&state.pg)
+            .await?;
+        if !crate::messages::can_read(&state.pg, me, channel_id).await? {
+            return Err(ApiError::forbidden("not a member of this channel"));
+        }
+    } else if uploader_id != me {
+        // Unclaimed attachment (not yet sent): only the uploader may mint
+        // a URL, e.g. to retry a failed PUT before sending.
+        return Err(ApiError::forbidden("not the uploader of this attachment"));
+    }
 
     let url = s3::presign_get(&state, &s3_key, DOWNLOAD_URL_TTL).await?;
     let expires_at_ms = now_ms() + DOWNLOAD_URL_TTL.as_millis() as i64;

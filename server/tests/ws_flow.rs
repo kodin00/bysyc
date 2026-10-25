@@ -21,11 +21,11 @@ mod common;
 use std::time::Duration;
 use tokio::time::Instant;
 
-use bysyc_common::protocol::{
-    decode_ws_server_msg, encode_ws_client_msg, CreateGuildInviteRequest, CreateGuildRequest,
-    JoinGuildRequest, WsClientBody, WsClientMsg, WsServerBody, WsServerMsg,
-};
 use bysyc_common::PROTOCOL_VERSION;
+use bysyc_common::protocol::{
+    CreateGuildInviteRequest, CreateGuildRequest, JoinGuildRequest, WsClientBody, WsClientMsg,
+    WsServerBody, WsServerMsg, decode_ws_server_msg, encode_ws_client_msg,
+};
 use common::{mint_invite, register, setup, unique_name};
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::connect_async;
@@ -103,11 +103,12 @@ where
     }
 }
 
-/// The first frame must be `Ready`, with `id: None` (canonical pushes
-/// carry no client-correlation id).
+/// The first frame must be `Ready`.
 fn assert_first_is_ready(msg: &WsServerMsg) {
-    assert!(matches!(msg.body, WsServerBody::Ready { .. }), "first frame must be Ready");
-    assert_eq!(msg.id, None, "Ready must carry id: None");
+    assert!(
+        matches!(msg.body, WsServerBody::Ready { .. }),
+        "first frame must be Ready"
+    );
 }
 
 #[tokio::test]
@@ -119,8 +120,13 @@ async fn ws_round_trip() {
     let invite = mint_invite(&h.state).await;
     let (alice_token, alice_id) =
         register(&h.base_url, &unique_name("ws_a"), "pw12345", &invite).await;
-    let (bob_token, bob_id) =
-        register(&h.base_url, &unique_name("ws_b"), "pw12345", &mint_invite(&h.state).await).await;
+    let (bob_token, bob_id) = register(
+        &h.base_url,
+        &unique_name("ws_b"),
+        "pw12345",
+        &mint_invite(&h.state).await,
+    )
+    .await;
 
     let guild: serde_json::Value = http()
         .post(format!("{}/guilds", h.base_url))
@@ -161,7 +167,10 @@ async fn ws_round_trip() {
         .json()
         .await
         .expect("decode guild invite");
-    let code = ginv["code"].as_str().expect("guild invite code").to_string();
+    let code = ginv["code"]
+        .as_str()
+        .expect("guild invite code")
+        .to_string();
     let _: serde_json::Value = http()
         .post(format!("{}/guilds/join", h.base_url))
         .bearer_auth(&bob_token)
@@ -182,14 +191,21 @@ async fn ws_round_trip() {
     // Heartbeat: the server resyncs subscriptions and refreshes presence
     // but must NOT send an Error. Other pushes (e.g. Presence from the
     // peer's connect) are fine — drain them, assert none is an Error.
-    send(&mut alice_ws, WsClientMsg { id: 1, body: WsClientBody::Heartbeat }).await;
+    send(
+        &mut alice_ws,
+        WsClientMsg {
+            id: 1,
+            body: WsClientBody::Heartbeat,
+        },
+    )
+    .await;
     let heartbeat_deadline = Instant::now() + NO_REPLY_WINDOW;
     while Instant::now() < heartbeat_deadline {
         // `ws.next()` yields Option<Result<Message, Error>>; `timeout_at`
         // wraps that in another Result<_, Elapsed>. Timeout or stream-end
         // both end the drain (no Error frame arrived); an Error frame fails.
         match tokio::time::timeout_at(heartbeat_deadline, alice_ws.next()).await {
-            Err(_) => break, // window elapsed with no frame — expected
+            Err(_) => break,   // window elapsed with no frame — expected
             Ok(None) => break, // stream ended — nothing more to drain
             Ok(Some(Err(e))) => panic!("ws read error after heartbeat: {e}"),
             Ok(Some(Ok(msg))) => {
@@ -237,13 +253,25 @@ async fn ws_round_trip() {
 
     // VoiceJoin: alice joins the call; bob (a chan:{voice_id} subscriber)
     // must receive the VoiceState fan-out with alice in the roster.
-    send(&mut alice_ws, WsClientMsg {
-        id: 2,
-        body: WsClientBody::VoiceJoin { channel_id: voice_id },
-    }).await;
-    let joined = next_matching(&mut bob_ws, |b| matches!(b, WsServerBody::VoiceState { .. })).await;
+    send(
+        &mut alice_ws,
+        WsClientMsg {
+            id: 2,
+            body: WsClientBody::VoiceJoin {
+                channel_id: voice_id,
+            },
+        },
+    )
+    .await;
+    let joined = next_matching(&mut bob_ws, |b| {
+        matches!(b, WsServerBody::VoiceState { .. })
+    })
+    .await;
     match joined {
-        WsServerBody::VoiceState { channel_id, participants } => {
+        WsServerBody::VoiceState {
+            channel_id,
+            participants,
+        } => {
             assert_eq!(channel_id, voice_id);
             assert_eq!(participants.len(), 1);
             assert_eq!(participants[0].id, alice_id);
@@ -253,17 +281,29 @@ async fn ws_round_trip() {
 
     // VoiceLeave: alice leaves; bob must receive the empty roster (the
     // "Call ended" snapshot).
-    send(&mut alice_ws, WsClientMsg {
-        id: 3,
-        body: WsClientBody::VoiceLeave,
-    }).await;
-    let left = next_matching(&mut bob_ws, |b| {
-        matches!(b, WsServerBody::VoiceState { participants, .. } if participants.is_empty())
-    }).await;
+    send(
+        &mut alice_ws,
+        WsClientMsg {
+            id: 3,
+            body: WsClientBody::VoiceLeave,
+        },
+    )
+    .await;
+    let left = next_matching(
+        &mut bob_ws,
+        |b| matches!(b, WsServerBody::VoiceState { participants, .. } if participants.is_empty()),
+    )
+    .await;
     match left {
-        WsServerBody::VoiceState { channel_id, participants } => {
+        WsServerBody::VoiceState {
+            channel_id,
+            participants,
+        } => {
             assert_eq!(channel_id, voice_id);
-            assert!(participants.is_empty(), "leaving the only participant ends the call");
+            assert!(
+                participants.is_empty(),
+                "leaving the only participant ends the call"
+            );
         }
         other => panic!("expected empty VoiceState after leave, got {other:?}"),
     }

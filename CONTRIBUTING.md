@@ -85,6 +85,6 @@ as if written by a human.
 Never commit secrets (`.env`, invite codes, keys). The server reads
 its secrets from `.env` (copy `.env.example`); the client keeps its
 session token and pickle passphrase in a local 0600 file, never the OS
-keychain (ADR-0005). Server-side, `chmod 600 .env` and back it up
+keychain (ADR-0006). Server-side, `chmod 600 .env` and back it up
 somewhere safe; losing `POSTGRES_PASSWORD` locks you out of your own
 DB.

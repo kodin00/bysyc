@@ -19,21 +19,19 @@
 // helper.
 #![allow(dead_code)]
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use bysyc_common::protocol::{
-    ApiError, LoginRequest, RegisterRequest, TokenResponse,
-};
+use bysyc_common::protocol::{AccountInfo, ApiError, LoginRequest, RegisterRequest, TokenResponse};
 use testcontainers::{
+    GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
-    GenericImage, ImageExt,
 };
 
 use bysyc_server::ws;
-use bysyc_server::{boot, router, session, AppState, Config};
+use bysyc_server::{AppState, Config, boot, router, session};
 
 /// How long a readiness poll keeps retrying before giving up. First runs pay
 /// the image pull; warm runs finish in a second or two.
@@ -92,8 +90,8 @@ fn env() -> &'static EnvUrls {
     })
 }
 
-async fn start_backing_services(
-) -> Result<(EnvUrls, Containers), Box<dyn std::error::Error + Send + Sync>> {
+async fn start_backing_services()
+-> Result<(EnvUrls, Containers), Box<dyn std::error::Error + Send + Sync>> {
     let pg = GenericImage::new("postgres", "16")
         .with_exposed_port(5432.tcp())
         .with_wait_for(WaitFor::message_on_stderr(
@@ -106,9 +104,7 @@ async fn start_backing_services(
         .await?;
     let redis = GenericImage::new("redis", "7")
         .with_exposed_port(6379.tcp())
-        .with_wait_for(WaitFor::message_on_stdout(
-            "Ready to accept connections",
-        ))
+        .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
         .start()
         .await?;
     let s3 = GenericImage::new("localstack/localstack", "latest")
@@ -233,7 +229,9 @@ pub async fn setup() -> Harness {
     };
     let state = boot(&config).await.expect("boot");
     let app = router(state.clone());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
     let port = listener.local_addr().expect("local_addr").port();
     let server = tokio::spawn(async move {
         let _ = axum::serve(
@@ -292,7 +290,14 @@ pub async fn mint_admin(state: &AppState) -> (String, i64) {
     .fetch_one(&state.pg)
     .await
     .unwrap_or_else(|e| panic!("mint admin: {e}"));
-    let token = session::create(&state.redis, id)
+    let info = AccountInfo {
+        id,
+        username,
+        identity_key: "a2V5".to_string(),
+        created_at_ms: 0,
+        is_admin: true,
+    };
+    let token = session::create(&state.redis, id, &info)
         .await
         .map_err(|e| format!("session create: {:?} {}", e.code, e.message))
         .unwrap();

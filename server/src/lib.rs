@@ -18,7 +18,7 @@ pub mod voice;
 pub mod ws;
 
 pub use config::Config;
-pub use db::{AppState, connect_pool, migrate, bootstrap, make_invite};
+pub use db::{AppState, bootstrap, connect_pool, make_invite, migrate};
 pub use routes::router;
 
 pub async fn boot(config: &Config) -> anyhow::Result<db::AppState> {

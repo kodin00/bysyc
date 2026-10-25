@@ -97,8 +97,7 @@ mod dirty {
     /// Queued Megolm session shares not yet mailed out.
     pub(crate) const PENDING_SHARES: u8 = 1 << 4;
     /// Everything — what [`Engine::new`] persists up front.
-    pub(crate) const ALL: u8 =
-        OLM_ACCOUNT | OLM_SESSIONS | MEGOLM_OUT | MEGOLM_IN | PENDING_SHARES;
+    pub(crate) const ALL: u8 = OLM_ACCOUNT | OLM_SESSIONS | MEGOLM_OUT | MEGOLM_IN | PENDING_SHARES;
 }
 
 /// The E2EE engine. Interior-mutable and thread-safe (`Send + Sync`);
@@ -485,7 +484,9 @@ impl Engine {
         for (sid, session) in candidates.iter_mut() {
             match decrypt_one(sid, session) {
                 Ok(text) => {
-                    inner.megolm_hint.insert((channel_id, sender_id), sid.clone());
+                    inner
+                        .megolm_hint
+                        .insert((channel_id, sender_id), sid.clone());
                     return Ok(text);
                 }
                 Err(e) => last_err = e,
@@ -514,7 +515,7 @@ impl Engine {
     /// *omitted* (rather than erroring the whole batch) when no session
     /// exists with it and its OTK could not be used — the caller retries
     /// those peers after claiming fresh keys. Do not include ourselves.
-    #[allow(clippy::type_complexity)]
+    #[allow(clippy::type_complexity)] // (account, username, Option<(identity, signing)>) peer batch
     pub fn share_envelopes(
         &self,
         channel_id: i64,
@@ -690,7 +691,8 @@ impl Engine {
         inner.account = account;
         inner.olm_sessions.clear();
         inner.dirty |= dirty::OLM_ACCOUNT | dirty::OLM_SESSIONS;
-        self.persist(&mut inner).context("persisting imported identity")
+        self.persist(&mut inner)
+            .context("persisting imported identity")
     }
 
     /// Pickle exactly the state tables operations marked dirty (bitset in
@@ -709,7 +711,11 @@ impl Engine {
 
         let mut writes: Vec<(&'static str, Vec<u8>)> = Vec::new();
         if dirty & dirty::OLM_ACCOUNT != 0 {
-            let blob = inner.account.pickle().encrypt(&self.pickle_key).into_bytes();
+            let blob = inner
+                .account
+                .pickle()
+                .encrypt(&self.pickle_key)
+                .into_bytes();
             writes.push((SCOPE_OLM_ACCOUNT, blob));
         }
         if dirty & dirty::OLM_SESSIONS != 0 {
@@ -1346,9 +1352,7 @@ mod tests {
         assert_eq!(wrote(&bob_store), ["olm_account", "olm_sessions"]);
 
         // Steady-state olm: one session-table write per direction.
-        let reply = bob
-            .olm_encrypt_to(ALICE, &alice_key, None, "yo")
-            .unwrap();
+        let reply = bob.olm_encrypt_to(ALICE, &alice_key, None, "yo").unwrap();
         assert_eq!(wrote(&bob_store), ["olm_sessions"]);
         assert!(alice.olm_decrypt_from(BOB, &bob_key, &reply).is_ok());
         assert_eq!(wrote(&alice_store), ["olm_sessions"]);
@@ -1374,8 +1378,16 @@ mod tests {
             .unwrap();
         assert_eq!(wrote(&bob_store), ["megolm_in"]);
         wrote(&bob_store);
-        assert!(bob.megolm_decrypt(7, ALICE, &sid, &ct0).unwrap().contains("m\""));
-        assert!(bob.megolm_decrypt(7, ALICE, "", &ct1).unwrap().contains("m2"));
+        assert!(
+            bob.megolm_decrypt(7, ALICE, &sid, &ct0)
+                .unwrap()
+                .contains("m\"")
+        );
+        assert!(
+            bob.megolm_decrypt(7, ALICE, "", &ct1)
+                .unwrap()
+                .contains("m2")
+        );
         assert!(wrote(&bob_store).is_empty());
     }
 
@@ -1411,7 +1423,12 @@ mod tests {
 
         // The hint names sid0, so the new session's message goes hint-miss →
         // scan, and the hint moves to the winner.
-        assert!(world.bob.megolm_decrypt(CHANNEL, ALICE, "", &ct_new).is_ok());
+        assert!(
+            world
+                .bob
+                .megolm_decrypt(CHANNEL, ALICE, "", &ct_new)
+                .is_ok()
+        );
         assert_eq!(
             world.bob.lock().megolm_hint.get(&(CHANNEL, ALICE)),
             Some(&sid1)

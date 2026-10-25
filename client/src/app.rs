@@ -179,12 +179,12 @@ fn install_fonts(ctx: &egui::Context) {
     // further edits.
     fonts.font_data.insert(
         "NotoEmoji-Regular".to_owned(),
-        std::sync::Arc::new(egui::FontData::from_static(NOTO_EMOJI).tweak(
-            egui::FontTweak {
+        std::sync::Arc::new(
+            egui::FontData::from_static(NOTO_EMOJI).tweak(egui::FontTweak {
                 scale: 0.81, // Make smaller — matches the builtin entry
                 ..Default::default()
-            },
-        )),
+            }),
+        ),
     );
     ctx.set_fonts(fonts);
 }
@@ -245,9 +245,7 @@ fn installed_font_covers_modern_emoji() {
         "🙂 and 🥲 both resolved to the same (replacement) glyph"
     );
 
-    let axes = ctx.fonts(|f| {
-        f.definitions().font_data["NotoEmoji-Regular"].variation_axes()
-    });
+    let axes = ctx.fonts(|f| f.definitions().font_data["NotoEmoji-Regular"].variation_axes());
     assert!(
         !axes.is_empty(),
         "live NotoEmoji-Regular is static — the shipped variable font was not installed"

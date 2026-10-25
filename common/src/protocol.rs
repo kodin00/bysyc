@@ -36,6 +36,23 @@
 //! with MessagePack (see the codec helpers at the bottom of this module);
 //! REST bodies remain JSON, built from the same types.
 //!
+//! # Versioning and compatibility
+//!
+//! - Every wire enum ([`ErrorCode`], [`ChannelKind`], [`MessageKind`],
+//!   [`CallSignalKind`], [`WsClientBody`], [`WsServerBody`]) is
+//!   `#[non_exhaustive]` and carries an `Unknown` fallback variant annotated
+//!   `#[serde(other)]`. An unrecognized variant tag on the wire deserializes
+//!   to `Unknown` rather than producing an `Err`, so an older peer is not
+//!   killed by a newer peer's vocabulary.
+//! - Clients MUST handle `Unknown` gracefully: log and ignore, never tear
+//!   down the connection over it.
+//! - Servers MUST NOT rely on clients understanding newer variants; anything
+//!   new a server emits lands as `Unknown` on an older client and is ignored.
+//! - v2 servers do NOT support v1 clients. v1 used JSON text frames on the
+//!   gateway; v2 uses binary MessagePack. The two are wire-incompatible with
+//!   no on-the-wire negotiation, and a v1 client is rejected at the
+//!   `protocol` query parameter rather than silently degraded.
+//!
 //! # REST error envelope
 //!
 //! Every failing REST response carries a JSON body of [`ApiError`]. The
@@ -133,6 +150,7 @@ pub struct AccountInfo {
 /// [`Internal`]: ErrorCode::Internal
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ErrorCode {
     /// 401 — missing, expired or invalid session token.
     Unauthorized,
@@ -155,6 +173,11 @@ pub enum ErrorCode {
     InvalidRequest,
     /// 500 — unexpected server-side failure.
     Internal,
+    /// Fallback for an unrecognized error code on the wire. A newer server
+    /// may emit codes this version does not know; clients log and ignore.
+    /// Never produced by this server, only absorbed on read.
+    #[serde(other)]
+    Unknown,
 }
 
 /// The JSON body of every failing REST response.
@@ -178,6 +201,7 @@ pub struct ApiError {
 /// Body of the registration endpoint. Creating an Account requires a
 /// admin-issued Registration Invite (see `CONTEXT.md`).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct RegisterRequest {
     /// Desired username; taken usernames yield [`ErrorCode::UsernameTaken`].
     pub username: String,
@@ -193,6 +217,7 @@ pub struct RegisterRequest {
 
 /// Body of the login endpoint.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct LoginRequest {
     /// Username to sign in.
     pub username: String,
@@ -217,6 +242,7 @@ pub struct TokenResponse {
 /// Batch-upload of Olm one-time prekeys so peers can start an encrypted DM
 /// while this Account is offline.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct UploadOtkRequest {
     /// One-time prekey entries, each the single string `"{key_id}:{b64
     /// pubkey}"` (the id must not contain `:`). Stored and re-served
@@ -290,6 +316,7 @@ pub struct FriendList {
 /// [`ErrorCode::InvalidRequest`]).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ChannelKind {
     /// Text Channel: Messages (Megolm-encrypted).
     Text,
@@ -298,6 +325,9 @@ pub enum ChannelKind {
     /// Direct-message channel between exactly two Friends; server-created
     /// only (see [`DmChannel`] / [`OpenDmRequest`]).
     Dm,
+    /// Fallback for an unrecognized channel kind on the wire.
+    #[serde(other)]
+    Unknown,
 }
 
 /// A single Channel. For DMs `guild_id` is `None` (and omitted on the wire)
@@ -332,6 +362,7 @@ pub struct GuildInfo {
 
 /// Body of "create guild".
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct CreateGuildRequest {
     /// New Guild's name.
     pub name: String,
@@ -341,6 +372,7 @@ pub struct CreateGuildRequest {
 /// [`ChannelKind::Text`] or [`ChannelKind::Voice`]; sending `Dm` is rejected
 /// with [`ErrorCode::InvalidRequest`].
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct CreateChannelRequest {
     /// New Channel's name.
     pub name: String,
@@ -351,6 +383,7 @@ pub struct CreateChannelRequest {
 /// Body of "create guild invite", issued by the Guild Owner. Both limits are
 /// optional; `None` means unconstrained.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct CreateGuildInviteRequest {
     /// Maximum number of times the code may be accepted, or `None` for
     /// unlimited.
@@ -379,6 +412,7 @@ pub struct GuildInviteDto {
 
 /// Body of "join guild" with a previously shared code.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct JoinGuildRequest {
     /// Guild Invite code to redeem.
     pub code: String,
@@ -398,6 +432,7 @@ pub struct DmChannel {
 /// Body of "open DM" with a Friend. Idempotent: the server returns the
 /// existing [`DmChannel`] when one already exists, otherwise creates one.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct OpenDmRequest {
     /// Account id of the Friend to talk to. Non-friends yield
     /// [`ErrorCode::Forbidden`].
@@ -448,11 +483,15 @@ pub struct AttachmentMeta {
 /// them.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum MessageKind {
     /// Human-visible conversation Message.
     Chat,
     /// Crypto housekeeping envelope; never rendered by clients.
     Control,
+    /// Fallback for an unrecognized message kind on the wire.
+    #[serde(other)]
+    Unknown,
 }
 
 /// A Message: the ciphertext envelope clients exchange through the
@@ -484,6 +523,7 @@ pub struct MessageDto {
 
 /// Body of "send message" into a channel.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct SendMessageRequest {
     /// `Chat` for user text, `Control` for crypto housekeeping.
     pub kind: MessageKind,
@@ -520,6 +560,7 @@ pub struct MessagePage {
 /// Body of "create attachment": reserve storage for a client-side-encrypted
 /// file before uploading.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct CreateAttachmentRequest {
     /// File name to store alongside the ciphertext.
     pub name: String,
@@ -577,6 +618,7 @@ pub struct DownloadUrlResponse {
 /// [`WsServerBody::CallSignal`] with `from` set to the sender.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum CallSignalKind {
     /// SDP offer initiating (or re-offering) a peer connection.
     Offer {
@@ -598,6 +640,10 @@ pub enum CallSignalKind {
     },
     /// Leave the Call / tear down the peer connection.
     Hangup,
+    /// Fallback for an unrecognized signaling payload on the wire. Relayed
+    /// verbatim by the server; clients that do not understand it drop it.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Envelope for every client→server WebSocket message.
@@ -625,7 +671,8 @@ pub struct WsClientMsg {
 
 /// Payload of a client→server WebSocket message.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(rename_all = "snake_case")]
+#[serde(remote = "Self", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum WsClientBody {
     /// Liveness ping; the server answers nothing special (the transport
     /// itself proves liveness) but may use it to reset idle timers.
@@ -664,18 +711,19 @@ pub enum WsClientBody {
         /// The signaling payload.
         kind: CallSignalKind,
     },
+    /// Fallback for an unrecognized client→server variant. The server logs
+    /// and ignores it; it never replies with an error for an unknown tag.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Envelope for every server→client WebSocket message. The first message on
-/// any connection is [`WsServerBody::Ready`].
+/// any connection is [`WsServerBody::Ready`]. The envelope carries only the
+/// payload; per-message correlation, where attributable, lives inside
+/// [`WsServerBody::Error::reply_to`] (echoing [`WsClientMsg::id`]). The
+/// server never assigns its own sequence number.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct WsServerMsg {
-    /// Server-assigned sequence number for this message on this
-    /// connection, when applicable; `None` otherwise.
-    // Not skipped when None (unlike reply_to/attachment): nil vs the integer
-    // lets a client tell an unsolicited push (id=None) from a correlated
-    // reply (id=Some) over the same body.
-    pub id: Option<i64>,
     /// The payload proper.
     pub body: WsServerBody,
 }
@@ -702,7 +750,8 @@ pub struct MailboxItem {
 
 /// Payload of a server→client WebSocket message.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(rename_all = "snake_case")]
+#[serde(remote = "Self", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum WsServerBody {
     /// Initial snapshot, sent as the first message of the connection:
     /// everything the client needs to render its world before any delta
@@ -838,6 +887,73 @@ pub enum WsServerBody {
         /// Human-readable explanation.
         message: String,
     },
+    /// Fallback for an unrecognized server→client variant. Clients MUST log
+    /// and ignore rather than tear down the connection; a newer server may
+    /// emit variants this version does not yet know.
+    #[serde(other)]
+    Unknown,
+}
+
+// The two body enums carry payloads, so `#[serde(other)]` alone is not enough:
+// serde resolves the unknown tag to `Unknown` but then asks the format for a
+// *unit* variant, which fails when the tag arrives as `{"tag": {..payload..}}`.
+// They therefore derive with `remote = "Self"` (generating inherent
+// `serialize`/`deserialize` fns) and wrap them below.
+
+/// Deserialize a payload-carrying wire enum, mapping an unrecognized tag —
+/// bare string or single-key map with any payload — to its `Unknown` variant.
+///
+/// The input is buffered once as a [`serde_json::Value`] (a self-describing
+/// intermediate, whatever the source format). A tag is "unrecognized" when the
+/// derived impl maps the bare tag string to `Unknown`; a known tag with a
+/// malformed payload still errors.
+fn deserialize_forward_compat<'de, D, T>(
+    deserializer: D,
+    derived: fn(serde_json::Value) -> Result<T, serde_json::Error>,
+    is_unknown: fn(&T) -> bool,
+) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let value = serde_json::Value::deserialize(deserializer)?;
+    if let serde_json::Value::Object(map) = &value
+        && map.len() == 1
+        && let Some(tag) = map.keys().next()
+        && let Ok(unknown) = derived(serde_json::Value::String(tag.clone()))
+        && is_unknown(&unknown)
+    {
+        return Ok(unknown);
+    }
+    derived(value).map_err(D::Error::custom)
+}
+
+impl Serialize for WsClientBody {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Self::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for WsClientBody {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserialize_forward_compat(deserializer, Self::deserialize, |b| {
+            matches!(b, Self::Unknown)
+        })
+    }
+}
+
+impl Serialize for WsServerBody {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Self::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for WsServerBody {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserialize_forward_compat(deserializer, Self::deserialize, |b| {
+            matches!(b, Self::Unknown)
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1018,7 +1134,6 @@ mod tests {
     #[test]
     fn ws_server_msg_roundtrips_every_variant() {
         roundtrip(WsServerMsg {
-            id: Some(1),
             body: WsServerBody::Ready {
                 account: info(),
                 friends: vec![brief()],
@@ -1030,73 +1145,60 @@ mod tests {
             },
         });
         roundtrip(WsServerMsg {
-            id: Some(2),
             body: WsServerBody::Message(message_dto()),
         });
         roundtrip(WsServerMsg {
-            id: Some(3),
             body: WsServerBody::MessageDeleted {
                 channel_id: 10,
                 message_id: 100,
             },
         });
         roundtrip(WsServerMsg {
-            id: Some(3),
             body: WsServerBody::MailboxAppend(mailbox_item()),
         });
         roundtrip(WsServerMsg {
-            id: Some(4),
             body: WsServerBody::Presence {
                 account_id: 2,
                 online: false,
             },
         });
         roundtrip(WsServerMsg {
-            id: Some(5),
             body: WsServerBody::Typing {
                 channel_id: 10,
                 account_id: 2,
             },
         });
         roundtrip(WsServerMsg {
-            id: Some(6),
             body: WsServerBody::FriendRequested { from: brief() },
         });
         roundtrip(WsServerMsg {
-            id: Some(7),
             body: WsServerBody::FriendRequestAccepted { by: brief() },
         });
         roundtrip(WsServerMsg {
-            id: Some(8),
             body: WsServerBody::FriendRemoved { account_id: 2 },
         });
         roundtrip(WsServerMsg {
-            id: Some(9),
             body: WsServerBody::GuildJoined { guild: guild() },
         });
         roundtrip(WsServerMsg {
-            id: Some(10),
             body: WsServerBody::ChannelCreated {
                 guild_id: 5,
                 channel: text_channel(),
             },
         });
         roundtrip(WsServerMsg {
-            id: Some(11),
             body: WsServerBody::MemberJoined {
                 guild_id: 5,
                 account: brief(),
             },
         });
         roundtrip(WsServerMsg {
-            id: Some(12),
             body: WsServerBody::VoiceState {
                 channel_id: 12,
                 participants: vec![brief()],
             },
         });
         roundtrip(WsServerMsg {
-            id: Some(13),
             body: WsServerBody::CallSignal {
                 call_id: 12,
                 from: 2,
@@ -1107,16 +1209,13 @@ mod tests {
             },
         });
         roundtrip(WsServerMsg {
-            id: Some(14),
             body: WsServerBody::Error {
                 reply_to: Some(6),
                 code: ErrorCode::VoiceChannelFull,
                 message: "voice channel is full".into(),
             },
         });
-        // The sequence id is optional.
         roundtrip(WsServerMsg {
-            id: None,
             body: WsServerBody::Presence {
                 account_id: 3,
                 online: true,
@@ -1331,7 +1430,6 @@ mod tests {
         let dec: fn(&[u8]) -> Result<WsServerMsg, _> = decode_ws_server_msg;
         roundtrip_bin(
             WsServerMsg {
-                id: Some(2),
                 body: WsServerBody::Message(message_dto()),
             },
             enc,
@@ -1339,7 +1437,6 @@ mod tests {
         );
         roundtrip_bin(
             WsServerMsg {
-                id: Some(2),
                 body: WsServerBody::Message(with_optional),
             },
             enc,
@@ -1347,7 +1444,6 @@ mod tests {
         );
         roundtrip_bin(
             WsServerMsg {
-                id: None,
                 body: WsServerBody::Error {
                     reply_to: Some(6),
                     code: ErrorCode::VoiceChannelFull,
@@ -1359,7 +1455,6 @@ mod tests {
         );
         roundtrip_bin(
             WsServerMsg {
-                id: None,
                 body: WsServerBody::Error {
                     reply_to: None,
                     code: ErrorCode::InvalidRequest,
@@ -1371,7 +1466,6 @@ mod tests {
         );
         roundtrip_bin(
             WsServerMsg {
-                id: None,
                 body: WsServerBody::CallSignal {
                     call_id: 12,
                     from: 2,
@@ -1386,7 +1480,6 @@ mod tests {
         );
         roundtrip_bin(
             WsServerMsg {
-                id: None,
                 body: WsServerBody::Ready {
                     account: info(),
                     friends: vec![brief()],
@@ -1440,13 +1533,46 @@ mod tests {
         );
     }
 
+    /// An unknown variant tag on the wire — sent by a newer peer or a buggy
+    /// one — MUST deserialize to the enum's `Unknown` fallback rather than
+    /// `Err`, so an older client can log and ignore it instead of dropping
+    /// the connection. Covers both the struct-style (single-key map, the
+    /// realistic case of a newer server's new variant) and the unit-style
+    /// (bare tag) shape, in each gateway direction.
+    #[test]
+    fn msgpack_unknown_variants_decode_to_unknown() {
+        // Server frame, unknown struct-variant tag: a newer server emits a
+        // variant this client does not know.
+        let frame = serde_json::json!({"body": {"bogus": {"x": 1}}});
+        let bytes = rmp_serde::to_vec_named(&frame).expect("encode");
+        let msg = decode_ws_server_msg(&bytes).expect("server frame decodes, not Err");
+        assert!(matches!(msg.body, WsServerBody::Unknown));
+
+        // Server frame, unknown unit-style tag (a bare string variant).
+        let frame = serde_json::json!({"body": "bogus"});
+        let bytes = rmp_serde::to_vec_named(&frame).expect("encode");
+        let msg = decode_ws_server_msg(&bytes).expect("server frame decodes, not Err");
+        assert!(matches!(msg.body, WsServerBody::Unknown));
+
+        // Client frame, unknown struct-variant tag.
+        let frame = serde_json::json!({"id": 9, "body": {"bogus": {"y": 2}}});
+        let bytes = rmp_serde::to_vec_named(&frame).expect("encode");
+        let msg = decode_ws_client_msg(&bytes).expect("client frame decodes, not Err");
+        assert!(matches!(msg.body, WsClientBody::Unknown));
+
+        // Client frame, unknown unit-style tag.
+        let frame = serde_json::json!({"id": 9, "body": "bogus"});
+        let bytes = rmp_serde::to_vec_named(&frame).expect("encode");
+        let msg = decode_ws_client_msg(&bytes).expect("client frame decodes, not Err");
+        assert!(matches!(msg.body, WsClientBody::Unknown));
+    }
+
     /// `skip_serializing_if` must reach the msgpack encoding too (the reason
     /// the codec is pinned to the named representation): a None option field
     /// leaves no trace in the frame bytes.
     #[test]
     fn msgpack_encoding_omits_none_option_fields() {
         let plain = encode_ws_server_msg(&WsServerMsg {
-            id: None,
             body: WsServerBody::Message(message_dto()),
         });
         assert!(!plain.windows(8).any(|w| w == b"reply_to"));
@@ -1462,7 +1588,6 @@ mod tests {
             encrypted: true,
         });
         let rich = encode_ws_server_msg(&WsServerMsg {
-            id: None,
             body: WsServerBody::Message(with),
         });
         assert!(rich.windows(8).any(|w| w == b"reply_to"));
@@ -1510,7 +1635,6 @@ mod tests {
         assert!(decode_ws_client_msg(&[0xff, 0xff]).is_err());
 
         let good = encode_ws_server_msg(&WsServerMsg {
-            id: None,
             body: WsServerBody::Message(message_dto()),
         });
         assert!(decode_ws_server_msg(&good).is_ok());
@@ -1539,6 +1663,7 @@ mod tests {
                 ErrorCode::ProtocolVersion => "protocol_version",
                 ErrorCode::InvalidRequest => "invalid_request",
                 ErrorCode::Internal => "internal",
+                ErrorCode::Unknown => "unknown",
             }
         }
 
@@ -1553,11 +1678,12 @@ mod tests {
             ErrorCode::ProtocolVersion,
             ErrorCode::InvalidRequest,
             ErrorCode::Internal,
+            ErrorCode::Unknown,
         ];
         // One entry per match arm above; bump this if ErrorCode grows.
         assert_eq!(
             codes.len(),
-            10,
+            11,
             "ErrorCode variant count changed; update this test"
         );
 
@@ -1573,112 +1699,5 @@ mod tests {
                 serde_json::json!(wire_str(&code)),
             );
         }
-    }
-
-    /// Canonical server-issued frames carry `id: None` (they are pushes, not
-    /// replies, so there is no client correlation id to echo). The `Option` is
-    /// actually serialized — `id: None` and `id: Some(n)` over the same body
-    /// encode to byte-distinct buffers — so a client can always tell a
-    /// correlated reply from an unsolicited push.
-    #[test]
-    fn production_server_frames_carry_id_none_and_option_is_serialized() {
-        let canonical = [
-            WsServerMsg {
-                id: None,
-                body: WsServerBody::Ready {
-                    account: info(),
-                    friends: vec![brief()],
-                    incoming_requests: vec![],
-                    outgoing_requests: vec![],
-                    guilds: vec![guild()],
-                    dm_channels: vec![dm_channel()],
-                    mailbox: vec![mailbox_item()],
-                },
-            },
-            WsServerMsg {
-                id: None,
-                body: WsServerBody::Message(message_dto()),
-            },
-            WsServerMsg {
-                id: None,
-                body: WsServerBody::MessageDeleted {
-                    channel_id: 10,
-                    message_id: 100,
-                },
-            },
-            WsServerMsg {
-                id: None,
-                body: WsServerBody::MailboxAppend(mailbox_item()),
-            },
-            WsServerMsg {
-                id: None,
-                body: WsServerBody::Presence {
-                    account_id: 2,
-                    online: false,
-                },
-            },
-            WsServerMsg {
-                id: None,
-                body: WsServerBody::Typing {
-                    channel_id: 10,
-                    account_id: 2,
-                },
-            },
-            WsServerMsg {
-                id: None,
-                body: WsServerBody::MemberJoined {
-                    guild_id: 5,
-                    account: brief(),
-                },
-            },
-            WsServerMsg {
-                id: None,
-                body: WsServerBody::VoiceState {
-                    channel_id: 12,
-                    participants: vec![brief()],
-                },
-            },
-            WsServerMsg {
-                id: None,
-                body: WsServerBody::CallSignal {
-                    call_id: 12,
-                    from: 2,
-                    kind: CallSignalKind::Hangup,
-                },
-            },
-            WsServerMsg {
-                id: None,
-                body: WsServerBody::Error {
-                    reply_to: None,
-                    code: ErrorCode::Internal,
-                    message: "boom".into(),
-                },
-            },
-        ];
-        for msg in canonical {
-            let bytes = encode_ws_server_msg(&msg);
-            let back = decode_ws_server_msg(&bytes).expect("canonical frame decodes");
-            assert_eq!(back.id, None, "production frame lost its id=None");
-            assert_eq!(back.body, msg.body);
-        }
-
-        // id:None vs id:Some on the SAME body must produce byte-distinct
-        // buffers: the Option is serialized (nil vs the integer), not
-        // collapsed away.
-        let body = WsServerBody::Presence {
-            account_id: 2,
-            online: false,
-        };
-        let none = encode_ws_server_msg(&WsServerMsg {
-            id: None,
-            body: body.clone(),
-        });
-        let some = encode_ws_server_msg(&WsServerMsg {
-            id: Some(42),
-            body,
-        });
-        assert_ne!(none, some, "id None vs Some collapsed to identical bytes");
-        let back = decode_ws_server_msg(&some).expect("some frame decodes");
-        assert_eq!(back.id, Some(42));
     }
 }

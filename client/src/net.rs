@@ -89,7 +89,8 @@ pub fn next_msg_id() -> u64 {
 static HTTP: OnceLock<Arc<reqwest::Client>> = OnceLock::new();
 
 fn shared_http() -> Arc<reqwest::Client> {
-    HTTP.get_or_init(|| Arc::new(reqwest::Client::new())).clone()
+    HTTP.get_or_init(|| Arc::new(reqwest::Client::new()))
+        .clone()
 }
 
 /// HTTP client for one Instance. Cheap to clone (`reqwest::Client` inside);
@@ -198,8 +199,9 @@ impl Net {
     /// Admin-only: mint a single-use registration invite code. Returns the
     /// bare code; non-admin callers get a 403 from the server.
     pub async fn create_invite(&self) -> Result<String, String> {
-        let v: serde_json::Value =
-            self.exec(self.authed(reqwest::Method::POST, "/auth/invites")).await?;
+        let v: serde_json::Value = self
+            .exec(self.authed(reqwest::Method::POST, "/auth/invites"))
+            .await?;
         v.get("code")
             .and_then(|c| c.as_str())
             .map(|s| s.to_string())
@@ -394,12 +396,10 @@ impl Net {
     /// `MessageDeleted` to every member (including us — the local removal
     /// done at send time just makes it instant, and is idempotent).
     pub async fn delete_message(&self, channel_id: i64, message_id: i64) -> Result<(), String> {
-        self.exec_empty(
-            self.authed(
-                reqwest::Method::DELETE,
-                &format!("/channels/{channel_id}/messages/{message_id}"),
-            ),
-        )
+        self.exec_empty(self.authed(
+            reqwest::Method::DELETE,
+            &format!("/channels/{channel_id}/messages/{message_id}"),
+        ))
         .await
     }
 
@@ -497,6 +497,7 @@ pub async fn publish_keys(net: &Net, engine: &Arc<Engine>) {
 /// Order matters (see the engine docs): this runs *before*
 /// [`Engine::drain_pending_shares`], so a creation/rotation share still
 /// carries its index-0 key. Returns how many peers received the share.
+#[allow(clippy::type_complexity)] // (account, username, Option<(identity, signing)>) peer batch
 pub async fn share_session_with_peers(
     state: &Arc<Mutex<ClientState>>,
     engine: &Arc<Engine>,
@@ -1054,4 +1055,3 @@ mod tests {
         assert!(earns_backoff_reset(true, Duration::from_secs(60)));
     }
 }
-

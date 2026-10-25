@@ -1,0 +1,45 @@
+# cargo-deny configuration. Intentionally permissive so the current
+# workspace stays green; tighten the thresholds as the project matures.
+# Run locally with: cargo deny check advisories bans licenses sources
+
+[advisories]
+# RUSTSEC vulnerability advisories always fail the check (built-in, cannot
+# be relaxed) — that is the real security gate. Unmaintained crates are
+# ignored for now because transitive trees carry plenty of them; switch to
+# "workspace" once the direct dependency surface is audited. Yanked crates
+# only warn.
+unmaintained = "none"
+yanked = "warn"
+ignore = []
+
+[licenses]
+# Allow common permissive OSS licenses; anything not listed here fails.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "OFL-1.1",
+    "OpenSSL",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+]
+confidence-threshold = 0.8
+
+[bans]
+# Warn on duplicate crate versions rather than hard-failing: benign
+# duplicates are common in large transitive trees (e.g. two windows-sys).
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+# Allow crates.io and git sources for now; tighten to "deny" once the
+# supply chain is pinned down.
+unknown-registry = "warn"
+unknown-git = "warn"

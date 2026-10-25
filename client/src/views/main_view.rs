@@ -34,9 +34,7 @@ use bysyc_common::protocol::{
 use crate::app::BysycApp;
 use crate::crypto::Envelope;
 use crate::net::{self, NetHandle};
-use crate::state::{
-    ClientState, ConnStatus, MainState, Selection, TYPING_TTL_SECS, guard, now_ms,
-};
+use crate::state::{ClientState, ConnStatus, MainState, Selection, TYPING_TTL_SECS, guard, now_ms};
 use crate::store::Store;
 use crate::views::attachments;
 
@@ -257,9 +255,13 @@ impl MainView {
         for id in self.image_cache.keys() {
             self.image_frames.entry(*id).or_insert(now);
         }
-        self.image_cache
-            .retain(|id, _| keep.contains(id) || now.saturating_sub(self.image_frames.get(id).copied().unwrap_or(now)) <= IMAGE_IDLE_FRAMES);
-        self.image_frames.retain(|id, _| self.image_cache.contains_key(id));
+        self.image_cache.retain(|id, _| {
+            keep.contains(id)
+                || now.saturating_sub(self.image_frames.get(id).copied().unwrap_or(now))
+                    <= IMAGE_IDLE_FRAMES
+        });
+        self.image_frames
+            .retain(|id, _| self.image_cache.contains_key(id));
         if self.image_cache.len() > IMAGE_CACHE_CAP {
             let mut by_use: Vec<(i64, u64)> = self
                 .image_cache
@@ -318,7 +320,9 @@ pub fn show(app: &mut BysycApp, ui: &mut egui::Ui) {
         .default_size(140.0)
         .min_size(140.0)
         .max_size(400.0)
-        .show(ui, |ui| nav(ui, state, store, rt, main_view, &ctx, snap.as_ref()));
+        .show(ui, |ui| {
+            nav(ui, state, store, rt, main_view, &ctx, snap.as_ref())
+        });
 
     // The middle column's minimum (and first-run default) is its intrinsic
     // width — the widest visible row measured against the live state, so
@@ -333,9 +337,13 @@ pub fn show(app: &mut BysycApp, ui: &mut egui::Ui) {
         .default_size(mid_min)
         .min_size(mid_min)
         .max_size(400.0)
-        .show(ui, |ui| middle(ui, state, rt, main_view, &ctx, snap.as_ref()));
+        .show(ui, |ui| {
+            middle(ui, state, rt, main_view, &ctx, snap.as_ref())
+        });
 
-    egui::CentralPanel::default().show(ui, |ui| chat(ui, state, store, rt, main_view, &ctx, snap.as_ref()));
+    egui::CentralPanel::default().show(ui, |ui| {
+        chat(ui, state, store, rt, main_view, &ctx, snap.as_ref())
+    });
 
     // Transient popups driven by background tasks (invite codes).
     invite_window(state, &ctx);
@@ -441,11 +449,10 @@ fn nav(
                     {
                         let mut st = guard(state);
                         if let Some(m) = st.main_mut()
-                            && let Some(ch) = m.first_text_channel(g.id)
-                        {
-                            m.selected = Selection::Channel(ch);
-                            m.unread.remove(&ch);
-                        }
+                            && let Some(ch) = m.first_text_channel(g.id) {
+                                m.selected = Selection::Channel(ch);
+                                m.unread.remove(&ch);
+                            }
                     }
                     // Guild-level unread: any channel of the guild with
                     // unseen messages shows the same dot the DM rows use,
@@ -472,10 +479,9 @@ fn nav(
             if ui
                 .selectable_label(matches!(selected, Selection::Friends), friends_label)
                 .clicked()
-                && let Some(m) = guard(state).main_mut()
-            {
-                m.selected = Selection::Friends;
-            }
+                && let Some(m) = guard(state).main_mut() {
+                    m.selected = Selection::Friends;
+                }
 
             ui.add_space(4.0);
             for dm in dms {
@@ -869,6 +875,11 @@ fn middle_min_width(ctx: &egui::Context, style: &egui::Style, snap: &PanelSnap) 
                     None => format!("(v) {} — 0 in call", c.name),
                 },
                 ChannelKind::Dm => continue,
+                // `ChannelKind` is `#[non_exhaustive]`; `Unknown` (a
+                // `#[serde(other)]` fallback from a newer server) or any
+                // future variant is not rendered here — skip it like Dm,
+                // which lives in its own panel.
+                _ => continue,
             };
             let mut row = text_w(&label, &body) + pad; // selectable_label
             if g.owner_id == my_id {
@@ -942,7 +953,12 @@ fn cached_middle_min_width(
         d.channel.id.hash(&mut h);
         d.peer.username.hash(&mut h);
     }
-    for f in snap.incoming.iter().chain(&snap.friends).chain(&snap.outgoing) {
+    for f in snap
+        .incoming
+        .iter()
+        .chain(&snap.friends)
+        .chain(&snap.outgoing)
+    {
         f.username.hash(&mut h);
     }
     let mut voice: Vec<(&i64, &(usize, bool))> = snap.voice.iter().collect();
@@ -987,7 +1003,11 @@ fn middle(
         .show(ui, |ui| match selected {
             Selection::Friends => friends_panel(ui, state, rt, mv, ctx, snap),
             Selection::Dm(ch) => {
-                let Some(peer) = snap.dms.iter().find(|d| d.channel.id == ch).map(|d| &d.peer)
+                let Some(peer) = snap
+                    .dms
+                    .iter()
+                    .find(|d| d.channel.id == ch)
+                    .map(|d| &d.peer)
                 else {
                     return;
                 };
@@ -1064,6 +1084,11 @@ fn middle(
                             });
                         }
                         ChannelKind::Dm => {}
+                        // `ChannelKind` is `#[non_exhaustive]`; `Unknown`
+                        // (a `#[serde(other)]` fallback from a newer server)
+                        // or any future variant renders nothing here, matching
+                        // Dm (which is listed in its own panel).
+                        _ => {}
                     }
                 }
                 channel_popup(state, rt, mv, ctx, g.id, is_owner);
@@ -1609,50 +1634,45 @@ fn chat(
             // `mv.composer`).
             let line_height = ui.text_style_height(&egui::TextStyle::Body);
             let (send_clicked, field) = {
-                ui.with_layout(
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| {
-                        let mut send_clicked = false;
-                        if icon_button(ui, "bytes://attach.svg", ICON_ATTACH, "Attach file")
-                            .clicked()
-                        {
-                            attachments::begin_attach(ctx, mv, ch);
-                        }
-                        if icon_button(ui, "bytes://send.svg", ICON_SEND, "Send").clicked() {
-                            send_clicked = true;
-                        }
-                        let buf = mv.composer.entry(ch).or_default();
-                        // The wrapping ScrollArea grows with the text up
-                        // to COMPOSER_MAX_ROWS rows and scrolls past that,
-                        // so a long draft never pushes the message list
-                        // away. The TextEdit itself drives the scroll to
-                        // keep the caret visible.
-                        let field = egui::ScrollArea::vertical()
-                            .id_salt(("composer_scroll", ch))
-                            .auto_shrink([false, true])
-                            .max_height(COMPOSER_MAX_ROWS as f32 * line_height)
-                            .scroll_bar_visibility(
-                                egui::containers::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let mut send_clicked = false;
+                    if icon_button(ui, "bytes://attach.svg", ICON_ATTACH, "Attach file").clicked() {
+                        attachments::begin_attach(ctx, mv, ch);
+                    }
+                    if icon_button(ui, "bytes://send.svg", ICON_SEND, "Send").clicked() {
+                        send_clicked = true;
+                    }
+                    let buf = mv.composer.entry(ch).or_default();
+                    // The wrapping ScrollArea grows with the text up
+                    // to COMPOSER_MAX_ROWS rows and scrolls past that,
+                    // so a long draft never pushes the message list
+                    // away. The TextEdit itself drives the scroll to
+                    // keep the caret visible.
+                    let field = egui::ScrollArea::vertical()
+                        .id_salt(("composer_scroll", ch))
+                        .auto_shrink([false, true])
+                        .max_height(COMPOSER_MAX_ROWS as f32 * line_height)
+                        .scroll_bar_visibility(
+                            egui::containers::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                        )
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::TextEdit::multiline(buf)
+                                    .id_salt(("composer", ch))
+                                    .hint_text(
+                                        "Message…  (Enter to send, Shift+Enter for a new line)",
+                                    )
+                                    .desired_width(f32::INFINITY)
+                                    .desired_rows(1)
+                                    // Keep only the horizontal inset:
+                                    // no vertical padding, the field
+                                    // hugs its lines exactly.
+                                    .margin(egui::Margin::symmetric(4, 0)),
                             )
-                            .show(ui, |ui| {
-                                ui.add(
-                                    egui::TextEdit::multiline(buf)
-                                        .id_salt(("composer", ch))
-                                        .hint_text(
-                                            "Message…  (Enter to send, Shift+Enter for a new line)",
-                                        )
-                                        .desired_width(f32::INFINITY)
-                                        .desired_rows(1)
-                                        // Keep only the horizontal inset:
-                                        // no vertical padding, the field
-                                        // hugs its lines exactly.
-                                        .margin(egui::Margin::symmetric(4, 0)),
-                                )
-                            })
-                            .inner;
-                        (send_clicked, field)
-                    },
-                )
+                        })
+                        .inner;
+                    (send_clicked, field)
+                })
                 .inner
             };
             if field.changed() {
@@ -1776,13 +1796,9 @@ fn chat(
                             .get(&msg.id)
                             .map(String::as_str)
                             .or_else(|| (msg.id < 0).then_some(msg.content.as_str()));
-                        let h = mv
-                            .row_heights
-                            .get(&msg.id)
-                            .copied()
-                            .unwrap_or_else(|| {
-                                estimate_row_height(msg, line_h, spacing, content_w, body)
-                            });
+                        let h = mv.row_heights.get(&msg.id).copied().unwrap_or_else(|| {
+                            estimate_row_height(msg, line_h, spacing, content_w, body)
+                        });
                         off += h + spacing;
                     }
                 }
@@ -1812,7 +1828,9 @@ fn chat(
                 // locked after state is released (state → store order).
                 let st = guard(state);
                 let Some(m) = st.main() else { return };
-                let Some(msgs) = m.messages.get(&ch) else { return };
+                let Some(msgs) = m.messages.get(&ch) else {
+                    return;
+                };
                 // Reply-prefix index for the loaded channel: message id →
                 // sender id, rebuilt when the message list moves. Resolves
                 // the ↪ prefixes in O(1) instead of a linear scan per
@@ -1846,13 +1864,9 @@ fn chat(
                         .get(&msg.id)
                         .map(String::as_str)
                         .or_else(|| (msg.id < 0).then_some(msg.content.as_str()));
-                    let h = mv
-                        .row_heights
-                        .get(&msg.id)
-                        .copied()
-                        .unwrap_or_else(|| {
-                            estimate_row_height(msg, line_h, spacing, content_w, body)
-                        });
+                    let h = mv.row_heights.get(&msg.id).copied().unwrap_or_else(|| {
+                        estimate_row_height(msg, line_h, spacing, content_w, body)
+                    });
                     if cursor < viewport.max.y + ROW_OVERDRAW_PX
                         && cursor + h > viewport.min.y - ROW_OVERDRAW_PX
                     {
@@ -1864,11 +1878,10 @@ fn chat(
                             att_keep.insert(att.id);
                             // The envelope is immutable per message id —
                             // clone it out once and keep it.
-                            if let std::collections::hash_map::Entry::Vacant(e) =
-                                mv.file_envs.entry(msg.id)
+                            if !mv.file_envs.contains_key(&msg.id)
                                 && let Some(fe) = m.file_meta.get(&msg.id)
                             {
-                                e.insert(fe.clone());
+                                mv.file_envs.insert(msg.id, fe.clone());
                             }
                         }
                         if msg.id > 0 && !mv.plaintexts.contains_key(&msg.id) {
@@ -1937,10 +1950,8 @@ fn chat(
             if rows.is_empty() {
                 return;
             }
-            let rect = egui::Rect::from_x_y_ranges(
-                ui.max_rect().x_range(),
-                (top + y0)..=(top + y1),
-            );
+            let rect =
+                egui::Rect::from_x_y_ranges(ui.max_rect().x_range(), (top + y0)..=(top + y1));
             ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |vui| {
                 vui.skip_ahead_auto_ids(i0);
                 for row in &rows {
@@ -2066,7 +2077,10 @@ fn resolve_name(names: &mut HashMap<i64, String>, m: &MainState, id: i64) -> Str
 /// armed (replacing the old per-frame store-locking `preview_body`).
 fn truncate_preview(body: &str) -> String {
     const LEN: usize = 40;
-    let flat: Vec<char> = body.chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
+    let flat: Vec<char> = body
+        .chars()
+        .map(|c| if c == '\n' { ' ' } else { c })
+        .collect();
     let mut s: String = flat.iter().take(LEN).collect();
     if flat.len() > LEN {
         s.push('…');
@@ -2184,8 +2198,7 @@ fn message_row(
                             attachments::attachment_row(ui, state, rt, ctx, mv, att, fe);
                         } else {
                             ui.add(
-                                egui::Label::new("[encrypted]")
-                                    .wrap_mode(egui::TextWrapMode::Wrap),
+                                egui::Label::new("[encrypted]").wrap_mode(egui::TextWrapMode::Wrap),
                             );
                         }
                         if let Some(fe) = fe {
@@ -2829,7 +2842,10 @@ mod tests {
         keep.insert(1);
         mv.evict_stale_images(&keep);
         assert!(mv.image_cache.contains_key(&1), "keep pins an idle texture");
-        assert!(!mv.image_cache.contains_key(&2), "unpinned idle texture goes");
+        assert!(
+            !mv.image_cache.contains_key(&2),
+            "unpinned idle texture goes"
+        );
         assert!(!mv.image_frames.contains_key(&2));
     }
 
@@ -2872,4 +2888,3 @@ mod tests {
         assert!(!mv.image_frames.contains_key(&2));
     }
 }
-

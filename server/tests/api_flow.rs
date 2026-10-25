@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use bysyc_common::protocol::{
     AccountInfo, ApiError, ChannelKind, CreateAttachmentRequest, CreateAttachmentResponse,
-    CreateGuildInviteRequest, CreateGuildRequest, DownloadUrlResponse, DmChannel, ErrorCode,
+    CreateGuildInviteRequest, CreateGuildRequest, DmChannel, DownloadUrlResponse, ErrorCode,
     FriendList, GuildInfo, GuildInviteDto, JoinGuildRequest, MessageDto, MessageKind, MessagePage,
     OpenDmRequest, SendMessageRequest,
 };
@@ -69,7 +69,10 @@ async fn auth_register_login_me_round_trip() {
         .expect("decode me");
     assert_eq!(me.id, id);
     assert_eq!(me.username, name);
-    assert!(!me.is_admin, "a registered account is not the Instance admin");
+    assert!(
+        !me.is_admin,
+        "a registered account is not the Instance admin"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -101,24 +104,32 @@ async fn invite_gating_and_admin_mint() {
         .to_string();
 
     // 1) Non-existent invite is rejected with InvalidInvite (400).
-    let (status, err) =
-        register_status(&h.base_url, &unique_name("ghost"), "pw12345", "no_such_code").await;
+    let (status, err) = register_status(
+        &h.base_url,
+        &unique_name("ghost"),
+        "pw12345",
+        "no_such_code",
+    )
+    .await;
     assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
     let err = err.expect("error body");
     assert_eq!(err.code, ErrorCode::InvalidInvite);
 
     // 2) A minted invite works exactly once: redeem it, then try again.
     let (_t, _id) = register(&h.base_url, &unique_name("ok"), "pw12345", &code).await;
-    let (status, err) =
-        register_status(&h.base_url, &unique_name("dup"), "pw12345", &code).await;
+    let (status, err) = register_status(&h.base_url, &unique_name("dup"), "pw12345", &code).await;
     assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
     let err = err.expect("error body");
     assert_eq!(err.code, ErrorCode::InvalidInvite);
 
     // 3) A non-admin account may not mint invites.
-    let (non_admin_token, _) =
-        register(&h.base_url, &unique_name("peasant"), "pw12345", &mint_invite(&h.state).await)
-            .await;
+    let (non_admin_token, _) = register(
+        &h.base_url,
+        &unique_name("peasant"),
+        "pw12345",
+        &mint_invite(&h.state).await,
+    )
+    .await;
     let resp = http()
         .post(format!("{}/auth/invites", h.base_url))
         .bearer_auth(&non_admin_token)
@@ -138,11 +149,15 @@ async fn invite_gating_and_admin_mint() {
 async fn guild_create_join_leave() {
     let h = setup().await;
     let invite = mint_invite(&h.state).await;
-    let (owner_token, owner_id) = register(&h.base_url, &unique_name("owner"), "pw12345", &invite)
-        .await;
-    let (joiner_token, _joiner_id) =
-        register(&h.base_url, &unique_name("joiner"), "pw12345", &mint_invite(&h.state).await)
-            .await;
+    let (owner_token, owner_id) =
+        register(&h.base_url, &unique_name("owner"), "pw12345", &invite).await;
+    let (joiner_token, _joiner_id) = register(
+        &h.base_url,
+        &unique_name("joiner"),
+        "pw12345",
+        &mint_invite(&h.state).await,
+    )
+    .await;
 
     // Owner creates a guild: response includes the two default channels.
     let guild: GuildInfo = http()
@@ -159,14 +174,18 @@ async fn guild_create_join_leave() {
         .expect("decode guild");
     assert_eq!(guild.owner_id, owner_id);
     assert_eq!(guild.channels.len(), 2);
-    assert!(guild
-        .channels
-        .iter()
-        .any(|c| matches!(c.kind, ChannelKind::Text)));
-    assert!(guild
-        .channels
-        .iter()
-        .any(|c| matches!(c.kind, ChannelKind::Voice)));
+    assert!(
+        guild
+            .channels
+            .iter()
+            .any(|c| matches!(c.kind, ChannelKind::Text))
+    );
+    assert!(
+        guild
+            .channels
+            .iter()
+            .any(|c| matches!(c.kind, ChannelKind::Voice))
+    );
 
     // Owner mints a guild invite; joiner redeems it.
     let ginv: GuildInviteDto = http()
@@ -245,8 +264,13 @@ async fn message_send_page_delete() {
     let h = setup().await;
     let invite = mint_invite(&h.state).await;
     let (a_token, a_id) = register(&h.base_url, &unique_name("msg_a"), "pw12345", &invite).await;
-    let (b_token, b_id) =
-        register(&h.base_url, &unique_name("msg_b"), "pw12345", &mint_invite(&h.state).await).await;
+    let (b_token, b_id) = register(
+        &h.base_url,
+        &unique_name("msg_b"),
+        "pw12345",
+        &mint_invite(&h.state).await,
+    )
+    .await;
 
     // A befriends B (B accepts) so a DM channel can be opened: that channel
     // is where both sides can read each other's messages.
@@ -323,10 +347,7 @@ async fn message_send_page_delete() {
         .expect("decode page");
     assert_eq!(page.messages.len(), 3);
     assert!(!page.has_more);
-    assert_eq!(
-        page.messages.iter().map(|m| m.id).collect::<Vec<_>>(),
-        ids
-    );
+    assert_eq!(page.messages.iter().map(|m| m.id).collect::<Vec<_>>(), ids);
 
     // Page with `before=<oldest>` returns nothing older.
     let older: MessagePage = http()
@@ -392,9 +413,13 @@ async fn attachment_create_download_and_idor_fix() {
     let invite = mint_invite(&h.state).await;
     let (owner_token, _owner_id) =
         register(&h.base_url, &unique_name("att_owner"), "pw12345", &invite).await;
-    let (outsider_token, _) =
-        register(&h.base_url, &unique_name("att_out"), "pw12345", &mint_invite(&h.state).await)
-            .await;
+    let (outsider_token, _) = register(
+        &h.base_url,
+        &unique_name("att_out"),
+        "pw12345",
+        &mint_invite(&h.state).await,
+    )
+    .await;
 
     // Owner reserves an attachment and uploads ciphertext bytes to the
     // presigned PUT URL (no auth header: the SigV4 signature in the URL IS
@@ -475,8 +500,13 @@ async fn friend_request_accept_remove() {
     let h = setup().await;
     let invite = mint_invite(&h.state).await;
     let (a_token, a_id) = register(&h.base_url, &unique_name("fr_a"), "pw12345", &invite).await;
-    let (b_token, b_id) =
-        register(&h.base_url, &unique_name("fr_b"), "pw12345", &mint_invite(&h.state).await).await;
+    let (b_token, b_id) = register(
+        &h.base_url,
+        &unique_name("fr_b"),
+        "pw12345",
+        &mint_invite(&h.state).await,
+    )
+    .await;
 
     // A sends a friend request to B: A's outgoing list gains B.
     let a_list: FriendList = http()

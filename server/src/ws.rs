@@ -45,8 +45,8 @@
 //!    as a safety net independent of client heartbeats. Connectivity is
 //!    detected from socket close, not from TTL expiry.
 //! 6. **Disconnect** (every exit path): delete the presence key, leave any
-//!    voice channel via [`crate::voice::leave`] (which publishes the new
-//!    `VoiceState`), fan out `Presence{online:false}` to the same
+//!    voice channel with one `DELETE ... RETURNING` (then publishes each
+//!    affected channel's `VoiceState` snapshot), fan out `Presence{online:false}` to the same
 //!    friends+co-members audience. The REST session survives disconnect.
 //!
 //! # v1 limitations (documented contract)
@@ -91,7 +91,7 @@ use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use redis::aio::ConnectionManager;
 use sqlx::{PgPool, Row};
-use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio::sync::{Mutex, broadcast, mpsc};
 
 use bysyc_common::PROTOCOL_VERSION;
 use bysyc_common::protocol::{
@@ -508,11 +508,34 @@ impl ConnState {
     /// Cache a DB-confirmed readable channel so later keystrokes skip the
     /// DB until the next resync recomputes the whole set.
     fn remember_readable(&mut self, channel: i64) {
-        self.channels.get_or_insert_with(HashSet::new).insert(channel);
+        self.channels
+            .get_or_insert_with(HashSet::new)
+            .insert(channel);
     }
 }
 
 async fn run_connected(state: &AppState, socket: WebSocket, me: i64) -> Result<(), ApiError> {
+    // 0. Sweep stale voice participation. After a server crash/restart,
+    //    voice_participants rows for me survive (the old socket never ran
+    //    disconnect_cleanup), so others still see me in Calls. Clear them
+    //    now and publish the fresh snapshot per affected channel — the
+    //    empty participant list is the clients' "Call ended" signal.
+    //    Best-effort: log on failure and still proceed to presence/Ready.
+    match sqlx::query_scalar::<_, i64>(
+        "DELETE FROM voice_participants WHERE account_id = $1 RETURNING channel_id",
+    )
+    .bind(me)
+    .fetch_all(&state.pg)
+    .await
+    {
+        Ok(channels) => {
+            for channel_id in channels {
+                crate::voice::publish_channel_snapshot(state, channel_id).await;
+            }
+        }
+        Err(e) => tracing::warn!(me, "stale voice participant sweep failed: {e:#}"),
+    }
+
     // 1. Presence on + fan-out (best effort: a Redis hiccup must not kill
     //    an otherwise healthy connection).
     if let Err(e) = set_presence(&state.redis, me).await {
@@ -528,7 +551,6 @@ async fn run_connected(state: &AppState, socket: WebSocket, me: i64) -> Result<(
     let (out_tx, out_rx) = mpsc::channel::<WsMessage>(OUT_QUEUE_DEPTH);
     out_tx
         .send(frame_msg(WsServerMsg {
-            id: None,
             body: WsServerBody::Ready {
                 account: ready.account,
                 friends: ready.friends,
@@ -603,7 +625,10 @@ async fn run_connected(state: &AppState, socket: WebSocket, me: i64) -> Result<(
         .is_err()
     {
         forwarder.abort();
-        tracing::warn!(me, "event forwarder did not drain; its bus topics were leaked");
+        tracing::warn!(
+            me,
+            "event forwarder did not drain; its bus topics were leaked"
+        );
     }
     let _ = writer.await;
     Ok(())
@@ -622,11 +647,15 @@ async fn disconnect_cleanup(state: &AppState, me: i64) {
         tracing::warn!(me, "presence delete failed: {e}");
     }
 
-    // Leave every Call we were in. A socket dying mid-call has no VoiceLeave
-    // wire message to ride, so this loop is the cleanup path; voice::leave
-    // publishes the fresh VoiceState and clears the participant row.
+    // Leave every Call in one statement. An account can be in multiple
+    // voice channels (the PK is (channel_id, account_id)), so the old
+    // per-channel voice::leave loop paid one DELETE + one snapshot SELECT
+    // + one publish per channel. One DELETE ... RETURNING collapses the
+    // deletes; per affected channel we publish the fresh VoiceState
+    // snapshot (the empty list is the "Call ended" signal). Best-effort
+    // publish, like the old leave.
     match sqlx::query_scalar::<_, i64>(
-        "SELECT channel_id FROM voice_participants WHERE account_id = $1",
+        "DELETE FROM voice_participants WHERE account_id = $1 RETURNING channel_id",
     )
     .bind(me)
     .fetch_all(&state.pg)
@@ -634,17 +663,10 @@ async fn disconnect_cleanup(state: &AppState, me: i64) {
     {
         Ok(channels) => {
             for channel_id in channels {
-                if let Err(e) = crate::voice::leave(state, channel_id, me).await {
-                    tracing::warn!(
-                        me,
-                        channel_id,
-                        "voice leave on disconnect failed: {}",
-                        e.message
-                    );
-                }
+                crate::voice::publish_channel_snapshot(state, channel_id).await;
             }
         }
-        Err(e) => tracing::error!(me, "voice cleanup query failed: {e:#}"),
+        Err(e) => tracing::warn!(me, "voice cleanup query failed: {e:#}"),
     }
 
     if let Err(e) = fan_out_presence(state, me, false).await {
@@ -751,7 +773,6 @@ async fn handle_client_msg(
                     // VoiceState that voice::join publishes to the channel.
                     let _ = out
                         .send(frame_msg(WsServerMsg {
-                            id: None,
                             body: WsServerBody::VoiceState {
                                 channel_id,
                                 participants,
@@ -766,21 +787,29 @@ async fn handle_client_msg(
             }
         }
         WsClientBody::VoiceLeave => {
-            // The wire message carries no channel id; look up where we are.
-            let current = sqlx::query_scalar::<_, i64>(
-                "SELECT channel_id FROM voice_participants WHERE account_id = $1 LIMIT 1",
+            // The wire message carries no channel id; the PK is
+            // (channel_id, account_id) so an account can be in multiple
+            // channels. Delete ALL of them and publish the fresh snapshot
+            // per affected channel — mirroring disconnect_cleanup. A 0-row
+            // delete is a no-op (not in any Call: no error, no event).
+            match sqlx::query_scalar::<_, i64>(
+                "DELETE FROM voice_participants WHERE account_id = $1 RETURNING channel_id",
             )
             .bind(me)
-            .fetch_optional(&state.pg)
+            .fetch_all(&state.pg)
             .await
-            .ok()
-            .flatten();
-            if let Some(channel_id) = current
-                && let Err(e) = crate::voice::leave(state, channel_id, me).await
             {
-                send_error(out, Some(msg.id), e.code, e.message);
-                // The updated VoiceState reaches the leaver through
-                // their still-active chan:{id} subscription.
+                Ok(channels) => {
+                    for channel_id in channels {
+                        crate::voice::publish_channel_snapshot(state, channel_id).await;
+                    }
+                    // The updated VoiceState reaches the leaver through
+                    // their still-active chan:{id} subscription.
+                }
+                Err(e) => {
+                    tracing::warn!(me, "voice leave query failed: {e:#}");
+                    send_error(out, Some(msg.id), ErrorCode::Internal, "database error");
+                }
             }
             // not in a Call: nothing to do, no error
         }
@@ -789,6 +818,11 @@ async fn handle_client_msg(
                 send_error(out, Some(msg.id), e.code, e.message);
             }
         }
+        // `WsClientBody` is `#[non_exhaustive]` with a `#[serde(other)] Unknown`
+        // fallback; the wire contract is "server logs and ignores, never errors
+        // for an unknown tag", so unknown variants (and any future variant this
+        // version does not know) are dropped here without a reply.
+        _ => tracing::debug!(me, "ignoring unrecognized ws client body"),
     }
 }
 
@@ -811,7 +845,6 @@ fn send_error(
     message: impl Into<String>,
 ) {
     let msg = WsServerMsg {
-        id: None,
         body: WsServerBody::Error {
             reply_to,
             code,
@@ -862,10 +895,7 @@ async fn sync_subscriptions(
     conn: &mut ConnState,
     sub_tx: &mpsc::Sender<HashSet<Arc<str>>>,
 ) -> sqlx::Result<()> {
-    let channels: HashSet<i64> = my_channels(&state.pg, conn.me)
-        .await?
-        .into_iter()
-        .collect();
+    let channels: HashSet<i64> = my_channels(&state.pg, conn.me).await?.into_iter().collect();
     conn.channels = Some(channels.clone());
     // A send error means the forwarder is gone, i.e. the connection is
     // already tearing down.
@@ -1117,20 +1147,27 @@ async fn ready_snapshot(state: &AppState, me: i64) -> Result<Ready, ApiError> {
             if guild_ids.is_empty() {
                 Ok(Vec::new())
             } else {
-                sqlx::query("SELECT id, guild_id, kind, name FROM channels WHERE guild_id = ANY($1)")
-                    .bind(&guild_ids)
-                    .fetch_all(pg)
-                    .await
+                sqlx::query(
+                    "SELECT id, guild_id, kind, name FROM channels WHERE guild_id = ANY($1)",
+                )
+                .bind(&guild_ids)
+                .fetch_all(pg)
+                .await
             }
         },
         presence_map(&state.redis, &brief_ids),
     );
+    // Build a guild_id -> index map once so per-channel attachment is O(1)
+    // instead of an O(guilds.len()) linear scan per channel (the previous
+    // `find` made snapshot assembly O(guilds * channels) on this loop).
+    let guild_idx: HashMap<i64, usize> =
+        guilds.iter().enumerate().map(|(i, g)| (g.id, i)).collect();
     for cr in chan_rows_res? {
         let guild_id: i64 = cr.try_get("guild_id")?;
-        let Some(guild) = guilds.iter_mut().find(|g| g.id == guild_id) else {
+        let Some(&idx) = guild_idx.get(&guild_id) else {
             continue;
         };
-        guild.channels.push(ChannelInfo {
+        guilds[idx].channels.push(ChannelInfo {
             id: cr.try_get("id")?,
             guild_id: Some(guild_id),
             kind: crate::messages::parse_channel_kind(&cr.try_get::<String, _>("kind")?)
@@ -1217,7 +1254,6 @@ mod tests {
     #[test]
     fn frame_msg_encodes_msgpack_envelope() {
         let frame = frame_msg(WsServerMsg {
-            id: None,
             body: WsServerBody::Presence {
                 account_id: 2,
                 online: true,
@@ -1234,7 +1270,6 @@ mod tests {
                         online: true,
                     }
                 );
-                assert_eq!(parsed.id, None);
             }
             other => panic!("expected binary frame, got {other:?}"),
         }
@@ -1243,7 +1278,7 @@ mod tests {
     #[test]
     fn event_frame_transcodes_pubsub_json_to_msgpack() {
         // The exact bytes `crate::events` puts on Redis (its pinned envelope).
-        let payload = r#"{"id":null,"body":{"presence":{"account_id":2,"online":true}}}"#;
+        let payload = r#"{"body":{"presence":{"account_id":2,"online":true}}}"#;
         let frame = event_frame(payload).expect("pubsub payload transcodes");
         let WsMessage::Binary(data) = frame else {
             panic!("expected binary frame, got {frame:?}");
@@ -1252,7 +1287,6 @@ mod tests {
         assert_eq!(
             parsed,
             WsServerMsg {
-                id: None,
                 body: WsServerBody::Presence {
                     account_id: 2,
                     online: true,
@@ -1295,7 +1329,10 @@ mod tests {
         assert_eq!(first, desired);
         let mut adds = 0;
         while let Ok(cmd) = cmds.try_recv() {
-            assert!(matches!(cmd, WorkerCmd::Add(_)), "expected Add, got {cmd:?}");
+            assert!(
+                matches!(cmd, WorkerCmd::Add(_)),
+                "expected Add, got {cmd:?}"
+            );
             adds += 1;
         }
         assert_eq!(adds, 2);

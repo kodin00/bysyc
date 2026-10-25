@@ -24,12 +24,10 @@ mod common;
 use std::time::Duration;
 use tokio::time::Instant;
 
-use bysyc_common::protocol::{
-    decode_ws_server_msg, CallSignalKind, WsServerBody, WsServerMsg,
-};
 use bysyc_common::PROTOCOL_VERSION;
+use bysyc_common::protocol::{CallSignalKind, WsServerBody, WsServerMsg, decode_ws_server_msg};
 use bysyc_server::error::ApiResult;
-use bysyc_server::voice::{join, leave, relay_signal, MAX_PARTICIPANTS};
+use bysyc_server::voice::{MAX_PARTICIPANTS, join, leave, relay_signal};
 use common::{mint_admin, setup};
 use futures_util::StreamExt;
 use tokio_tungstenite::connect_async;
@@ -60,11 +58,7 @@ fn err_code<T>(r: ApiResult<T>, what: &str) -> bysyc_common::protocol::ErrorCode
 
 /// Assert the next binary frame on the observer's WS is a `VoiceState`
 /// for `voice_id` whose participant ids equal `expected` (join order).
-async fn expect_voice_state(
-    ws: &mut WsStream,
-    voice_id: i64,
-    expected: &[i64],
-) {
+async fn expect_voice_state(ws: &mut WsStream, voice_id: i64, expected: &[i64]) {
     let deadline = Instant::now() + VOICE_TIMEOUT;
     loop {
         let msg = tokio::time::timeout_at(deadline, ws.next())
@@ -189,8 +183,10 @@ async fn voice_flow_against_testcontainers() {
     // channel of every guild they're in (including voice_id). A short
     // settle lets the shared event bus's worker establish the Redis
     // subscription before voice publishes start.
-    let observer_url =
-        format!("{}?token={}&protocol={}", h.ws_url, observer_token, PROTOCOL_VERSION);
+    let observer_url = format!(
+        "{}?token={}&protocol={}",
+        h.ws_url, observer_token, PROTOCOL_VERSION
+    );
     let (mut observer, _) = connect_async(&observer_url)
         .await
         .expect("observer ws connect");
@@ -239,7 +235,12 @@ async fn voice_flow_against_testcontainers() {
     for id in &ids[2..6] {
         ok(join(&h.state, voice_id, *id).await, "filler joins");
     }
-    expect_voice_state(&mut observer, voice_id, &[a, b, ids[2], ids[3], ids[4], ids[5]]).await;
+    expect_voice_state(
+        &mut observer,
+        voice_id,
+        &[a, b, ids[2], ids[3], ids[4], ids[5]],
+    )
+    .await;
     assert_eq!(MAX_PARTICIPANTS, 6, "fixture assumes a 6-participant cap");
 
     // -- G (the 7th) is rejected with VoiceChannelFull.
@@ -264,15 +265,31 @@ async fn voice_flow_against_testcontainers() {
 
     // -- leave frees a slot; observer sees the roster shrink by one.
     ok(leave(&h.state, voice_id, a).await, "a leaves");
-    expect_voice_state(&mut observer, voice_id, &[b, ids[2], ids[3], ids[4], ids[5]]).await;
+    expect_voice_state(
+        &mut observer,
+        voice_id,
+        &[b, ids[2], ids[3], ids[4], ids[5]],
+    )
+    .await;
 
     // -- G can now join (slot freed).
-    ok(join(&h.state, voice_id, g).await, "g joins after slot freed");
-    expect_voice_state(&mut observer, voice_id, &[b, ids[2], ids[3], ids[4], ids[5], g]).await;
+    ok(
+        join(&h.state, voice_id, g).await,
+        "g joins after slot freed",
+    );
+    expect_voice_state(
+        &mut observer,
+        voice_id,
+        &[b, ids[2], ids[3], ids[4], ids[5], g],
+    )
+    .await;
 
     // -- not-in-channel leave is a no-op success: no row deleted, so no
     //    VoiceState is published. The observer must NOT receive one.
-    ok(leave(&h.state, voice_id, a).await, "leave while absent (no-op)");
+    ok(
+        leave(&h.state, voice_id, a).await,
+        "leave while absent (no-op)",
+    );
     // Assert by negative: nothing arrives within a short window.
     let deadline = Instant::now() + Duration::from_millis(800);
     match tokio::time::timeout_at(deadline, observer.next()).await {

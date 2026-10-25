@@ -10,4 +10,4 @@ The client must be lightweight (target < 30 MB binary, < 150 MB RAM) with zero w
 ## Consequences
 
 - Large scroll histories must always be virtualized; unvirtualized message lists will visibly cost CPU in immediate mode.
-- Local persistence is SQLite (rusqlite); session token lives in the OS keychain (keyring crate). Superseded on the keychain clause by [ADR-0005](0005-session-secrets-in-0600-file.md).
+- Local persistence is SQLite (rusqlite); session token lives in the OS keychain (keyring crate). Superseded on the keychain clause by [ADR-0006](0006-session-secrets-in-0600-file.md).

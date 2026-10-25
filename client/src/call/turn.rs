@@ -1329,12 +1329,14 @@ mod tests {
         assert_eq!(bind.msg_type, TYPE_BIND_REQ);
         // Complete both so the pending list is empty before the refresh step
         // (otherwise tick would retransmit them, not queue a Refresh).
-        assert!(c
-            .handle_input(&response(TYPE_PERMISSION_OK, perm.trans_id, &[]))
-            .is_none());
-        assert!(c
-            .handle_input(&response(TYPE_BIND_OK, bind.trans_id, &[]))
-            .is_none());
+        assert!(
+            c.handle_input(&response(TYPE_PERMISSION_OK, perm.trans_id, &[]))
+                .is_none()
+        );
+        assert!(
+            c.handle_input(&response(TYPE_BIND_OK, bind.trans_id, &[]))
+                .is_none()
+        );
 
         // ---- ChannelData round-trip: outgoing wraps compactly, incoming
         // unwraps to the peer address bound above. -------------------------

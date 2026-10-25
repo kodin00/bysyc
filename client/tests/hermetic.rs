@@ -307,8 +307,13 @@ async fn two_accounts_full_flow_hermetic() {
             .is_empty(),
         "no share may be pending after a reuse send"
     );
-    b.wait_for_plaintext(dto3.id, dm_ch, text3, "b decrypts a's second DM (session reuse)")
-        .await;
+    b.wait_for_plaintext(
+        dto3.id,
+        dm_ch,
+        text3,
+        "b decrypts a's second DM (session reuse)",
+    )
+    .await;
 
     // Guild: b creates one (default text channel), invites a, a joins by
     // code. b's MemberJoined widens the share roster; a gets GuildJoined.
@@ -383,8 +388,13 @@ async fn two_accounts_full_flow_hermetic() {
     // the newcomer a, who must decrypt it.
     let text4 = format!("guild hello {suffix}");
     let dto4 = b.send_chat(text_channel.id, &text4).await;
-    a.wait_for_plaintext(dto4.id, text_channel.id, &text4, "a decrypts b's guild message")
-        .await;
+    a.wait_for_plaintext(
+        dto4.id,
+        text_channel.id,
+        &text4,
+        "a decrypts b's guild message",
+    )
+    .await;
 
     // ---- 5. Teardown -------------------------------------------------------
     a.shutdown().await;

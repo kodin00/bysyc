@@ -111,7 +111,7 @@ immediate-mode, repaints only on interaction. Local state is SQLite
 (rusqlite, bundled); the session token and pickle passphrase live in
 a 0600 `secrets.json` in the data dir, not the OS keychain
 ([ADR-0003](adr/0003-pure-rust-egui-client.md),
-[ADR-0005](adr/0005-session-secrets-in-0600-file.md)). Voice uses
+[ADR-0006](adr/0006-session-secrets-in-0600-file.md)). Voice uses
 str0m (sans-I/O WebRTC) over a tokio-owned UDP loop, with cpal for
 capture and Opus for the codec. See `README.md` for v1 limits (one
 device per account, audio-only calls, no read receipts).

@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::middleware::{from_fn_with_state, Next};
+use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -33,10 +33,11 @@ pub fn router(rate_limiter: Arc<RateLimiter>) -> Router<AppState> {
         .route("/auth/invites", post(create_invite))
 }
 
-/// Per-IP throttle on the login/register routes. ConnectInfo is the direct
-/// peer when present (local dev); behind Caddy the real client is the first
-/// hop of `X-Forwarded-For`. No IP at all means allow — don't break local dev
-/// without connect-info serving.
+/// Per-IP throttle on the login/register routes. `X-Forwarded-For` is only
+/// honored when `TRUSTED_PROXY_HOPS` is set to the number of trusted reverse
+/// proxies in front of this server (see `client_ip`); otherwise the direct
+/// peer (ConnectInfo) is the rate-limit key. No IP at all means allow, so
+/// local dev without connect-info serving isn't broken.
 async fn rate_limit_middleware(
     State(rl): State<Arc<RateLimiter>>,
     req: Request,
@@ -51,14 +52,38 @@ async fn rate_limit_middleware(
 }
 
 fn client_ip(req: &Request) -> Option<IpAddr> {
-    if let Some(ci) = req.extensions().get::<ConnectInfo<SocketAddr>>() {
-        return Some(ci.0.ip());
-    }
-    req.headers()
+    let connect_info = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0.ip());
+
+    // Only honor X-Forwarded-For when an operator has opted in via
+    // TRUSTED_PROXY_HOPS (the count of trusted reverse proxies in front of
+    // this server). Without that gate any client could forge the header and
+    // reset its rate-limit key. Unset/empty/0 → trust the direct peer only.
+    let hops = std::env::var("TRUSTED_PROXY_HOPS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0);
+    let Some(hops) = hops else {
+        return connect_info;
+    };
+
+    // XFF lists the original client first, then each proxy appends to the
+    // right. With N trusted proxies the rightmost N entries are those
+    // proxies; the entry just left of them, index len-1-N, is the real
+    // client. A header missing or too short to peel off N proxies falls
+    // back to ConnectInfo, then None.
+    let client = req
+        .headers()
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .and_then(|s| s.trim().parse::<IpAddr>().ok())
+        .and_then(|s| {
+            let entries: Vec<&str> = s.split(',').map(|e| e.trim()).collect();
+            let idx = entries.len().checked_sub(1)?.checked_sub(hops)?;
+            entries.get(idx).and_then(|e| e.parse::<IpAddr>().ok())
+        });
+    client.or(connect_info)
 }
 
 /// (id, username, identity_key, created_at_ms, is_admin)
@@ -178,10 +203,11 @@ async fn register(
         "account registered"
     );
 
-    let token = session::create(&state.redis, row.0).await?;
+    let info = account_info(row);
+    let token = session::create(&state.redis, info.id, &info).await?;
     Ok(Json(TokenResponse {
         token,
-        account: account_info(row),
+        account: info,
     }))
 }
 
@@ -213,16 +239,17 @@ async fn login(
     }
 
     tracing::info!(account_id = id, "login ok");
-    let token = session::create(&state.redis, id).await?;
+    let info = AccountInfo {
+        id,
+        username,
+        identity_key: identity_key.unwrap_or_default(),
+        created_at_ms,
+        is_admin,
+    };
+    let token = session::create(&state.redis, info.id, &info).await?;
     Ok(Json(TokenResponse {
         token,
-        account: AccountInfo {
-            id,
-            username,
-            identity_key: identity_key.unwrap_or_default(),
-            created_at_ms,
-            is_admin,
-        },
+        account: info,
     }))
 }
 
@@ -242,17 +269,42 @@ async fn logout(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn me(State(state): State<AppState>, Authed(me): Authed) -> ApiResult<Json<AccountInfo>> {
+/// Fetch the caller's [`AccountInfo`] from Postgres. Shared by [`me`] (the
+/// cache-miss read-through path) and `keys::put_identity` (cache refresh
+/// after an identity-key upload). `None` means the account no longer exists.
+pub(crate) async fn fetch_account_info(
+    pg: &sqlx::PgPool,
+    account_id: i64,
+) -> Result<Option<AccountInfo>, ApiError> {
     let row: Option<AccountRow> = sqlx::query_as(
         "SELECT id, username, identity_key, \
                   (EXTRACT(EPOCH FROM created_at) * 1000)::bigint, is_admin \
          FROM accounts WHERE id = $1",
     )
-    .bind(me)
-    .fetch_optional(&state.pg)
+    .bind(account_id)
+    .fetch_optional(pg)
     .await?;
-    let row = row.ok_or_else(|| ApiError::unauthorized("account no longer exists"))?;
-    Ok(Json(account_info(row)))
+    Ok(row.map(account_info))
+}
+
+async fn me(State(state): State<AppState>, Authed(me): Authed) -> ApiResult<Json<AccountInfo>> {
+    // Hot path: the AccountInfo was cached alongside the session at login
+    // (or by a prior read-through); serve it from Redis without a Postgres
+    // hit, so /auth/me resolves at the same cost as the session lookup that
+    // Authed already did.
+    if let Some(info) = session::account_info(&state.redis, me).await? {
+        return Ok(Json(info));
+    }
+    // Cache miss: read Postgres and re-cache so the next /me is hot again.
+    let Some(info) = fetch_account_info(&state.pg, me).await? else {
+        return Err(ApiError::unauthorized("account no longer exists"));
+    };
+    // Best-effort re-cache: a Redis hiccup just means the next /me falls
+    // through to Postgres again, not a request failure.
+    if let Err(e) = session::cache_account_info(&state.redis, me, &info).await {
+        tracing::warn!(me, "account info cache re-fill failed: {e}");
+    }
+    Ok(Json(info))
 }
 
 /// `POST /auth/invites` — admin-only: mint a fresh registration invite code.
@@ -261,11 +313,10 @@ async fn create_invite(
     State(state): State<AppState>,
     Authed(me): Authed,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let is_admin: Option<bool> =
-        sqlx::query_scalar("SELECT is_admin FROM accounts WHERE id = $1")
-            .bind(me)
-            .fetch_optional(&state.pg)
-            .await?;
+    let is_admin: Option<bool> = sqlx::query_scalar("SELECT is_admin FROM accounts WHERE id = $1")
+        .bind(me)
+        .fetch_optional(&state.pg)
+        .await?;
     if is_admin != Some(true) {
         return Err(ApiError::forbidden("admin only"));
     }

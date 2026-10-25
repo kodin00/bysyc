@@ -119,9 +119,7 @@ fn teardown(state: &Arc<Mutex<ClientState>>, send_voice_leave: bool) {
     }
     if let Some(incoming) = reg.incoming.take() {
         // Decline a pending prompt so the caller stops ringing.
-        if send_voice_leave
-            && let Some(net) = current_net(state)
-        {
+        if send_voice_leave && let Some(net) = current_net(state) {
             let _ = net.out.try_send(WsClientMsg {
                 id: next_msg_id(),
                 body: WsClientBody::CallSignal {
@@ -132,9 +130,7 @@ fn teardown(state: &Arc<Mutex<ClientState>>, send_voice_leave: bool) {
             });
         }
     }
-    if send_voice_leave
-        && let Some(net) = current_net(state)
-    {
+    if send_voice_leave && let Some(net) = current_net(state) {
         let _ = net.out.try_send(WsClientMsg {
             id: next_msg_id(),
             body: WsClientBody::VoiceLeave,
