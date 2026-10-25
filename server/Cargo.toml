@@ -33,7 +33,7 @@ hex = "0.4"
 # bysyc-common for the WS MessagePack codec types, sqlx for direct DB access
 # (minting registration invites, seeding the voice-cap fixture).
 testcontainers = "0.23"
-tokio-tungstenite = "0.28"
+tokio-tungstenite = "0.29"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 tokio = { workspace = true }
 axum = { version = "0.8", features = ["ws"] }
