@@ -21,15 +21,19 @@ pub struct Config {
 impl Config {
     pub fn from_env() -> Self {
         Self {
-            database_url: env("DATABASE_URL", "postgres://bysyc:bysyc@localhost/bysyc"),
-            redis_url: env("REDIS_URL", "redis://localhost/1"),
+            // Production-critical: a missing/empty value means a broken
+            // deployment, so crash at boot with a pointer to .env.example
+            // rather than failing on first request with a cryptic error.
+            database_url: require_env("DATABASE_URL"),
+            redis_url: require_env("REDIS_URL"),
+            s3_secret_key: require_env("S3_SECRET_KEY"),
+            turn_password: require_env("TURN_PASSWORD"),
+            // Tunables: safe local defaults, overridden in production .env.
             s3_endpoint: env("S3_ENDPOINT", "http://localhost:8333"),
             s3_access_key: env("S3_ACCESS_KEY", "bysyc"),
-            s3_secret_key: env("S3_SECRET_KEY", "bysyc"),
             s3_bucket: env("S3_BUCKET", "bysyc"),
             turn_addr: env("TURN_ADDR", "localhost:3478"),
             turn_user: env("TURN_USER", "bysyc"),
-            turn_password: env("TURN_PASSWORD", "bysyc"),
             attachment_max_bytes: env("ATTACHMENT_MAX_MB", "50").parse::<u64>().unwrap_or(50)
                 * 1024
                 * 1024,
@@ -40,4 +44,14 @@ impl Config {
 
 fn env(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+/// Read a required env var, panicking at boot (not first use) when it is
+/// unset or empty. The message points operators at `.env.example` so a
+/// misconfigured instance fails loudly and obviously.
+fn require_env(key: &str) -> String {
+    match std::env::var(key) {
+        Ok(v) if !v.is_empty() => v,
+        _ => panic!("{key} must be set (see .env.example)"),
+    }
 }

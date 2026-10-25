@@ -13,6 +13,11 @@ services:
     # postgres install. Loopback-only: never exposed on a public interface.
     ports:
       - "127.0.0.1:15432:5432"
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512m
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U bysyc -d bysyc"]
       interval: 5s
@@ -23,6 +28,11 @@ services:
     image: redis:7-alpine
     ports:
       - "127.0.0.1:16379:6379"
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 128m
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -44,7 +54,21 @@ services:
     volumes:
       - seaweed:/data
       - ./deploy/seaweedfs/s3.json:/etc/seaweedfs/s3.json:ro
-    # TODO: add healthcheck once we settle the image's shell tooling for probes.
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+    # Probe the master HTTP port (9333, always listening inside the container
+    # in `server` mode) not the S3 gateway port: /cluster/status is a master
+    # endpoint and returns 200 once the single-node raft elects a leader.
+    # The S3 gateway (8333) only got its own /healthz in a post-3.80 build.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- localhost:9333/cluster/status || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
 
   coturn:
     image: coturn/coturn:alpine
@@ -61,13 +85,30 @@ services:
       - "3478:3478/udp"
       - "3478:3478/tcp"
       - "49160-49200:49160-49200/udp"
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+    # coturn:alpine ships busybox nc (which supports -z). TCP-connect probe
+    # on the TURN listener: the relay accepts TCP on 3478 alongside UDP.
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z -w2 localhost 3478 || exit 1"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
 
   server:
     build:
       context: .
       dockerfile: server/Dockerfile
+    # Default: bind only to loopback so plain HTTP isn't reachable on a public
+    # interface. To serve plain HTTP with no TLS proxy in front, bind
+    # "0.0.0.0:8080:8080" instead — but put a TLS-terminating reverse proxy
+    # (Caddy, nginx) in front for anything reachable from the internet.
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     environment:
       DATABASE_URL: postgres://bysyc:${POSTGRES_PASSWORD}@postgres/bysyc
       REDIS_URL: redis://redis/1
@@ -82,7 +123,21 @@ services:
       redis:
         condition: service_healthy
       seaweedfs:
-        condition: service_started
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 384m
+    # wget is installed in the runtime image (server/Dockerfile); the
+    # Dockerfile also declares a HEALTHCHECK so the probe works without
+    # compose too. /healthz returns "ok" once the router is up.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- localhost:8080/healthz || exit 1"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 15s
 
 volumes:
   pgdata:
