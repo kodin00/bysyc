@@ -672,6 +672,9 @@ pub enum WsClientBody {
 pub struct WsServerMsg {
     /// Server-assigned sequence number for this message on this
     /// connection, when applicable; `None` otherwise.
+    // Not skipped when None (unlike reply_to/attachment): nil vs the integer
+    // lets a client tell an unsolicited push (id=None) from a correlated
+    // reply (id=Some) over the same body.
     pub id: Option<i64>,
     /// The payload proper.
     pub body: WsServerBody,
@@ -1494,5 +1497,188 @@ mod tests {
             assert_eq!(dto.reply_to, None);
             assert_eq!(dto.attachment, None);
         }
+    }
+
+    /// Malformed or truncated inputs must never decode as a real frame: an
+    /// empty buffer and a non-map marker both yield Err, on both envelopes.
+    /// A well-formed frame built by the encoder still decodes Ok (sanity).
+    #[test]
+    fn malformed_and_empty_frames_fail_to_decode() {
+        assert!(decode_ws_server_msg(&[]).is_err());
+        assert!(decode_ws_server_msg(&[0xff, 0xff]).is_err());
+        assert!(decode_ws_client_msg(&[]).is_err());
+        assert!(decode_ws_client_msg(&[0xff, 0xff]).is_err());
+
+        let good = encode_ws_server_msg(&WsServerMsg {
+            id: None,
+            body: WsServerBody::Message(message_dto()),
+        });
+        assert!(decode_ws_server_msg(&good).is_ok());
+        let good_c = encode_ws_client_msg(&WsClientMsg {
+            id: 1,
+            body: WsClientBody::Heartbeat,
+        });
+        assert!(decode_ws_client_msg(&good_c).is_ok());
+    }
+
+    /// Every `ErrorCode` variant round-trips through JSON and lands as the
+    /// documented snake_case wire string. The exhaustive `match` below is the
+    /// completeness check: a variant added to `ErrorCode` fails to compile here
+    /// until an arm is added, so coverage cannot silently drift.
+    #[test]
+    fn error_code_every_variant_roundtrips() {
+        fn wire_str(code: &ErrorCode) -> &'static str {
+            match code {
+                ErrorCode::Unauthorized => "unauthorized",
+                ErrorCode::Forbidden => "forbidden",
+                ErrorCode::NotFound => "not_found",
+                ErrorCode::UsernameTaken => "username_taken",
+                ErrorCode::InvalidInvite => "invalid_invite",
+                ErrorCode::RateLimited => "rate_limited",
+                ErrorCode::VoiceChannelFull => "voice_channel_full",
+                ErrorCode::ProtocolVersion => "protocol_version",
+                ErrorCode::InvalidRequest => "invalid_request",
+                ErrorCode::Internal => "internal",
+            }
+        }
+
+        let codes = [
+            ErrorCode::Unauthorized,
+            ErrorCode::Forbidden,
+            ErrorCode::NotFound,
+            ErrorCode::UsernameTaken,
+            ErrorCode::InvalidInvite,
+            ErrorCode::RateLimited,
+            ErrorCode::VoiceChannelFull,
+            ErrorCode::ProtocolVersion,
+            ErrorCode::InvalidRequest,
+            ErrorCode::Internal,
+        ];
+        // One entry per match arm above; bump this if ErrorCode grows.
+        assert_eq!(
+            codes.len(),
+            10,
+            "ErrorCode variant count changed; update this test"
+        );
+
+        for code in codes {
+            // Bare variant and the REST envelope both round-trip equal.
+            roundtrip(code.clone());
+            roundtrip(ApiError {
+                code: code.clone(),
+                message: "x".into(),
+            });
+            assert_eq!(
+                serde_json::to_value(&code).unwrap(),
+                serde_json::json!(wire_str(&code)),
+            );
+        }
+    }
+
+    /// Canonical server-issued frames carry `id: None` (they are pushes, not
+    /// replies, so there is no client correlation id to echo). The `Option` is
+    /// actually serialized — `id: None` and `id: Some(n)` over the same body
+    /// encode to byte-distinct buffers — so a client can always tell a
+    /// correlated reply from an unsolicited push.
+    #[test]
+    fn production_server_frames_carry_id_none_and_option_is_serialized() {
+        let canonical = [
+            WsServerMsg {
+                id: None,
+                body: WsServerBody::Ready {
+                    account: info(),
+                    friends: vec![brief()],
+                    incoming_requests: vec![],
+                    outgoing_requests: vec![],
+                    guilds: vec![guild()],
+                    dm_channels: vec![dm_channel()],
+                    mailbox: vec![mailbox_item()],
+                },
+            },
+            WsServerMsg {
+                id: None,
+                body: WsServerBody::Message(message_dto()),
+            },
+            WsServerMsg {
+                id: None,
+                body: WsServerBody::MessageDeleted {
+                    channel_id: 10,
+                    message_id: 100,
+                },
+            },
+            WsServerMsg {
+                id: None,
+                body: WsServerBody::MailboxAppend(mailbox_item()),
+            },
+            WsServerMsg {
+                id: None,
+                body: WsServerBody::Presence {
+                    account_id: 2,
+                    online: false,
+                },
+            },
+            WsServerMsg {
+                id: None,
+                body: WsServerBody::Typing {
+                    channel_id: 10,
+                    account_id: 2,
+                },
+            },
+            WsServerMsg {
+                id: None,
+                body: WsServerBody::MemberJoined {
+                    guild_id: 5,
+                    account: brief(),
+                },
+            },
+            WsServerMsg {
+                id: None,
+                body: WsServerBody::VoiceState {
+                    channel_id: 12,
+                    participants: vec![brief()],
+                },
+            },
+            WsServerMsg {
+                id: None,
+                body: WsServerBody::CallSignal {
+                    call_id: 12,
+                    from: 2,
+                    kind: CallSignalKind::Hangup,
+                },
+            },
+            WsServerMsg {
+                id: None,
+                body: WsServerBody::Error {
+                    reply_to: None,
+                    code: ErrorCode::Internal,
+                    message: "boom".into(),
+                },
+            },
+        ];
+        for msg in canonical {
+            let bytes = encode_ws_server_msg(&msg);
+            let back = decode_ws_server_msg(&bytes).expect("canonical frame decodes");
+            assert_eq!(back.id, None, "production frame lost its id=None");
+            assert_eq!(back.body, msg.body);
+        }
+
+        // id:None vs id:Some on the SAME body must produce byte-distinct
+        // buffers: the Option is serialized (nil vs the integer), not
+        // collapsed away.
+        let body = WsServerBody::Presence {
+            account_id: 2,
+            online: false,
+        };
+        let none = encode_ws_server_msg(&WsServerMsg {
+            id: None,
+            body: body.clone(),
+        });
+        let some = encode_ws_server_msg(&WsServerMsg {
+            id: Some(42),
+            body,
+        });
+        assert_ne!(none, some, "id None vs Some collapsed to identical bytes");
+        let back = decode_ws_server_msg(&some).expect("some frame decodes");
+        assert_eq!(back.id, Some(42));
     }
 }
