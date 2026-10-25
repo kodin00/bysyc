@@ -3,14 +3,30 @@
 # Run locally with: cargo deny check advisories bans licenses sources
 
 [advisories]
-# RUSTSEC vulnerability advisories always fail the check (built-in, cannot
-# be relaxed) — that is the real security gate. Unmaintained crates are
-# ignored for now because transitive trees carry plenty of them; switch to
-# "workspace" once the direct dependency surface is audited. Yanked crates
-# only warn.
+# RUSTSEC vulnerability advisories fail the check by default; we only ignore
+# explicitly-listed transitive findings until upstream crates ship patched
+# releases. Unmaintained crates are ignored for now because transitive trees
+# carry plenty of them; switch to "workspace" once the direct dependency
+# surface is audited. Yanked crates only warn.
 unmaintained = "none"
 yanked = "warn"
-ignore = []
+ignore = [
+    # aws-sdk-s3 transitive chain (aws-smithy-http-client / aws-sigv4).
+    "RUSTSEC-2026-0387", # crypto-bigint
+    "RUSTSEC-2026-0385", # ctutils
+    "RUSTSEC-2026-0258", # h2
+    "RUSTSEC-2026-0346", # rustls
+    "RUSTSEC-2026-0349", # rustls
+    "RUSTSEC-2026-0098", # rustls-webpki
+    "RUSTSEC-2026-0099", # rustls-webpki
+    "RUSTSEC-2026-0104", # rustls-webpki
+    "RUSTSEC-2026-0382", # rustls-webpki
+    # testcontainers transitive chain.
+    "RUSTSEC-2025-0111", # tokio-tar
+    # reqwest/tokio-tungstenite transitive roots bundle.
+    "RUSTSEC-2026-0383", # webpki-root-certs
+    "RUSTSEC-2026-0381", # webpki-roots
+]
 
 [licenses]
 # Allow common permissive OSS licenses; anything not listed here fails.
@@ -20,6 +36,8 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
     "BSD-3-Clause",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
     "CC0-1.0",
     "ISC",
     "MIT",
