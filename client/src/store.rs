@@ -256,10 +256,10 @@ impl Store {
         {
             let mut stmt = self.conn.prepare_cached(Self::INSERT_MESSAGE)?;
             for m in dtos {
-                let attachment_json = match &m.attachment {
-                    Some(a) => Some(serde_json::to_string(a).unwrap_or_default()),
-                    None => None,
-                };
+                let attachment_json = m
+                    .attachment
+                    .as_ref()
+                    .map(|a| serde_json::to_string(a).unwrap_or_default());
                 stmt.execute(params![
                     m.id,
                     m.channel_id,
@@ -330,9 +330,7 @@ impl Store {
     pub fn plaintext(&self, msg_id: i64) -> Option<String> {
         self.conn
             .prepare_cached("SELECT plaintext FROM messages WHERE id = ?1")
-            .and_then(|mut stmt| {
-                stmt.query_row(params![msg_id], |r| r.get::<_, Option<String>>(0))
-            })
+            .and_then(|mut stmt| stmt.query_row(params![msg_id], |r| r.get::<_, Option<String>>(0)))
             .optional()
             .ok()
             .flatten()
@@ -534,24 +532,23 @@ impl Store {
         if let Ok(mut stmt) = self
             .conn
             .prepare_cached("SELECT id, guild_id, kind, name FROM channels ORDER BY name")
-        {
-            if let Ok(rows) = stmt.query_map([], |r| {
+            && let Ok(rows) = stmt.query_map([], |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
                     r.get::<_, i64>(1)?,
                     r.get::<_, String>(2)?,
                     r.get::<_, String>(3)?,
                 ))
-            }) {
-                for (id, guild_id, kind, name) in rows.filter_map(|r| r.ok()) {
-                    if let Some(g) = out.iter_mut().find(|g| g.id == guild_id) {
-                        g.channels.push(ChannelInfo {
-                            id,
-                            guild_id: Some(guild_id),
-                            kind: parse_kind_channel(&kind),
-                            name,
-                        });
-                    }
+            })
+        {
+            for (id, guild_id, kind, name) in rows.filter_map(|r| r.ok()) {
+                if let Some(g) = out.iter_mut().find(|g| g.id == guild_id) {
+                    g.channels.push(ChannelInfo {
+                        id,
+                        guild_id: Some(guild_id),
+                        kind: parse_kind_channel(&kind),
+                        name,
+                    });
                 }
             }
         }
@@ -607,11 +604,26 @@ fn secrets_store(map: &BTreeMap<String, String>) -> Result<(), String> {
         std::fs::create_dir_all(parent).map_err(|e| format!("secrets: {e}"))?;
     }
     let json = serde_json::to_string_pretty(map).map_err(|e| format!("secrets: {e}"))?;
-    std::fs::write(&path, json).map_err(|e| format!("secrets: {e}"))?;
+    // Open already at mode 0600 so the file is never briefly world-readable
+    // (write-then-chmod leaves a TOCTOU window for the token + passphrase).
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|e| format!("secrets: {e}"))?;
+        f.write_all(json.as_bytes())
+            .map_err(|e| format!("secrets: {e}"))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&path, json).map_err(|e| format!("secrets: {e}"))?;
     }
     Ok(())
 }

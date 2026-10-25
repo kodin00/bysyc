@@ -24,8 +24,8 @@
 //! the oldest samples to bound latency.
 
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -117,7 +117,10 @@ impl SpscRing {
     /// Consumer side: pop up to `out.len()` samples, returning how many
     /// were filled. The remainder is left untouched.
     pub fn pop_into(&self, out: &mut [f32]) -> usize {
-        let head = self.head.load(Ordering::Relaxed); // consumer-owned
+        // Acquire pairs with the producer's Release store of `head` on overflow,
+        // so the slots it dropped (advancing head past) are visible before we
+        // read past them; loading Relaxed here would race the producer.
+        let head = self.head.load(Ordering::Acquire);
         let tail = self.tail.load(Ordering::Acquire);
         let avail = (tail - head) as usize;
         let n = avail.min(out.len());
@@ -141,6 +144,12 @@ impl SpscRing {
     pub fn clear(&self) {
         let tail = self.tail.load(Ordering::Acquire);
         self.head.store(tail, Ordering::Release);
+    }
+}
+
+impl Default for SpscRing {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -422,7 +431,7 @@ fn find_output(host: &cpal::Host, name: Option<&str>) -> Option<cpal::Device> {
         Some(n) => host
             .output_devices()
             .ok()
-            .and_then(|mut it| it.find(|d| dev_name(&d).as_deref() == Some(n)))
+            .and_then(|mut it| it.find(|d| dev_name(d).as_deref() == Some(n)))
             .or_else(|| host.default_output_device()),
         None => host.default_output_device(),
     }
@@ -433,7 +442,7 @@ fn find_input(host: &cpal::Host, name: Option<&str>) -> Option<cpal::Device> {
         Some(n) => host
             .input_devices()
             .ok()
-            .and_then(|mut it| it.find(|d| dev_name(&d).as_deref() == Some(n)))
+            .and_then(|mut it| it.find(|d| dev_name(d).as_deref() == Some(n)))
             .or_else(|| host.default_input_device()),
         None => host.default_input_device(),
     }
@@ -459,8 +468,7 @@ impl AudioIo {
                 in_dev
                     .supported_input_configs()
                     .ok()?
-                    .filter(|r| r.sample_format() == cpal::SampleFormat::F32)
-                    .next()
+                    .find(|r| r.sample_format() == cpal::SampleFormat::F32)
                     .map(|r| r.with_max_sample_rate())
             })
             .ok_or("no f32 microphone format")?;
@@ -513,8 +521,7 @@ impl AudioIo {
                 out_dev
                     .supported_output_configs()
                     .ok()?
-                    .filter(|r| r.sample_format() == cpal::SampleFormat::F32)
-                    .next()
+                    .find(|r| r.sample_format() == cpal::SampleFormat::F32)
                     .map(|r| r.with_max_sample_rate())
             })
             .ok_or("no f32 speaker format")?;
@@ -813,7 +820,7 @@ mod tests {
         let mut dec = PeerDecoder::new(sink.clone()).expect("decoder");
         dec.conceal();
         dec.conceal();
-        assert!(sink.ring.len() > 0);
+        assert!(!sink.ring.is_empty());
     }
 
     #[test]
