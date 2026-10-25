@@ -39,7 +39,7 @@ jobs:
           tar -czf "bysyc-${{ github.ref_name }}-aarch64-apple-darwin.tar.gz" \
             -C target/aarch64-apple-darwin/release bysyc-client
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: bysyc-macos-aarch64
           path: bysyc-${{ github.ref_name }}-aarch64-apple-darwin.tar.gz
@@ -69,7 +69,7 @@ jobs:
             -Path target/x86_64-pc-windows-msvc/release/bysyc-client.exe `
             -DestinationPath "bysyc-${{ github.ref_name }}-x86_64-windows.zip"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: bysyc-windows-x86_64
           path: bysyc-${{ github.ref_name }}-x86_64-windows.zip
