@@ -648,18 +648,20 @@ fn secrets_path() -> Result<PathBuf, String> {
         .ok_or_else(|| "cannot determine the platform data directory".to_string())
 }
 
-fn secrets_load() -> BTreeMap<String, String> {
-    let Ok(path) = secrets_path() else {
-        return BTreeMap::new();
-    };
+/// Read the secrets map at an explicit path (missing/corrupt → empty).
+/// Split out of [`secrets_load`] so the parse contract is testable without
+/// touching the real platform data dir.
+fn secrets_at(path: &Path) -> BTreeMap<String, String> {
     std::fs::read_to_string(path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
 }
 
-fn secrets_store(map: &BTreeMap<String, String>) -> Result<(), String> {
-    let path = secrets_path()?;
+/// Write the secrets map to an explicit path, mode 0600 on unix. Split out of
+/// [`secrets_store`] so the 0600 permission contract is unit-testable without
+/// redirecting the real platform data dir.
+fn secrets_to(path: &Path, map: &BTreeMap<String, String>) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("secrets: {e}"))?;
     }
@@ -676,16 +678,27 @@ fn secrets_store(map: &BTreeMap<String, String>) -> Result<(), String> {
             .create(true)
             .truncate(true)
             .mode(0o600)
-            .open(&path)
+            .open(path)
             .map_err(|e| format!("secrets: {e}"))?;
         f.write_all(json.as_bytes())
             .map_err(|e| format!("secrets: {e}"))?;
     }
     #[cfg(not(unix))]
     {
-        std::fs::write(&path, json).map_err(|e| format!("secrets: {e}"))?;
+        std::fs::write(path, json).map_err(|e| format!("secrets: {e}"))?;
     }
     Ok(())
+}
+
+fn secrets_load() -> BTreeMap<String, String> {
+    match secrets_path() {
+        Ok(path) => secrets_at(&path),
+        Err(_) => BTreeMap::new(),
+    }
+}
+
+fn secrets_store(map: &BTreeMap<String, String>) -> Result<(), String> {
+    secrets_to(&secrets_path()?, map)
 }
 
 fn secret_get(service: &str, account: &str) -> Option<String> {
@@ -1025,6 +1038,48 @@ mod tests {
         assert_eq!(h.len(), 64);
         assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(h, random_hex32());
+    }
+
+    /// The secrets file is written mode 0600 on unix (no group/other bits)
+    /// and round-trips through the same read path. Covers the 0600 contract
+    /// `secrets_to` carries for the real platform data dir without redirecting it.
+    #[cfg(unix)]
+    #[test]
+    fn secrets_file_is_0600_and_round_trips() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!(
+            "bysyc-test-secrets-{}-{}.json",
+            std::process::id(),
+            now_tag()
+        ));
+        let mut map = BTreeMap::new();
+        map.insert("bysyc-session/alice".to_string(), "tok-abc".to_string());
+        map.insert("bysyc-pickle/alice".to_string(), "pp-xyz".to_string());
+        secrets_to(&path, &map).expect("write secrets");
+
+        let mode = std::fs::metadata(&path)
+            .expect("secrets metadata")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "secrets file must not be group/other readable (mode={mode:o})"
+        );
+        assert_eq!(mode & 0o600, 0o600);
+
+        let back = secrets_at(&path);
+        assert_eq!(back, map, "secrets round-trip");
+
+        // A missing file parses to an empty map, not an error (the login
+        // view falls back gracefully when nothing is stored yet).
+        let none = std::env::temp_dir().join(format!(
+            "bysyc-test-secrets-missing-{}-{}.json",
+            std::process::id(),
+            now_tag()
+        ));
+        assert!(secrets_at(&none).is_empty());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

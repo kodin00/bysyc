@@ -539,6 +539,11 @@ impl Engine {
         let share = queued
             .clone()
             .unwrap_or_else(|| out.pending_share(channel_id));
+        // The caller mails these Olm-wrapped envelopes BEFORE POSTing the
+        // chat MessageDto that triggered the share, so peers import the key
+        // before the ciphertext arrives (the sender-key ordering guarantee).
+        // The POST order is the caller's; this function only builds the
+        // envelopes.
         let json = match (Envelope::SessionShare {
             channel_id: share.channel_id,
             session_id: share.session_id.clone(),
@@ -701,7 +706,7 @@ impl Engine {
     fn persist(&self, inner: &mut EngineInner) -> anyhow::Result<()> {
         let dirty = inner.dirty;
         if dirty == 0 {
-            return Ok(());
+            return Ok(()); // no tables touched (e.g. a megolm decrypt): no write at all
         }
 
         let mut writes: Vec<(&'static str, Vec<u8>)> = Vec::new();

@@ -28,6 +28,7 @@ use super::{ClientState, MAILBOX_STALE_MS, MAX_OUTBOX_ACKS, guard, now_ms, push_
 /// sequentially by one worker thread holding no locks, and published back
 /// under a brief state lock; the single FIFO keeps decrypt order per channel
 /// identical to arrival order.
+#[derive(Debug)]
 pub(super) enum CryptoJob {
     /// Megolm-decrypt one incoming chat message, persist its plaintext (or
     /// apply its Delete envelope), then insert the row into the live cache.
@@ -76,6 +77,26 @@ struct CryptoQueueInner {
     worker_alive: bool,
 }
 
+/// Test-only latch: when set, [`stage_crypto_job`] enqueues jobs without
+/// spawning the crypto worker, so unit tests can assert exactly what
+/// [`super::apply_server_msg`] staged (the worker would otherwise pop and run
+/// the jobs on another thread before the test could inspect them). The
+/// integration tests (`tests/e2e.rs`, `tests/hermetic.rs`) live in separate
+/// test binaries that never set this, so their decrypt workers run for real.
+/// Set by `apply::apply_tests::Fixture::new`; deliberately never reset — no
+/// unit test in this binary relies on the worker, so a single set per process
+/// is race-free across parallel tests.
+#[cfg(test)]
+pub(super) static NO_WORKER: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test-only: pull every staged job out of the queue. With [`NO_WORKER`] set
+/// the worker never ran, so these are exactly the jobs staging pushed.
+#[cfg(test)]
+pub(super) fn drain_staged(q: &CryptoQueue) -> Vec<CryptoJob> {
+    guard(&q.inner).queue.drain(..).collect()
+}
+
 /// Append `job` and make sure exactly one worker thread is draining the
 /// queue (see [`CryptoWorker::run`] for the empty-exit protocol).
 pub(super) fn stage_crypto_job(
@@ -85,6 +106,11 @@ pub(super) fn stage_crypto_job(
     store: &Arc<Mutex<Store>>,
     ctx: &Context,
 ) {
+    #[cfg(test)]
+    if NO_WORKER.load(std::sync::atomic::Ordering::Relaxed) {
+        guard(&q.inner).queue.push_back(job);
+        return;
+    }
     let spawn = {
         let mut inner = guard(&q.inner);
         inner.queue.push_back(job);

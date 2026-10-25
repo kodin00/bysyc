@@ -1623,4 +1623,81 @@ mod tests {
             assert_eq!(dto.attachment, None);
         }
     }
+
+    /// Malformed or truncated inputs must never decode as a real frame: an
+    /// empty buffer and a non-map marker both yield Err, on both envelopes.
+    /// A well-formed frame built by the encoder still decodes Ok (sanity).
+    #[test]
+    fn malformed_and_empty_frames_fail_to_decode() {
+        assert!(decode_ws_server_msg(&[]).is_err());
+        assert!(decode_ws_server_msg(&[0xff, 0xff]).is_err());
+        assert!(decode_ws_client_msg(&[]).is_err());
+        assert!(decode_ws_client_msg(&[0xff, 0xff]).is_err());
+
+        let good = encode_ws_server_msg(&WsServerMsg {
+            body: WsServerBody::Message(message_dto()),
+        });
+        assert!(decode_ws_server_msg(&good).is_ok());
+        let good_c = encode_ws_client_msg(&WsClientMsg {
+            id: 1,
+            body: WsClientBody::Heartbeat,
+        });
+        assert!(decode_ws_client_msg(&good_c).is_ok());
+    }
+
+    /// Every `ErrorCode` variant round-trips through JSON and lands as the
+    /// documented snake_case wire string. The exhaustive `match` below is the
+    /// completeness check: a variant added to `ErrorCode` fails to compile here
+    /// until an arm is added, so coverage cannot silently drift.
+    #[test]
+    fn error_code_every_variant_roundtrips() {
+        fn wire_str(code: &ErrorCode) -> &'static str {
+            match code {
+                ErrorCode::Unauthorized => "unauthorized",
+                ErrorCode::Forbidden => "forbidden",
+                ErrorCode::NotFound => "not_found",
+                ErrorCode::UsernameTaken => "username_taken",
+                ErrorCode::InvalidInvite => "invalid_invite",
+                ErrorCode::RateLimited => "rate_limited",
+                ErrorCode::VoiceChannelFull => "voice_channel_full",
+                ErrorCode::ProtocolVersion => "protocol_version",
+                ErrorCode::InvalidRequest => "invalid_request",
+                ErrorCode::Internal => "internal",
+                ErrorCode::Unknown => "unknown",
+            }
+        }
+
+        let codes = [
+            ErrorCode::Unauthorized,
+            ErrorCode::Forbidden,
+            ErrorCode::NotFound,
+            ErrorCode::UsernameTaken,
+            ErrorCode::InvalidInvite,
+            ErrorCode::RateLimited,
+            ErrorCode::VoiceChannelFull,
+            ErrorCode::ProtocolVersion,
+            ErrorCode::InvalidRequest,
+            ErrorCode::Internal,
+            ErrorCode::Unknown,
+        ];
+        // One entry per match arm above; bump this if ErrorCode grows.
+        assert_eq!(
+            codes.len(),
+            11,
+            "ErrorCode variant count changed; update this test"
+        );
+
+        for code in codes {
+            // Bare variant and the REST envelope both round-trip equal.
+            roundtrip(code.clone());
+            roundtrip(ApiError {
+                code: code.clone(),
+                message: "x".into(),
+            });
+            assert_eq!(
+                serde_json::to_value(&code).unwrap(),
+                serde_json::json!(wire_str(&code)),
+            );
+        }
+    }
 }

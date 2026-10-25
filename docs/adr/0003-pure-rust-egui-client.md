@@ -10,4 +10,4 @@ The client must be lightweight (target < 30 MB binary, < 150 MB RAM) with zero w
 ## Consequences
 
 - Large scroll histories must always be virtualized; unvirtualized message lists will visibly cost CPU in immediate mode.
-- Local persistence is SQLite (rusqlite); session token and pickle passphrase live in a 0600 `secrets.json` in the data dir (amended 2026-10-15: previously the OS keychain via the keyring crate — dropped to avoid keychain access prompts; the passphrase still never lives inside the SQLite file it protects).
+- Local persistence is SQLite (rusqlite); session token lives in the OS keychain (keyring crate). Superseded on the keychain clause by [ADR-0006](0006-session-secrets-in-0600-file.md).

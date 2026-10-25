@@ -125,6 +125,7 @@ async fn member_ids(pool: &sqlx::PgPool, guild_id: i64) -> ApiResult<Vec<i64>> {
 
 /// Full GuildInfo snapshot (guild row + channels ordered by id) in one
 /// `guilds LEFT JOIN channels` query — the same shape list_guilds folds.
+#[allow(clippy::type_complexity)]
 async fn guild_info(pool: &sqlx::PgPool, guild_id: i64) -> ApiResult<GuildInfo> {
     // (guild name, owner id, channel id, channel kind, channel name): one row
     // per channel, plus a single all-NULL channel row for an empty guild.

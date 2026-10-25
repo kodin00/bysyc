@@ -1,23 +1,4 @@
-mod attachments;
-mod auth;
-mod config;
-mod db;
-mod error;
-mod events;
-mod friends;
-mod guilds;
-mod keys;
-mod mailbox;
-mod messages;
-mod passwd;
-mod rate_limit;
-mod routes;
-mod s3;
-mod session;
-mod voice;
-mod ws;
-
-use db::AppState;
+use bysyc_server::{boot, config, db, routes, ws};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -74,22 +55,4 @@ fn ws_event_workers() -> usize {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(4)
         .clamp(1, 8)
-}
-
-async fn boot(config: &config::Config) -> anyhow::Result<AppState> {
-    let pg = db::connect_pool(&config.database_url, config.db_max_connections).await?;
-    db::migrate(&pg).await?;
-    let redis_client = redis::Client::open(config.redis_url.as_str())?;
-    let redis = redis::aio::ConnectionManager::new(redis_client.clone()).await?;
-    // Not a clone of `redis` (a manager clone shares one connection): a
-    // second manager so event publishes get their own pipe.
-    let redis_events = redis::aio::ConnectionManager::new(redis_client).await?;
-    let s3 = s3::client(config);
-    Ok(AppState {
-        pg,
-        redis,
-        redis_events,
-        s3,
-        config: config.clone(),
-    })
 }

@@ -18,7 +18,9 @@ Cargo workspace with three crates: `common` (wire protocol), `server`
 backing services), `client` (`bysyc-client`: eframe/egui desktop app; cpal /
 opus / str0m for mesh voice, rusqlite bundled for local state). Deployment is
 docker-compose from `deploy/`; `README.md` has the full quickstart and
-`CONTEXT.md` the domain glossary.
+`CONTEXT.md` the domain glossary. New domain terms go in `CONTEXT.md`;
+do not introduce synonyms (the glossary's `_Avoid:` notes pin the
+canonical word per concept).
 
 ## Build & test
 

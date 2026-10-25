@@ -45,8 +45,8 @@
 //!    as a safety net independent of client heartbeats. Connectivity is
 //!    detected from socket close, not from TTL expiry.
 //! 6. **Disconnect** (every exit path): delete the presence key, leave any
-//!    voice channel via [`crate::voice::leave`] (which publishes the new
-//!    `VoiceState`), fan out `Presence{online:false}` to the same
+//!    voice channel with one `DELETE ... RETURNING` (then publishes each
+//!    affected channel's `VoiceState` snapshot), fan out `Presence{online:false}` to the same
 //!    friends+co-members audience. The REST session survives disconnect.
 //!
 //! # v1 limitations (documented contract)
@@ -239,7 +239,7 @@ static EVENT_BUS: OnceLock<EventBus> = OnceLock::new();
 
 /// Start `workers` shared subscriber workers and install the process-wide
 /// bus. No-op if called twice.
-pub(crate) fn start_event_bus(redis_url: &str, workers: usize) {
+pub fn start_event_bus(redis_url: &str, workers: usize) {
     if EVENT_BUS.get().is_some() {
         return;
     }
@@ -811,6 +811,7 @@ async fn handle_client_msg(
                     send_error(out, Some(msg.id), ErrorCode::Internal, "database error");
                 }
             }
+            // not in a Call: nothing to do, no error
         }
         WsClientBody::CallSignal { call_id, to, kind } => {
             if let Err(e) = crate::voice::relay_signal(state, call_id, me, to, kind).await {

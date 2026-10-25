@@ -505,6 +505,7 @@ pub async fn share_session_with_peers(
     channel_id: i64,
     peer_ids: Vec<i64>,
 ) -> usize {
+    #[allow(clippy::type_complexity)]
     let mut with_keys: Vec<(i64, String, Option<(String, String)>)> = Vec::new();
     for peer in &peer_ids {
         match net.claim_otk(*peer).await {
@@ -715,6 +716,9 @@ pub fn spawn_ws(
 /// Whether this loop is still the session's WS task.
 fn alive(state: &Arc<Mutex<ClientState>>, generation: u64) -> bool {
     let st = guard(state);
+    // ws_generation is bumped on reconnect/logout; this loop captured
+    // `generation` at spawn, so a mismatch means a newer loop superseded us
+    // (or we logged out) — exit at the next check instead of racing it.
     st.ws_generation == generation && !matches!(st.phase, Phase::Disconnected)
 }
 
@@ -779,6 +783,15 @@ fn jittered(d: Duration) -> Duration {
 /// drops us is retried with real spacing instead of every second.
 const MIN_SESSION_UPTIME: Duration = Duration::from_secs(10);
 
+/// Whether a just-ended session earns a backoff reset: only one that carried
+/// a `Ready` AND stayed up at least [`MIN_SESSION_UPTIME`]. A flapping
+/// Instance that completes the handshake then drops us keeps the backoff
+/// growing instead of resetting to 1 s per TCP success. Factored out of
+/// `run_ws` so the gate is unit-testable without driving a real socket.
+fn earns_backoff_reset(saw_ready: bool, uptime: Duration) -> bool {
+    saw_ready && uptime >= MIN_SESSION_UPTIME
+}
+
 /// The realtime gateway task: connect → apply `Ready` → stream deltas,
 /// reconnecting forever with exponential backoff (1 s → 30 s cap, each
 /// sleep jittered ±30%; the backoff only resets after a session that
@@ -820,6 +833,9 @@ pub async fn run_ws(
 
                 let session: Result<(), String> = loop {
                     tokio::select! {
+                        // biased: poll the heartbeat first so a flood of
+                        // outgoing or incoming frames cannot starve the
+                        // presence TTL refresh past its 90s window.
                         biased;
                         _ = heartbeat.tick() => {
                             // The periodic tick also bounds how long a
@@ -935,7 +951,7 @@ pub async fn run_ws(
                 // only for one that carried a Ready and stayed up. A
                 // connection that dies within seconds keeps the backoff
                 // growing instead of resetting to 1 s per TCP success.
-                if saw_ready && connected_at.elapsed() >= MIN_SESSION_UPTIME {
+                if earns_backoff_reset(saw_ready, connected_at.elapsed()) {
                     backoff = Duration::from_secs(1);
                 }
                 let _ = session;
@@ -975,5 +991,67 @@ async fn resync(net: &Net, state: &Arc<Mutex<ClientState>>) {
         && let Some(m) = guard(state).main_mut()
     {
         m.resync_guilds(guilds);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ws_url_from_base_scheme_slash_and_token() {
+        // http → ws, https → wss, no scheme → ws prefix, trailing slash
+        // trimmed, token percent-encoded, protocol version appended.
+        let url = ws_url_from_base("http://127.0.0.1:8080", "tok");
+        assert_eq!(url, "ws://127.0.0.1:8080/ws?token=tok&protocol=2");
+        let url = ws_url_from_base("https://example.com/", "tok");
+        assert_eq!(url, "wss://example.com/ws?token=tok&protocol=2");
+        let url = ws_url_from_base("http://localhost:8080/", "a b%+");
+        assert_eq!(url, "ws://localhost:8080/ws?token=a%20b%25%2B&protocol=2");
+        // A bare host (no scheme) is treated as http → ws.
+        let url = ws_url_from_base("127.0.0.1:8080", "tok");
+        assert_eq!(url, "ws://127.0.0.1:8080/ws?token=tok&protocol=2");
+    }
+
+    #[test]
+    fn pct_encode_passes_unreserved_and_escapes_rest() {
+        // Unreserved set (RFC 3986) passes through verbatim.
+        assert_eq!(pct_encode("AZaz09-_.~"), "AZaz09-_.~");
+        // The four characters most likely in an opaque token.
+        assert_eq!(pct_encode("%"), "%25");
+        assert_eq!(pct_encode("+"), "%2B");
+        assert_eq!(pct_encode(" "), "%20");
+        // Multibyte UTF-8 is encoded byte-wise (é = 0xC3 0xA9).
+        assert_eq!(pct_encode("é"), "%C3%A9");
+        // Empty in, empty out.
+        assert!(pct_encode("").is_empty());
+    }
+
+    /// `jittered` must stay within the ±30% band for every draw; a fixed
+    /// input keeps the floor and ceiling derivable from it.
+    #[test]
+    fn jittered_stays_in_band() {
+        let base = Duration::from_millis(1000);
+        let lo = Duration::from_millis(700);
+        let hi = Duration::from_millis(1300);
+        for _ in 0..256 {
+            let j = jittered(base);
+            assert!(j >= lo && j <= hi, "jittered out of band: {j:?}");
+        }
+    }
+
+    /// The backoff reset gate fires only past `MIN_SESSION_UPTIME` AND when a
+    /// Ready was carried; a 401-dance reconnect or a flapping handshake never
+    /// earns a reset.
+    #[test]
+    fn earns_backoff_reset_gate() {
+        // No Ready → never, regardless of uptime.
+        assert!(!earns_backoff_reset(false, Duration::from_secs(60)));
+        // Ready but short → not yet.
+        assert!(!earns_backoff_reset(true, Duration::from_secs(0)));
+        assert!(!earns_backoff_reset(true, Duration::from_millis(9_999)));
+        // Ready AND at the threshold (>=) → reset.
+        assert!(earns_backoff_reset(true, Duration::from_secs(10)));
+        assert!(earns_backoff_reset(true, Duration::from_secs(60)));
     }
 }

@@ -21,3 +21,22 @@ thiserror = "2"
 anyhow = "1"
 base64 = "0.23"
 hex = "0.4"
+
+[dev-dependencies]
+# Integration tests (server/tests/) drive the real axum router + WS gateway
+# against ephemeral Docker backing services. testcontainers spins up
+# postgres/redis/localstack once per test binary; tokio-tungstenite speaks the
+# binary MessagePack gateway; reqwest hits the REST surface. The remaining
+# four are the server's own deps re-listed so the integration-test crate can
+# name them directly (Cargo only allows `use` of direct deps): tokio for
+# `#[tokio::test]` + spawn/net/time, axum to `axum::serve` the router,
+# bysyc-common for the WS MessagePack codec types, sqlx for direct DB access
+# (minting registration invites, seeding the voice-cap fixture).
+testcontainers = "0.23"
+tokio-tungstenite = "0.28"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+tokio = { workspace = true }
+axum = { version = "0.8", features = ["ws"] }
+bysyc-common = { workspace = true }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres"] }
+futures-util = "0.3"

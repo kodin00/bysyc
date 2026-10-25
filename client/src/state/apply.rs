@@ -481,3 +481,464 @@ pub fn apply_server_msg(
     ctx.request_repaint();
     was_ready
 }
+
+/// Unit coverage for [`apply_server_msg`]: feeds each `WsServerBody` variant
+/// into a fresh `ClientState` with the worker gated off (see `NO_WORKER`) and
+/// asserts both the synchronous `MainState` mutations and the exact
+/// `CryptoJob`s staged. Staging is observable because the worker never runs;
+/// real decryption is covered by the e2e + hermetic integration tests with a
+/// live engine.
+#[cfg(test)]
+mod apply_tests {
+    use super::*;
+    use crate::state::EngineBoot;
+    use crate::state::worker::{NO_WORKER, drain_staged};
+    use bysyc_common::protocol::{
+        AccountBrief, AccountInfo, CallSignalKind, ChannelInfo, ChannelKind, DmChannel, GuildInfo,
+        MailboxItem, MessageDto,
+    };
+
+    fn acct(id: i64, name: &str) -> AccountInfo {
+        AccountInfo {
+            id,
+            username: name.into(),
+            identity_key: format!("identity-{id}"),
+            created_at_ms: 0,
+            is_admin: false,
+        }
+    }
+
+    fn brief(id: i64, name: &str, online: bool) -> AccountBrief {
+        AccountBrief {
+            id,
+            username: name.into(),
+            identity_key: format!("identity-{id}"),
+            online,
+        }
+    }
+
+    fn chan(id: i64, guild: Option<i64>, kind: ChannelKind, name: &str) -> ChannelInfo {
+        ChannelInfo {
+            id,
+            guild_id: guild,
+            kind,
+            name: name.into(),
+        }
+    }
+
+    fn dto(id: i64, ch: i64, sender: i64, kind: MessageKind) -> MessageDto {
+        MessageDto {
+            id,
+            channel_id: ch,
+            sender_id: sender,
+            kind,
+            content: format!("ct-{id}"),
+            reply_to: None,
+            attachment: None,
+            created_at_ms: id,
+        }
+    }
+
+    fn guild(id: i64, owner: i64) -> GuildInfo {
+        GuildInfo {
+            id,
+            name: format!("g{id}"),
+            owner_id: owner,
+            channels: vec![chan(id * 10 + 1, Some(id), ChannelKind::Text, "general")],
+        }
+    }
+
+    fn dm(id: i64, peer: AccountBrief) -> DmChannel {
+        DmChannel {
+            channel: chan(id, None, ChannelKind::Dm, "dm"),
+            peer,
+        }
+    }
+
+    /// In-memory `KeyStore` so a real engine can be staged without touching
+    /// disk (the crypto crate's `MemKeyStore` is test-gated to its own module).
+    #[derive(Default)]
+    struct TestKeys(std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>);
+
+    impl crate::crypto::KeyStore for TestKeys {
+        fn get(&self, scope: &str) -> Option<Vec<u8>> {
+            self.0.lock().unwrap().get(scope).cloned()
+        }
+        fn put(&self, scope: &str, blob: &[u8]) {
+            self.0.lock().unwrap().insert(scope.into(), blob.to_vec());
+        }
+        fn delete(&self, scope: &str) {
+            self.0.lock().unwrap().remove(scope);
+        }
+    }
+
+    /// A fresh world + gated worker. `NO_WORKER` is set on construction and
+    /// never cleared (see its doc comment for why that is race-safe).
+    struct Fixture {
+        state: Arc<Mutex<ClientState>>,
+        store: Arc<Mutex<Store>>,
+        ctx: Context,
+    }
+
+    impl Fixture {
+        fn new() -> Fixture {
+            NO_WORKER.store(true, std::sync::atomic::Ordering::Relaxed);
+            Fixture {
+                state: Arc::new(Mutex::new(ClientState::new())),
+                store: Arc::new(Mutex::new(
+                    Store::open(std::path::Path::new(":memory:")).expect("open store"),
+                )),
+                ctx: Context::default(),
+            }
+        }
+
+        fn apply(&self, body: WsServerBody) -> bool {
+            apply_server_msg(&self.state, &self.store, &self.ctx, WsServerMsg { body })
+        }
+
+        /// Inspect the world read-only; `None` while Disconnected.
+        fn with_main<T>(&self, f: impl FnOnce(&MainState) -> T) -> Option<T> {
+            guard(&self.state).main().map(f)
+        }
+    }
+
+    /// Pull every staged job out of the queue (the worker never ran, so these
+    /// are exactly the jobs `apply_server_msg` pushed).
+    fn drain_jobs(state: &Arc<Mutex<ClientState>>) -> Vec<CryptoJob> {
+        let q = Arc::clone(&guard(state).jobs);
+        drain_staged(&q)
+    }
+
+    fn ready_world() -> WsServerBody {
+        WsServerBody::Ready {
+            account: acct(1, "me"),
+            friends: vec![brief(2, "friend", false)],
+            incoming_requests: vec![],
+            outgoing_requests: vec![],
+            guilds: vec![guild(100, 2)],
+            dm_channels: vec![dm(200, brief(2, "friend", false))],
+            mailbox: vec![],
+        }
+    }
+
+    /// Ready with no staged engine stages exactly one `EnsureEngine` job, and
+    /// every synchronous part of the world swap applied: account, friends,
+    /// guilds, DMs, online seeded from the friend's `online` flag, identities
+    /// seeded from every visible brief, and the connection marked Online.
+    #[test]
+    fn ready_with_no_engine_stages_ensure_engine_and_swaps_world() {
+        let f = Fixture::new();
+        assert!(f.apply(ready_world()));
+
+        assert_eq!(f.with_main(|m| m.account.id).unwrap_or(0), 1);
+        assert_eq!(f.with_main(|m| m.friends.len()).unwrap_or(0), 1);
+        assert_eq!(f.with_main(|m| m.friends[0].id).unwrap_or(0), 2);
+        assert_eq!(f.with_main(|m| m.guilds.len()).unwrap_or(0), 1);
+        assert_eq!(f.with_main(|m| m.guilds[0].id).unwrap_or(0), 100);
+        assert_eq!(f.with_main(|m| m.dms.len()).unwrap_or(0), 1);
+        assert_eq!(f.with_main(|m| m.dms[0].channel.id).unwrap_or(0), 200);
+        // The friend's `online: false` seeds an empty online set.
+        assert!(f.with_main(|m| m.online.is_empty()).unwrap_or(false));
+        assert!(
+            f.with_main(|m| matches!(m.connection, ConnStatus::Online))
+                .unwrap_or(false)
+        );
+        // seed_world ran: self + friend + DM peer identities are known.
+        assert_eq!(f.with_main(|m| m.identities.len()).unwrap_or(0), 2);
+        assert!(
+            f.with_main(|m| m.identities.contains_key(&1) && m.identities.contains_key(&2))
+                .unwrap_or(false)
+        );
+        // Guild roster seeded with owner + self.
+        assert!(
+            f.with_main(|m| m
+                .guild_members
+                .get(&100)
+                .is_some_and(|r| r.contains(&1) && r.contains(&2)))
+                .unwrap_or(false)
+        );
+
+        // Exactly EnsureEngine; nothing to backfill (no loaded channels yet).
+        let jobs = drain_jobs(&f.state);
+        assert_eq!(
+            jobs.len(),
+            1,
+            "Ready without an engine stages EnsureEngine only"
+        );
+        assert!(
+            matches!(jobs[0], CryptoJob::EnsureEngine { generation: 0, ref username } if username == "me")
+        );
+    }
+
+    /// Ready with a staged engine attaches it and stages NO EnsureEngine job.
+    /// Proves the login→Ready hand-off: `pending_engine` is consumed.
+    #[test]
+    fn ready_with_staged_engine_skips_ensure_engine() {
+        let f = Fixture::new();
+        let engine = Engine::new(Arc::new(TestKeys::default()), "pass".into()).unwrap();
+        {
+            let mut st = guard(&f.state);
+            st.pending_engine = Some(EngineBoot {
+                engine: Arc::new(engine),
+                outbound: HashSet::new(),
+            });
+        }
+        f.apply(ready_world());
+        assert!(
+            f.with_main(|m| m.engine.is_some()).unwrap_or(false),
+            "the staged engine must attach on Ready"
+        );
+        let jobs = drain_jobs(&f.state);
+        assert!(
+            jobs.iter()
+                .all(|j| !matches!(j, CryptoJob::EnsureEngine { .. })),
+            "no EnsureEngine when an engine was staged: {jobs:?}"
+        );
+    }
+
+    /// Presence toggles both the online set and the friend's `online` flag;
+    /// no crypto job is staged (the path is purely synchronous).
+    #[test]
+    fn presence_updates_online_set_and_friend_flag() {
+        let f = Fixture::new();
+        f.apply(ready_world());
+        drain_jobs(&f.state);
+
+        f.apply(WsServerBody::Presence {
+            account_id: 2,
+            online: true,
+        });
+        assert!(f.with_main(|m| m.online.contains(&2)).unwrap_or(false));
+        assert!(
+            f.with_main(|m| m.friends.iter().find(|x| x.id == 2).map(|x| x.online))
+                .flatten()
+                == Some(true)
+        );
+
+        f.apply(WsServerBody::Presence {
+            account_id: 2,
+            online: false,
+        });
+        assert!(!f.with_main(|m| m.online.contains(&2)).unwrap_or(true));
+        assert!(
+            f.with_main(|m| m.friends.iter().find(|x| x.id == 2).map(|x| x.online))
+                .flatten()
+                == Some(false)
+        );
+        assert!(
+            drain_jobs(&f.state).is_empty(),
+            "presence stages no crypto job"
+        );
+    }
+
+    /// Typing records a per-channel entry; no job.
+    #[test]
+    fn typing_records_channel_entry() {
+        let f = Fixture::new();
+        f.apply(ready_world());
+        drain_jobs(&f.state);
+
+        f.apply(WsServerBody::Typing {
+            channel_id: 200,
+            account_id: 2,
+        });
+        assert_eq!(
+            f.with_main(|m| m.typing.get(&200).map(|(who, _)| *who))
+                .flatten(),
+            Some(2)
+        );
+        assert!(drain_jobs(&f.state).is_empty());
+    }
+
+    /// A non-empty VoiceState snapshot replaces the channel's roster and
+    /// learns every participant's identity; an empty snapshot clears it
+    /// (call ended).
+    #[test]
+    fn voice_state_replaces_and_clears() {
+        let f = Fixture::new();
+        f.apply(ready_world());
+        drain_jobs(&f.state);
+
+        let p = vec![brief(3, "caller", true), brief(4, "other", true)];
+        f.apply(WsServerBody::VoiceState {
+            channel_id: 101,
+            participants: p.clone(),
+        });
+        assert_eq!(
+            f.with_main(|m| m.voice.get(&101).map(|v| v.len()))
+                .flatten(),
+            Some(2)
+        );
+        assert!(
+            f.with_main(|m| m.identities.contains_key(&3) && m.identities.contains_key(&4))
+                .unwrap_or(false)
+        );
+
+        f.apply(WsServerBody::VoiceState {
+            channel_id: 101,
+            participants: vec![],
+        });
+        assert!(
+            f.with_main(|m| !m.voice.contains_key(&101))
+                .unwrap_or(false),
+            "empty snapshot clears the channel"
+        );
+    }
+
+    /// CallSignal entries are capped at `MAX_PENDING_SIGNALS` (128); the
+    /// oldest is dropped first once the cap is reached.
+    #[test]
+    fn call_signal_queue_is_capped_oldest_first() {
+        let f = Fixture::new();
+        f.apply(ready_world());
+        drain_jobs(&f.state);
+
+        for i in 0..MAX_PENDING_SIGNALS {
+            f.apply(WsServerBody::CallSignal {
+                call_id: 101,
+                from: 2,
+                kind: CallSignalKind::Hangup,
+            });
+            let _ = i;
+        }
+        assert_eq!(
+            f.with_main(|m| m.pending_signals.len()).unwrap_or(0),
+            MAX_PENDING_SIGNALS
+        );
+        let first_from = f
+            .with_main(|m| m.pending_signals.first().map(|(from, _, _)| *from))
+            .flatten();
+        // One more push evicts the head (from == 2 in all of them, so check
+        // the length stays capped instead).
+        f.apply(WsServerBody::CallSignal {
+            call_id: 101,
+            from: 9,
+            kind: CallSignalKind::Hangup,
+        });
+        assert_eq!(
+            f.with_main(|m| m.pending_signals.len()).unwrap_or(0),
+            MAX_PENDING_SIGNALS,
+            "the cap holds"
+        );
+        assert!(
+            f.with_main(|m| m.pending_signals.last().map(|(from, _, _)| *from))
+                .flatten()
+                == Some(9),
+            "the newest push is at the tail"
+        );
+        // Pin `first_from` so it is read even when the cap push above made it
+        // uninteresting — keeps the intent legible if MAX_PENDING_SIGNALS grows.
+        let _ = first_from;
+    }
+
+    /// MemberJoined widens the guild roster, learns the identity, and queues
+    /// a newcomer share (the joiner is not us). With an empty mailbox no
+    /// Mailbox job is staged.
+    #[test]
+    fn member_join_widens_roster_and_queues_share() {
+        let f = Fixture::new();
+        f.apply(ready_world());
+        drain_jobs(&f.state);
+
+        f.apply(WsServerBody::MemberJoined {
+            guild_id: 100,
+            account: brief(7, "newcomer", false),
+        });
+        assert!(
+            f.with_main(|m| m.guild_members.get(&100).is_some_and(|r| r.contains(&7)))
+                .unwrap_or(false)
+        );
+        assert!(
+            f.with_main(|m| m.identities.contains_key(&7))
+                .unwrap_or(false)
+        );
+        assert_eq!(
+            f.with_main(|m| m.pending_newcomers.clone())
+                .unwrap_or_default(),
+            vec![(100, 7)]
+        );
+        assert!(
+            drain_jobs(&f.state).is_empty(),
+            "empty mailbox → no Mailbox job from MemberJoined"
+        );
+    }
+
+    /// A Chat message stages exactly one Chat job; a Control message is
+    /// dropped (v1 has no chat-routed control payloads).
+    #[test]
+    fn message_stages_chat_job_and_drops_control() {
+        let f = Fixture::new();
+        f.apply(ready_world());
+        drain_jobs(&f.state);
+
+        f.apply(WsServerBody::Message(dto(10, 200, 2, MessageKind::Chat)));
+        let jobs = drain_jobs(&f.state);
+        assert_eq!(jobs.len(), 1);
+        assert!(matches!(jobs[0], CryptoJob::Chat { generation: 0, ref dto } if dto.id == 10));
+
+        f.apply(WsServerBody::Message(dto(11, 200, 2, MessageKind::Control)));
+        assert!(
+            drain_jobs(&f.state).is_empty(),
+            "Control messages are dropped, never staged"
+        );
+    }
+
+    /// MessageDeleted stages exactly one Deleted job (queued, not applied
+    /// inline, so it lands after any in-flight decrypt of the same row).
+    #[test]
+    fn message_deleted_stages_deleted_job() {
+        let f = Fixture::new();
+        f.apply(ready_world());
+        drain_jobs(&f.state);
+
+        f.apply(WsServerBody::MessageDeleted {
+            channel_id: 200,
+            message_id: 42,
+        });
+        let jobs = drain_jobs(&f.state);
+        assert_eq!(jobs.len(), 1);
+        assert!(matches!(
+            jobs[0],
+            CryptoJob::Deleted {
+                generation: 0,
+                channel_id: 200,
+                message_id: 42
+            }
+        ));
+    }
+
+    /// MailboxAppend takes the mailbox (drains it locally) and stages exactly
+    /// one Mailbox job carrying the full item batch.
+    #[test]
+    fn mailbox_append_drains_and_stages_mailbox_job() {
+        let f = Fixture::new();
+        f.apply(ready_world());
+        drain_jobs(&f.state);
+
+        let item = MailboxItem {
+            id: 900,
+            sender_id: 2,
+            content: "bWFpbA==".into(),
+            created_at_ms: 1,
+        };
+        f.apply(WsServerBody::MailboxAppend(item.clone()));
+        // The synchronous path takes the mailbox before staging, so the live
+        // world holds nothing pending for the worker to drain.
+        assert!(
+            f.with_main(|m| m.mailbox.is_empty()).unwrap_or(false),
+            "MailboxAppend takes the mailbox before staging the job"
+        );
+        let jobs = drain_jobs(&f.state);
+        assert_eq!(jobs.len(), 1);
+        match &jobs[0] {
+            CryptoJob::Mailbox {
+                generation: 0,
+                items,
+            } => {
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].id, 900);
+            }
+            other => panic!("expected Mailbox job, got {other:?}"),
+        }
+    }
+}

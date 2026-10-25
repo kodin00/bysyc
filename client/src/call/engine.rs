@@ -1090,7 +1090,10 @@ fn send_datagram(
 
 fn run(cfg: SessionConfig, rx: std::sync::mpsc::Receiver<SessionCmd>, ui: Arc<UiState>) {
     // Publishes `finished` on every exit path below (including this
-    // function's early returns and any panic unwind).
+    // function's early returns and any panic unwind). Declared first so it
+    // is dropped LAST: the socket, audio streams, and core release before
+    // `finished` flips true, so the overlay's teardown (which polls
+    // `finished`) never races a still-live engine.
     let _finished = FinishOnDrop(ui.clone());
 
     // Socket every peer and the TURN client share.

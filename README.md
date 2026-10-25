@@ -15,11 +15,33 @@ Everything in Docker:
 mise install
 cp .env.example .env      # set POSTGRES_PASSWORD, TURN_PASSWORD, S3 keys,
                           # TURN_ADDR (and COTURN_EXTERNAL_IP on a VPS)
-# put the same S3 keys into deploy/seaweedfs/s3.json (accessKey/secretKey)
+# put the same S3 keys into deploy/seaweedfs/s3.json (schema below)
 docker compose up -d --build
 curl localhost:8080/healthz   # → ok
 mise run dev-client
 ```
+
+`deploy/seaweedfs/s3.json` enforces SigV4 auth on the SeaweedFS S3
+gateway (compose mounts it read-only at
+`-s3.config=/etc/seaweedfs/s3.json`). Put the same `S3_ACCESS_KEY` /
+`S3_SECRET_KEY` from `.env` into a `bysyc` identity; the bysyc server
+is the only S3 client. Minimal shape:
+
+```json
+{
+  "identities": [
+    {
+      "name": "bysyc",
+      "credentials": [
+        { "accessKey": "<S3_ACCESS_KEY>", "secretKey": "<S3_SECRET_KEY>" }
+      ],
+      "actions": ["Admin", "Read", "Write", "List", "Tagging"]
+    }
+  ]
+}
+```
+
+`deploy/seaweedfs/s3.json.example` will hold the canonical template.
 
 Or dev on the host — backing services in Docker only (don't also
 `docker compose up`: both claim port 8080):
