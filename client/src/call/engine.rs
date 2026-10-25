@@ -339,10 +339,10 @@ impl SessionCore {
         self.turn_relay = Some(relay);
         self.turn_mapped = mapped;
         let base = self.local_addr.unwrap_or(relay);
-        if let Some(m) = mapped {
-            if let Ok(c) = Candidate::server_reflexive(m, base, "udp") {
-                self.add_local_candidate_all(&c, out);
-            }
+        if let Some(m) = mapped
+            && let Ok(c) = Candidate::server_reflexive(m, base, "udp")
+        {
+            self.add_local_candidate_all(&c, out);
         }
         if let Ok(c) = Candidate::relayed(relay, base, "udp") {
             self.add_local_candidate_all(&c, out);
@@ -430,10 +430,10 @@ impl SessionCore {
             if let Ok(c) = Candidate::relayed(relay, base, "udp") {
                 lines.push(c.to_sdp_string());
             }
-            if let Some(m) = self.turn_mapped {
-                if let Ok(c) = Candidate::server_reflexive(m, base, "udp") {
-                    lines.push(c.to_sdp_string());
-                }
+            if let Some(m) = self.turn_mapped
+                && let Ok(c) = Candidate::server_reflexive(m, base, "udp")
+            {
+                lines.push(c.to_sdp_string());
             }
         }
         for line in lines {
@@ -629,17 +629,16 @@ impl SessionCore {
         let Some(pending) = self.peers[idx].pending.take() else {
             return;
         };
-        if let Ok(answer) = SdpAnswer::from_sdp_string(sdp) {
-            if self.peers[idx]
+        if let Ok(answer) = SdpAnswer::from_sdp_string(sdp)
+            && self.peers[idx]
                 .rtc
                 .sdp_api()
                 .accept_answer(pending, answer)
                 .is_ok()
-            {
-                // The m-line now exists in the Rtc (apply_answer ran before
-                // returning); safe to declare our outgoing stream.
-                SessionCore::open_send_stream(&mut self.peers[idx]);
-            }
+        {
+            // The m-line now exists in the Rtc (apply_answer ran before
+            // returning); safe to declare our outgoing stream.
+            SessionCore::open_send_stream(&mut self.peers[idx]);
         }
     }
 
@@ -889,8 +888,10 @@ impl SessionCore {
                     continue;
                 };
                 let (ssrc, pt, seq, time, mid) = (ss.ssrc, ss.pt, ss.seq, ss.time, peer.mid);
-                let mut ext = ExtensionValues::default();
-                ext.mid = mid;
+                let ext = ExtensionValues {
+                    mid,
+                    ..Default::default()
+                };
                 let write = RtpWrite::new(pt, SeqNo::from(seq as u64), time, now, packet.clone())
                     .ext_vals(ext);
                 if let Some(stream) = peer.rtc.direct_api().stream_tx(&ssrc) {
@@ -968,16 +969,17 @@ fn seed_candidates(
         if let Ok(c) = Candidate::relayed(relay, base, "udp") {
             peer.rtc.add_local_candidate(c);
         }
-        if let Some(m) = mapped {
-            if let Ok(c) = Candidate::server_reflexive(m, base, "udp") {
-                peer.rtc.add_local_candidate(c);
-            }
+        if let Some(m) = mapped
+            && let Ok(c) = Candidate::server_reflexive(m, base, "udp")
+        {
+            peer.rtc.add_local_candidate(c);
         }
     }
 }
 
 #[cfg(test)]
 thread_local! {
+    #[allow(clippy::type_complexity)]
     static RX_LOG: std::cell::RefCell<Option<Arc<Mutex<Vec<(u16, u32)>>>>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -1077,7 +1079,10 @@ fn send_datagram(
 
 fn run(cfg: SessionConfig, rx: std::sync::mpsc::Receiver<SessionCmd>, ui: Arc<UiState>) {
     // Publishes `finished` on every exit path below (including this
-    // function's early returns and any panic unwind).
+    // function's early returns and any panic unwind). Declared first so it
+    // is dropped LAST: the socket, audio streams, and core release before
+    // `finished` flips true, so the overlay's teardown (which polls
+    // `finished`) never races a still-live engine.
     let _finished = FinishOnDrop(ui.clone());
 
     // Socket every peer and the TURN client share.
@@ -1206,32 +1211,32 @@ fn run(cfg: SessionConfig, rx: std::sync::mpsc::Receiver<SessionCmd>, ui: Arc<Ui
         // onto the socket.
         let mut receive = |from: SocketAddr, data: &[u8]| {
             let mut from_turn = false;
-            if let Some(t) = turn.as_mut() {
-                if from == t.server() {
-                    from_turn = true;
-                    // Gather everything from `t` first so its borrow of
-                    // `turn` ends: the send sink below re-borrows `turn`
-                    // per datagram.
-                    let unwrapped = t.handle_input(data).map(|p| (p.from, p.payload));
-                    let allocated = t.ready() && core.relay_addr().is_none();
-                    let (relay, mapped) = if allocated {
-                        (t.relay_addr(), t.mapped_addr())
-                    } else {
-                        (None, None)
-                    };
-                    if let Some((peer_from, payload)) = unwrapped {
-                        core.deliver_packet(now, peer_from, &payload, &mut |s, d, c| {
-                            send_datagram(&socket, turn.as_mut(), relay_addr.get(), s, d, c);
-                        });
-                    }
-                    if allocated {
-                        // The allocation may have just completed.
-                        let mut out = Vec::new();
-                        core.turn_ready(relay.unwrap(), mapped, &mut out);
-                        relay_addr.set(relay);
-                        ui.relayed.store(true, Ordering::Relaxed);
-                        signals.extend(out);
-                    }
+            if let Some(t) = turn.as_mut()
+                && from == t.server()
+            {
+                from_turn = true;
+                // Gather everything from `t` first so its borrow of
+                // `turn` ends: the send sink below re-borrows `turn`
+                // per datagram.
+                let unwrapped = t.handle_input(data).map(|p| (p.from, p.payload));
+                let allocated = t.ready() && core.relay_addr().is_none();
+                let (relay, mapped) = if allocated {
+                    (t.relay_addr(), t.mapped_addr())
+                } else {
+                    (None, None)
+                };
+                if let Some((peer_from, payload)) = unwrapped {
+                    core.deliver_packet(now, peer_from, &payload, &mut |s, d, c| {
+                        send_datagram(&socket, turn.as_mut(), relay_addr.get(), s, d, c);
+                    });
+                }
+                if allocated {
+                    // The allocation may have just completed.
+                    let mut out = Vec::new();
+                    core.turn_ready(relay.unwrap(), mapped, &mut out);
+                    relay_addr.set(relay);
+                    ui.relayed.store(true, Ordering::Relaxed);
+                    signals.extend(out);
                 }
             }
             if !from_turn {
@@ -1269,11 +1274,11 @@ fn run(cfg: SessionConfig, rx: std::sync::mpsc::Receiver<SessionCmd>, ui: Arc<Ui
         // Audio pump, then drive: pump writes RTP into the peers' streams
         // and drive turns it (and any due timers) into transmits, sent
         // inline. `deadline` sizes the next socket wait.
-        if let Some(a) = audio.as_ref() {
-            if now >= next_pump {
-                core.pump_audio(now, &a.mic);
-                next_pump = now + TICK;
-            }
+        if let Some(a) = audio.as_ref()
+            && now >= next_pump
+        {
+            core.pump_audio(now, &a.mic);
+            next_pump = now + TICK;
         }
         deadline = core.drive(now, &mut |s, d, c| {
             send_datagram(&socket, turn.as_mut(), relay_addr.get(), s, d, c);
@@ -1707,7 +1712,7 @@ mod tests {
 
         // We ourselves vanishing from the snapshot ends the call.
         let mut out = Vec::new();
-        core.apply_roster(&[c.clone()], &mut out);
+        core.apply_roster(std::slice::from_ref(&c), &mut out);
         assert!(core.ended());
     }
 

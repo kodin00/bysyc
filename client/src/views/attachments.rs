@@ -522,6 +522,7 @@ async fn upload_and_send(
 ///
 /// On `Err` nothing is cleaned up — the caller owns the temp row and
 /// decides what the user sees.
+#[allow(clippy::too_many_arguments)]
 pub async fn encrypt_share_and_send(
     state: &Arc<Mutex<ClientState>>,
     store: &Arc<Mutex<Store>>,
@@ -1759,6 +1760,7 @@ fn save_attachment(
 /// Download + (E2EE only) decrypt to a temp path and hand it to the OS
 /// opener — every phase, including the opener's own verdict, is a strip
 /// row.
+#[allow(clippy::too_many_arguments)]
 fn open_attachment(
     state: &Arc<Mutex<ClientState>>,
     rt: &tokio::runtime::Handle,
@@ -1900,10 +1902,10 @@ fn drop_upload(state: &Arc<Mutex<ClientState>>, id: u64) {
 
 fn remove_temp(state: &Arc<Mutex<ClientState>>, ch: i64, temp: i64) {
     let mut st = guard(state);
-    if let Some(m) = st.main_mut() {
-        if let Some(v) = m.messages.get_mut(&ch) {
-            v.retain(|x| x.id != temp);
-        }
+    if let Some(m) = st.main_mut()
+        && let Some(v) = m.messages.get_mut(&ch)
+    {
+        v.retain(|x| x.id != temp);
     }
 }
 

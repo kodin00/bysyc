@@ -514,6 +514,7 @@ impl Engine {
     /// *omitted* (rather than erroring the whole batch) when no session
     /// exists with it and its OTK could not be used — the caller retries
     /// those peers after claiming fresh keys. Do not include ourselves.
+    #[allow(clippy::type_complexity)]
     pub fn share_envelopes(
         &self,
         channel_id: i64,
@@ -537,6 +538,11 @@ impl Engine {
         let share = queued
             .clone()
             .unwrap_or_else(|| out.pending_share(channel_id));
+        // The caller mails these Olm-wrapped envelopes BEFORE POSTing the
+        // chat MessageDto that triggered the share, so peers import the key
+        // before the ciphertext arrives (the sender-key ordering guarantee).
+        // The POST order is the caller's; this function only builds the
+        // envelopes.
         let json = match (Envelope::SessionShare {
             channel_id: share.channel_id,
             session_id: share.session_id.clone(),
@@ -698,7 +704,7 @@ impl Engine {
     fn persist(&self, inner: &mut EngineInner) -> anyhow::Result<()> {
         let dirty = inner.dirty;
         if dirty == 0 {
-            return Ok(());
+            return Ok(()); // no tables touched (e.g. a megolm decrypt): no write at all
         }
 
         let mut writes: Vec<(&'static str, Vec<u8>)> = Vec::new();
@@ -1217,11 +1223,10 @@ mod tests {
 
         // Megolm outbound survived: same session id continues, bob still
         // decrypts — including the pre-restart message.
-        assert_eq!(
+        assert!(
             bob.megolm_decrypt(7, ALICE, &sid, &first_ct)
                 .unwrap()
-                .contains("pre"),
-            true
+                .contains("pre")
         );
         let chat = Envelope::Chat {
             text: "post".into(),

@@ -94,7 +94,7 @@ pub fn settings_window(
             ui.weak("Changes apply to the next call.");
 
             // ---- Invites (admin only) ----
-            let is_admin = guard(state).main().map_or(false, |m| m.account.is_admin);
+            let is_admin = guard(state).main().is_some_and(|m| m.account.is_admin);
             if is_admin {
                 ui.add_space(10.0);
                 ui.heading("Invites");
@@ -111,26 +111,26 @@ pub fn settings_window(
                         }
                     });
                 }
-                if ui.button("Create invite").clicked() {
-                    if let Some(h) = crate::views::main_view::net_handle(state) {
-                        let s = Arc::clone(state);
-                        let c = ctx.clone();
-                        rt.spawn(async move {
-                            match h.net.create_invite().await {
-                                Ok(code) => {
-                                    if let Some(m) = guard(&s).main_mut() {
-                                        m.reg_invite = Some(code);
-                                    }
-                                }
-                                Err(e) => {
-                                    if let Some(m) = guard(&s).main_mut() {
-                                        m.notice = Some(e);
-                                    }
+                if ui.button("Create invite").clicked()
+                    && let Some(h) = crate::views::main_view::net_handle(state)
+                {
+                    let s = Arc::clone(state);
+                    let c = ctx.clone();
+                    rt.spawn(async move {
+                        match h.net.create_invite().await {
+                            Ok(code) => {
+                                if let Some(m) = guard(&s).main_mut() {
+                                    m.reg_invite = Some(code);
                                 }
                             }
-                            c.request_repaint();
-                        });
-                    }
+                            Err(e) => {
+                                if let Some(m) = guard(&s).main_mut() {
+                                    m.notice = Some(e);
+                                }
+                            }
+                        }
+                        c.request_repaint();
+                    });
                 }
             }
         });
