@@ -239,7 +239,7 @@ static EVENT_BUS: OnceLock<EventBus> = OnceLock::new();
 
 /// Start `workers` shared subscriber workers and install the process-wide
 /// bus. No-op if called twice.
-pub(crate) fn start_event_bus(redis_url: &str, workers: usize) {
+pub fn start_event_bus(redis_url: &str, workers: usize) {
     if EVENT_BUS.get().is_some() {
         return;
     }
@@ -412,12 +412,12 @@ async fn run_event_worker(
                 Step::Cmd(None) => return, // bus is gone: process shutdown
                 Step::Msg(Some(m)) => {
                     let topic = Arc::from(m.get_channel_name());
-                    if let Ok(payload) = m.get_payload::<String>() {
-                        if let Some(frame) = event_frame(&payload) {
-                            // A send error just means no live receivers right
-                            // now — the publish already happened, move on.
-                            let _ = bus_tx.send(Arc::new(BusEvent { topic, frame }));
-                        }
+                    if let Ok(payload) = m.get_payload::<String>()
+                        && let Some(frame) = event_frame(&payload)
+                    {
+                        // A send error just means no live receivers right
+                        // now — the publish already happened, move on.
+                        let _ = bus_tx.send(Arc::new(BusEvent { topic, frame }));
                     }
                 }
                 Step::Msg(None) => {
@@ -622,8 +622,9 @@ async fn disconnect_cleanup(state: &AppState, me: i64) {
         tracing::warn!(me, "presence delete failed: {e}");
     }
 
-    // Leave any Call. voice::leave publishes the fresh VoiceState to the
-    // channel (and clears the participant row).
+    // Leave every Call we were in. A socket dying mid-call has no VoiceLeave
+    // wire message to ride, so this loop is the cleanup path; voice::leave
+    // publishes the fresh VoiceState and clears the participant row.
     match sqlx::query_scalar::<_, i64>(
         "SELECT channel_id FROM voice_participants WHERE account_id = $1",
     )
@@ -774,16 +775,14 @@ async fn handle_client_msg(
             .await
             .ok()
             .flatten();
-            match current {
-                Some(channel_id) => {
-                    if let Err(e) = crate::voice::leave(state, channel_id, me).await {
-                        send_error(out, Some(msg.id), e.code, e.message);
-                    }
-                    // The updated VoiceState reaches the leaver through
-                    // their still-active chan:{id} subscription.
-                }
-                None => {} // not in a Call: nothing to do, no error
+            if let Some(channel_id) = current
+                && let Err(e) = crate::voice::leave(state, channel_id, me).await
+            {
+                send_error(out, Some(msg.id), e.code, e.message);
+                // The updated VoiceState reaches the leaver through
+                // their still-active chan:{id} subscription.
             }
+            // not in a Call: nothing to do, no error
         }
         WsClientBody::CallSignal { call_id, to, kind } => {
             if let Err(e) = crate::voice::relay_signal(state, call_id, me, to, kind).await {
@@ -832,7 +831,7 @@ fn send_error(
 /// (text AND voice — VoiceState/Typing ride the same `chan:{id}` topics)
 /// plus their DM channels.
 async fn my_channels(pg: &PgPool, me: i64) -> sqlx::Result<Vec<i64>> {
-    Ok(sqlx::query_scalar(
+    sqlx::query_scalar(
         "SELECT c.id FROM channels c \
          JOIN guild_members gm ON gm.guild_id = c.guild_id \
          WHERE gm.account_id = $1 \
@@ -841,7 +840,7 @@ async fn my_channels(pg: &PgPool, me: i64) -> sqlx::Result<Vec<i64>> {
     )
     .bind(me)
     .fetch_all(pg)
-    .await?)
+    .await
 }
 
 /// The full pub/sub topic set for an account: the directed topic plus one
@@ -892,7 +891,7 @@ async fn set_presence(redis: &ConnectionManager, me: i64) -> Result<(), redis::R
 /// Accounts that should hear about `me`'s connectivity: friends plus every
 /// co-member of `me`'s guilds.
 async fn presence_audience(pg: &PgPool, me: i64) -> sqlx::Result<Vec<i64>> {
-    Ok(sqlx::query_scalar(
+    sqlx::query_scalar(
         "SELECT CASE WHEN f.a = $1 THEN f.b ELSE f.a END AS other \
          FROM friends f WHERE f.a = $1 OR f.b = $1 \
          UNION \
@@ -903,7 +902,7 @@ async fn presence_audience(pg: &PgPool, me: i64) -> sqlx::Result<Vec<i64>> {
     )
     .bind(me)
     .fetch_all(pg)
-    .await?)
+    .await
 }
 
 async fn fan_out_presence(state: &AppState, me: i64, online: bool) -> Result<(), ApiError> {

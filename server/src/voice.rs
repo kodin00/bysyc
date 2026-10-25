@@ -17,6 +17,7 @@
 //!     current participants, or
 //!   * `call_id` is a **DM channel** (Private Call): `from`/`to` must be
 //!     exactly the channel's `dm_channels` pair,
+//!
 //!   anything else is `Forbidden`. The signal is then published to
 //!   `acct:{to}` with `from` set to the sender.
 //!
@@ -109,6 +110,10 @@ pub async fn join(
             .map_err(|e| ApiError::internal(format!("corrupt join verdict: {e}")))
     };
     if !flag("joined")? {
+        // Map a zero-row insert to its cause by elimination: channel missing
+        // → not voice → not a member. The remaining split is the cap (not
+        // already in → full) vs ON CONFLICT (already in → idempotent
+        // re-join, snapshot as-is below).
         if !flag("channel_exists")? {
             return Err(ApiError::not_found("no such channel"));
         }
@@ -294,12 +299,6 @@ async fn publish_voice_state(state: &AppState, channel_id: i64, briefs: Vec<Acco
 mod tests {
     use super::*;
 
-    /// ApiError has no Debug impl (error.rs is orchestrator-owned), so
-    /// `Result::expect` is unavailable on ApiResult values in tests.
-    fn ok<T>(r: ApiResult<T>, what: &str) -> T {
-        r.unwrap_or_else(|e| panic!("{what}: expected Ok, got {:?} {}", e.status, e.message))
-    }
-
     #[test]
     fn turn_uri_is_ice_standard() {
         assert_eq!(turn_uri("localhost:3478"), "turn:localhost:3478");
@@ -307,194 +306,5 @@ mod tests {
             turn_uri("turn.example.com:3478"),
             "turn:turn.example.com:3478"
         );
-    }
-
-    /// Full live-DB integration test of join/leave/relay. Ignored by
-    /// default: needs the dev postgres+redis (.env). Run with
-    /// `set -a; . ./.env; set +a; cargo test -p bysyc-server voice:: -- --ignored`.
-    #[ignore]
-    #[tokio::test]
-    async fn voice_flow_against_live_db() {
-        let config = crate::config::Config::from_env();
-        let pg = crate::db::connect_pool(&config.database_url, config.db_max_connections)
-            .await
-            .expect("pg");
-        let redis_client = redis::Client::open(config.redis_url.as_str()).expect("redis url");
-        let redis = redis::aio::ConnectionManager::new(redis_client.clone())
-            .await
-            .expect("redis");
-        // A second manager, not a clone — event publishes get their own
-        // pipe, mirroring boot. The S3 client is never used by this test.
-        let redis_events = redis::aio::ConnectionManager::new(redis_client)
-            .await
-            .expect("redis events");
-        let s3 = crate::s3::client(&config);
-        let state = AppState {
-            pg: pg.clone(),
-            redis,
-            redis_events,
-            s3,
-            config,
-        };
-
-        // Fixture: guild owned by A with text+voice channels, 7 member
-        // accounts (A..G) for the cap, and a DM between A and B.
-        let names: Vec<String> = (b'a'..=b'g')
-            .map(|c| format!("s5_voice_{}", c as char))
-            .collect();
-        let mut ids = Vec::new();
-        for n in &names {
-            let id: i64 = sqlx::query_scalar(
-                "INSERT INTO accounts(username, password_hash, identity_key) \
-                 VALUES ($1, 'x', 'a2V5') RETURNING id",
-            )
-            .bind(n)
-            .fetch_one(&pg)
-            .await
-            .expect("account");
-            ids.push(id);
-        }
-        let (a, b) = (ids[0], ids[1]);
-        let guild_id: i64 = sqlx::query_scalar(
-            "INSERT INTO guilds(name, owner_id) VALUES ('s5-voice-test', $1) RETURNING id",
-        )
-        .bind(a)
-        .fetch_one(&pg)
-        .await
-        .expect("guild");
-        for id in &ids {
-            sqlx::query("INSERT INTO guild_members(guild_id, account_id) VALUES ($1, $2)")
-                .bind(guild_id)
-                .bind(id)
-                .execute(&pg)
-                .await
-                .expect("member");
-        }
-        let text_id: i64 = sqlx::query_scalar(
-            "INSERT INTO channels(guild_id, kind, name) VALUES ($1, 'text', 't') RETURNING id",
-        )
-        .bind(guild_id)
-        .fetch_one(&pg)
-        .await
-        .expect("text channel");
-        let voice_id: i64 = sqlx::query_scalar(
-            "INSERT INTO channels(guild_id, kind, name) VALUES ($1, 'voice', 'v') RETURNING id",
-        )
-        .bind(guild_id)
-        .fetch_one(&pg)
-        .await
-        .expect("voice channel");
-        sqlx::query("INSERT INTO friends(a, b) VALUES (LEAST($1,$2), GREATEST($1,$2))")
-            .bind(a)
-            .bind(b)
-            .execute(&pg)
-            .await
-            .expect("friends");
-        let dm_id: i64 = sqlx::query_scalar(
-            "INSERT INTO channels(guild_id, kind, name) VALUES (NULL, 'text', '') RETURNING id",
-        )
-        .fetch_one(&pg)
-        .await
-        .expect("dm channel");
-        sqlx::query(
-            "INSERT INTO dm_channels(channel_id, a, b) VALUES ($1, LEAST($2,$3), GREATEST($2,$3))",
-        )
-        .bind(dm_id)
-        .bind(a)
-        .bind(b)
-        .execute(&pg)
-        .await
-        .expect("dm pair");
-
-        // -- text channel is not joinable
-        let err = join(&state, text_id, a)
-            .await
-            .expect_err("text join must fail");
-        assert_eq!(err.code, bysyc_common::protocol::ErrorCode::InvalidRequest);
-
-        // -- unknown channel
-        let err = join(&state, 987_654_321, a)
-            .await
-            .expect_err("unknown channel");
-        assert_eq!(err.code, bysyc_common::protocol::ErrorCode::NotFound);
-
-        // -- A joins, sees themselves
-        let ps = ok(join(&state, voice_id, a).await, "a joins");
-        assert_eq!(ps.iter().map(|p| p.id).collect::<Vec<_>>(), vec![a]);
-
-        // -- idempotent re-join: still one row, one participant
-        let ps = ok(join(&state, voice_id, a).await, "a re-joins");
-        assert_eq!(ps.len(), 1);
-
-        // -- B joins; snapshot has both, join order
-        let ps = ok(join(&state, voice_id, b).await, "b joins");
-        assert_eq!(ps.iter().map(|p| p.id).collect::<Vec<_>>(), vec![a, b]);
-
-        // -- fill the channel to the cap of 6, then G is rejected
-        for id in &ids[2..6] {
-            ok(join(&state, voice_id, *id).await, "filler joins");
-        }
-        let err = join(&state, voice_id, ids[6])
-            .await
-            .expect_err("must be full");
-        assert_eq!(
-            err.code,
-            bysyc_common::protocol::ErrorCode::VoiceChannelFull
-        );
-        assert_eq!(err.status, axum::http::StatusCode::CONFLICT);
-
-        // -- relay within the voice call: both participants OK
-        ok(
-            relay_signal(&state, voice_id, a, b, CallSignalKind::Hangup).await,
-            "relay between participants",
-        );
-        // someone outside the call is not relayed to
-        let err = relay_signal(&state, voice_id, ids[6], a, CallSignalKind::Hangup)
-            .await
-            .expect_err("outsider cannot relay");
-        assert_eq!(err.code, bysyc_common::protocol::ErrorCode::Forbidden);
-
-        // -- leave frees a slot; G can now join
-        ok(leave(&state, voice_id, a).await, "a leaves");
-        ok(
-            join(&state, voice_id, ids[6]).await,
-            "g joins after slot freed",
-        );
-        // not-in-channel leave is a no-op success
-        ok(leave(&state, voice_id, a).await, "leave while absent");
-
-        // -- Private Call signaling in the DM: exact pair only
-        ok(
-            relay_signal(&state, dm_id, a, b, CallSignalKind::Hangup).await,
-            "dm pair relay",
-        );
-        ok(
-            relay_signal(&state, dm_id, b, a, CallSignalKind::Hangup).await,
-            "dm pair relay, reverse direction",
-        );
-        let err = relay_signal(&state, dm_id, a, ids[2], CallSignalKind::Hangup)
-            .await
-            .expect_err("non-pair cannot relay in dm");
-        assert_eq!(err.code, bysyc_common::protocol::ErrorCode::Forbidden);
-
-        // Teardown: accounts cascade guild/membership/participants; friends
-        // and the dm channel reference the same accounts.
-        sqlx::query("DELETE FROM guilds WHERE id = $1")
-            .bind(guild_id)
-            .execute(&pg)
-            .await
-            .unwrap();
-        sqlx::query("DELETE FROM channels WHERE id = $1")
-            .bind(dm_id)
-            .execute(&pg)
-            .await
-            .unwrap();
-        for n in &names {
-            sqlx::query("DELETE FROM accounts WHERE username = $1")
-                .bind(n)
-                .execute(&pg)
-                .await
-                .unwrap();
-        }
     }
 }

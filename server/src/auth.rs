@@ -42,10 +42,10 @@ async fn rate_limit_middleware(
     req: Request,
     next: Next,
 ) -> Response {
-    if let Some(ip) = client_ip(&req) {
-        if !rl.check(ip) {
-            return (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response();
-        }
+    if let Some(ip) = client_ip(&req)
+        && !rl.check(ip)
+    {
+        return (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response();
     }
     next.run(req).await
 }

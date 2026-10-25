@@ -120,6 +120,7 @@ async fn member_ids(pool: &sqlx::PgPool, guild_id: i64) -> ApiResult<Vec<i64>> {
 
 /// Full GuildInfo snapshot (guild row + channels ordered by id) in one
 /// `guilds LEFT JOIN channels` query — the same shape list_guilds folds.
+#[allow(clippy::type_complexity)]
 async fn guild_info(pool: &sqlx::PgPool, guild_id: i64) -> ApiResult<GuildInfo> {
     let rows: Vec<(String, i64, Option<i64>, Option<String>, Option<String>)> = sqlx::query_as(
         "SELECT g.name, g.owner_id, c.id, c.kind, c.name \
