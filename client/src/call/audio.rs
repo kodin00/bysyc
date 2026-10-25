@@ -889,8 +889,7 @@ mod tests {
         let mut r = LinearResampler::default();
         let mut hot_out = Vec::new();
         r.process_into(&hot, from, &mut hot_out);
-        let hot_rms =
-            (hot_out.iter().map(|s| s * s).sum::<f32>() / hot_out.len() as f32).sqrt();
+        let hot_rms = (hot_out.iter().map(|s| s * s).sum::<f32>() / hot_out.len() as f32).sqrt();
         assert!(
             hot_rms < control_rms * 0.5,
             "30 kHz tone should be attenuated below 1 kHz control: \

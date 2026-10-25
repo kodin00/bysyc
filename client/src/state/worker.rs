@@ -18,13 +18,11 @@ use eframe::egui::Context;
 use crate::crypto::Envelope;
 use crate::store::Store;
 
-use super::{
-    guard, now_ms, push_capped, ClientState, MainState, MAILBOX_STALE_MS, MAX_OUTBOX_ACKS,
-};
 use super::apply::{
-    Decrypted, decrypt_envelope_text, file_row_text, load_file_envelopes,
-    persist_file_envelope, retry_undecrypted,
+    Decrypted, decrypt_envelope_text, file_row_text, load_file_envelopes, persist_file_envelope,
+    retry_undecrypted,
 };
+use super::{ClientState, MAILBOX_STALE_MS, MAX_OUTBOX_ACKS, guard, now_ms, push_capped};
 
 /// Deferred crypto/store work. Jobs are staged in arrival order, executed
 /// sequentially by one worker thread holding no locks, and published back
@@ -44,7 +42,10 @@ pub(super) enum CryptoJob {
     },
     /// Olm-decrypt + import a batch of mailbox items, ack what was consumed
     /// and retry-decrypt every channel a fresh share unlocked.
-    Mailbox { generation: u64, items: Vec<MailboxItem> },
+    Mailbox {
+        generation: u64,
+        items: Vec<MailboxItem>,
+    },
     /// Bootstrap the engine from the local store when login staged none
     /// (crash between WS connect and login task). The KDF plus unpickling
     /// of every session is far too slow for the state lock the UI needs
@@ -99,7 +100,15 @@ pub(super) fn stage_crypto_job(
         let state = Arc::clone(state);
         let store = Arc::clone(store);
         let ctx = ctx.clone();
-        std::thread::spawn(move || CryptoWorker { q, state, store, ctx }.run());
+        std::thread::spawn(move || {
+            CryptoWorker {
+                q,
+                state,
+                store,
+                ctx,
+            }
+            .run()
+        });
     }
 }
 
@@ -130,8 +139,7 @@ impl CryptoWorker {
                     }
                 }
             };
-            if let Err(p) =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.job(job)))
+            if let Err(p) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.job(job)))
             {
                 eprintln!("bysyc: crypto worker job panicked: {p:?}");
             }
@@ -152,12 +160,14 @@ impl CryptoWorker {
                 message_id,
             } => self.deleted(generation, channel_id, message_id),
             CryptoJob::Mailbox { generation, items } => self.mailbox(generation, items),
-            CryptoJob::EnsureEngine { generation, username } => {
-                self.ensure_engine(generation, username)
-            }
-            CryptoJob::Backfill { generation, channel_id } => {
-                self.backfill(generation, channel_id)
-            }
+            CryptoJob::EnsureEngine {
+                generation,
+                username,
+            } => self.ensure_engine(generation, username),
+            CryptoJob::Backfill {
+                generation,
+                channel_id,
+            } => self.backfill(generation, channel_id),
         }
     }
 
@@ -219,7 +229,9 @@ impl CryptoWorker {
                     false
                 }
                 Decrypted::Failed => {
-                    guard(&self.store).set_plaintext(msg_id, "[undecryptable]").ok();
+                    guard(&self.store)
+                        .set_plaintext(msg_id, "[undecryptable]")
+                        .ok();
                     true
                 }
             }
@@ -369,9 +381,7 @@ impl CryptoWorker {
                     .out
                     .try_send(WsClientMsg {
                         id: crate::net::next_msg_id(),
-                        body: WsClientBody::AckMailbox {
-                            ids: acks.clone(),
-                        },
+                        body: WsClientBody::AckMailbox { ids: acks.clone() },
                     })
                     .is_ok(),
                 None => false,
@@ -390,7 +400,10 @@ impl CryptoWorker {
         for channel_id in imported {
             stage_crypto_job(
                 &self.q,
-                CryptoJob::Backfill { generation, channel_id },
+                CryptoJob::Backfill {
+                    generation,
+                    channel_id,
+                },
                 &self.state,
                 &self.store,
                 &self.ctx,

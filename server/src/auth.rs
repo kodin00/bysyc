@@ -205,7 +205,10 @@ async fn register(
 
     let info = account_info(row);
     let token = session::create(&state.redis, info.id, &info).await?;
-    Ok(Json(TokenResponse { token, account: info }))
+    Ok(Json(TokenResponse {
+        token,
+        account: info,
+    }))
 }
 
 async fn login(
@@ -244,7 +247,10 @@ async fn login(
         is_admin,
     };
     let token = session::create(&state.redis, info.id, &info).await?;
-    Ok(Json(TokenResponse { token, account: info }))
+    Ok(Json(TokenResponse {
+        token,
+        account: info,
+    }))
 }
 
 async fn logout(

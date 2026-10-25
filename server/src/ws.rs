@@ -1159,11 +1159,8 @@ async fn ready_snapshot(state: &AppState, me: i64) -> Result<Ready, ApiError> {
     // Build a guild_id -> index map once so per-channel attachment is O(1)
     // instead of an O(guilds.len()) linear scan per channel (the previous
     // `find` made snapshot assembly O(guilds * channels) on this loop).
-    let guild_idx: HashMap<i64, usize> = guilds
-        .iter()
-        .enumerate()
-        .map(|(i, g)| (g.id, i))
-        .collect();
+    let guild_idx: HashMap<i64, usize> =
+        guilds.iter().enumerate().map(|(i, g)| (g.id, i)).collect();
     for cr in chan_rows_res? {
         let guild_id: i64 = cr.try_get("guild_id")?;
         let Some(&idx) = guild_idx.get(&guild_id) else {

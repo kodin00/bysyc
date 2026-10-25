@@ -42,7 +42,9 @@ use crate::state::guard;
 /// column); v2 is the `ALTER TABLE` that was previously swallowed by a
 /// best-effort `execute` whose error meant "already there".
 const MIGRATIONS: &[(u32, &str)] = &[
-    (1, "
+    (
+        1,
+        "
 CREATE TABLE IF NOT EXISTS settings(
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -87,8 +89,12 @@ CREATE TABLE IF NOT EXISTS dm(
     channel_id INTEGER PRIMARY KEY,
     peer_id    INTEGER NOT NULL
 );
-"),
-    (2, "ALTER TABLE messages ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0"),
+",
+    ),
+    (
+        2,
+        "ALTER TABLE messages ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0",
+    ),
 ];
 
 // ---------------------------------------------------------------------------
@@ -133,7 +139,8 @@ impl Store {
         // Open the read partner AFTER migrating so it observes the final
         // schema; `query_only = ON` turns any accidental write on this
         // connection into a hard error rather than a silent mutation.
-        let read = Connection::open(path).map_err(|e| format!("open read {}: {e}", path.display()))?;
+        let read =
+            Connection::open(path).map_err(|e| format!("open read {}: {e}", path.display()))?;
         let _ = read.execute_batch("PRAGMA query_only = ON;");
         Ok(Store {
             write: Mutex::new(write),
@@ -472,7 +479,9 @@ impl Store {
         // a WAL fsync per friend. `unchecked_transaction` is the `&self`
         // form (the Store is shared behind a Mutex, never `&mut`).
         let conn = guard(&self.write);
-        let tx = conn.unchecked_transaction().map_err(|e| format!("friends: {e}"))?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("friends: {e}"))?;
         {
             let mut stmt = conn
                 .prepare_cached(
@@ -491,8 +500,8 @@ impl Store {
 
     pub fn friends(&self) -> Vec<AccountBrief> {
         let conn = guard(&self.read);
-        let Ok(mut stmt) = conn
-            .prepare_cached("SELECT id, username, identity_key FROM friends ORDER BY username")
+        let Ok(mut stmt) =
+            conn.prepare_cached("SELECT id, username, identity_key FROM friends ORDER BY username")
         else {
             return Vec::new();
         };
@@ -513,7 +522,9 @@ impl Store {
         // One transaction across every guild and channel row (see
         // [`Store::upsert_friends`]).
         let conn = guard(&self.write);
-        let tx = conn.unchecked_transaction().map_err(|e| format!("guilds: {e}"))?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("guilds: {e}"))?;
         {
             let mut guild_stmt = conn
                 .prepare_cached(
@@ -546,8 +557,8 @@ impl Store {
     pub fn guilds(&self) -> Vec<GuildInfo> {
         let conn = guard(&self.read);
         let mut out: Vec<GuildInfo> = Vec::new();
-        let Ok(mut stmt) = conn
-            .prepare_cached("SELECT id, name, owner_id FROM guilds ORDER BY name")
+        let Ok(mut stmt) =
+            conn.prepare_cached("SELECT id, name, owner_id FROM guilds ORDER BY name")
         else {
             return out;
         };
@@ -1007,7 +1018,10 @@ mod tests {
         // Opening a brand-new DB runs every migration and lands at the
         // latest user_version.
         let latest = MIGRATIONS.last().unwrap().0;
-        let v: u32 = s.read().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        let v: u32 = s
+            .read()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(v, latest);
         // The v2 column is present and defaults to 0 (filterable).
         assert!(has_column(&s.read(), "messages", "deleted").unwrap());
@@ -1024,11 +1038,17 @@ mod tests {
             now_tag()
         ));
         let s = Store::open(&path).expect("open");
-        let first: u32 = s.read().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        let first: u32 = s
+            .read()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
         drop(s);
         // Reopening an already-migrated DB must not re-run migrations.
         let s = Store::open(&path).expect("reopen");
-        let second: u32 = s.read().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        let second: u32 = s
+            .read()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(first, second);
         assert_eq!(first, MIGRATIONS.last().unwrap().0);
     }
@@ -1061,7 +1081,10 @@ mod tests {
         }
         let s = Store::open(&path).expect("open pre-migration store");
         let latest = MIGRATIONS.last().unwrap().0;
-        let v: u32 = s.read().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        let v: u32 = s
+            .read()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(v, latest);
         // And the store is usable after the fast-forward.
         s.append_message(&msg(1, 10)).unwrap();

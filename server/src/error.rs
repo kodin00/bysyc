@@ -47,6 +47,12 @@ impl ApiError {
     }
 }
 
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({:?})", self.message, self.code)
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (

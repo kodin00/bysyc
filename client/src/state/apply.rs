@@ -28,11 +28,11 @@ use eframe::egui::Context;
 use crate::crypto::{Engine, Envelope};
 use crate::store::Store;
 
+use super::worker::{CryptoJob, stage_crypto_job};
 use super::{
-    guard, push_capped, ClientState, ConnStatus, MainState, Phase, Selection,
-    MAX_PENDING_NEWCOMERS, MAX_PENDING_SIGNALS,
+    ClientState, ConnStatus, MAX_PENDING_NEWCOMERS, MAX_PENDING_SIGNALS, MainState, Phase,
+    Selection, guard, push_capped,
 };
-use super::worker::{stage_crypto_job, CryptoJob};
 
 /// Result of decrypting one message ciphertext into renderable text.
 pub(super) enum Decrypted {
@@ -269,7 +269,10 @@ pub fn apply_server_msg(
                 let items = std::mem::take(&mut m.mailbox);
                 let loaded: Vec<i64> = m.loaded.iter().copied().collect();
                 if need_boot {
-                    jobs.push(CryptoJob::EnsureEngine { generation, username });
+                    jobs.push(CryptoJob::EnsureEngine {
+                        generation,
+                        username,
+                    });
                 }
                 if !items.is_empty() {
                     jobs.push(CryptoJob::Mailbox { generation, items });
@@ -445,7 +448,11 @@ pub fn apply_server_msg(
             kind,
         } => {
             if let Some(m) = st.main_mut() {
-                push_capped(&mut m.pending_signals, (from, call_id, kind), MAX_PENDING_SIGNALS);
+                push_capped(
+                    &mut m.pending_signals,
+                    (from, call_id, kind),
+                    MAX_PENDING_SIGNALS,
+                );
             }
         }
         WsServerBody::Error {

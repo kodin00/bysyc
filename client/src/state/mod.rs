@@ -33,7 +33,6 @@ use bysyc_common::protocol::{
     AccountBrief, AccountInfo, CallSignalKind, ChannelKind, DmChannel, FriendList, GuildInfo,
     MailboxItem, MessageDto,
 };
-use eframe::egui::Context;
 
 use crate::crypto::{Engine, Envelope};
 use crate::net::NetHandle;
@@ -386,7 +385,12 @@ impl MainState {
     /// Append a server-confirmed message, deduplicating by id (the same dto
     /// can arrive via both the REST response and the WS echo).
     pub fn append_message(&mut self, dto: MessageDto) {
-        if self.known_ids.entry(dto.channel_id).or_default().insert(dto.id) {
+        if self
+            .known_ids
+            .entry(dto.channel_id)
+            .or_default()
+            .insert(dto.id)
+        {
             self.messages.entry(dto.channel_id).or_default().push(dto);
         }
     }
