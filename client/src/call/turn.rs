@@ -65,7 +65,7 @@ fn md5(data: &[u8]) -> [u8; 16] {
         0x1032_5476u32,
     );
 
-    for chunk in msg.chunks_exact(64) {
+    for chunk in msg.as_chunks::<64>().0 {
         let mut m = [0u32; 16];
         for (i, w) in m.iter_mut().enumerate() {
             *w = u32::from_le_bytes(chunk[i * 4..i * 4 + 4].try_into().unwrap());
@@ -117,7 +117,7 @@ fn sha1(data: &[u8]) -> [u8; 20] {
         0xC3D2_E1F0,
     ];
 
-    for chunk in msg.chunks_exact(64) {
+    for chunk in msg.as_chunks::<64>().0 {
         let mut w = [0u32; 80];
         for i in 0..16 {
             w[i] = u32::from_be_bytes(chunk[i * 4..i * 4 + 4].try_into().unwrap());
@@ -262,7 +262,7 @@ impl StunBuilder {
         self.attrs
             .extend_from_slice(&(value.len() as u16).to_be_bytes());
         self.attrs.extend_from_slice(value);
-        while self.attrs.len() % 4 != 0 {
+        while !self.attrs.len().is_multiple_of(4) {
             self.attrs.push(0); // padding not counted in the length
         }
         self
@@ -718,6 +718,11 @@ impl TurnClient {
 
     fn on_allocate_response(&mut self, msg: &StunMsg, error: Option<u16>) {
         match error {
+            // 401 dance (RFC 5389 long-term credential): the anonymous probe
+            // was rejected carrying realm + nonce; rebuild the Allocate with
+            // USERNAME/REALM/NONCE + MESSAGE-INTEGRITY keyed on
+            // MD5(user:realm:pass) (see `key`). 438 (stale nonce) takes the
+            // same arm — learn the fresh nonce, retry once.
             Some(401) | Some(438) => {
                 if let Some(r) = msg.str_attr(ATTR_REALM) {
                     self.realm = Some(r.to_string());
@@ -966,6 +971,8 @@ mod tests {
     /// Allocate error response type — the server side of the exchange; the
     /// client only ever receives these, never sends them.
     const TYPE_ALLOCATE_ERR: u16 = 0x0113;
+    /// Refresh error response type (RFC 5389: error = request | 0x0110).
+    const TYPE_REFRESH_ERR: u16 = 0x0114;
 
     /// Append an ERROR-CODE attribute. The builder proper has no such
     /// method (the client never emits STUN errors); tests synthesize the
@@ -1263,5 +1270,123 @@ mod tests {
         for _ in 0..1000 {
             assert!(seen.insert(new_trans_id()));
         }
+    }
+
+    /// Full TURN client lifecycle end to end: the 401 realm/nonce dance, a
+    /// successful Allocate (relay + mapped + lifetime), ChannelBind setup
+    /// (permission + bind wires, then their OK responses), a ChannelData
+    /// round-trip, a Refresh triggered at half-lifetime, and the RFC 5389
+    /// 438-stale-nonce retry path that learns a fresh nonce and re-queues.
+    #[test]
+    fn full_lifecycle_allocate_bind_channeldata_refresh_438() {
+        let mut c = TurnClient::new(
+            "127.0.0.1:3478".parse().unwrap(),
+            "bysyc".into(),
+            "secret".into(),
+        );
+
+        // ---- allocate: anonymous probe → 401 dance → success --------------
+        let msgs = c.start();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(c.state, AllocState::Allocating);
+        let probe = StunMsg::parse(&msgs[0]).unwrap();
+        let err401 = StunBuilder::with_trans_id(TYPE_ALLOCATE_ERR, probe.trans_id)
+            .error_code(401, "Unauthorized")
+            .realm("bysyc")
+            .nonce("n-1")
+            .finish(None);
+        assert!(c.handle_input(&err401).is_none());
+        assert_eq!(c.realm.as_deref(), Some("bysyc"));
+        assert_eq!(c.nonce.as_deref(), Some("n-1"));
+        let sends = c.take_sends();
+        let retry = StunMsg::parse(&sends[0]).unwrap();
+        let relay: SocketAddr = "198.51.100.7:49160".parse().unwrap();
+        let mapped: SocketAddr = "203.0.113.9:51234".parse().unwrap();
+        let ok = response(
+            TYPE_ALLOCATE_OK,
+            retry.trans_id,
+            &[
+                (ATTR_XOR_RELAYED_ADDRESS, encode_xor_address(relay)),
+                (ATTR_XOR_MAPPED_ADDRESS, encode_xor_address(mapped)),
+                (ATTR_LIFETIME, 600u32.to_be_bytes().to_vec()),
+            ],
+        );
+        assert!(c.handle_input(&ok).is_none());
+        assert!(c.ready());
+        assert_eq!(c.relay_addr(), Some(relay));
+        assert_eq!(c.mapped_addr(), Some(mapped));
+
+        // ---- channel-bind: first wrap queues permission + bind; the first
+        // datagram rides a Send indication, later ones ChannelData. --------
+        let peer: SocketAddr = "10.9.8.7:50000".parse().unwrap();
+        let first = c.wrap_outgoing(peer, b"hello");
+        assert_eq!(StunMsg::parse(&first).unwrap().msg_type, TYPE_SEND_IND);
+        let queued = c.take_sends();
+        assert_eq!(queued.len(), 2, "permission + bind wires");
+        let perm = StunMsg::parse(&queued[0]).unwrap();
+        assert_eq!(perm.msg_type, TYPE_PERMISSION_REQ);
+        let bind = StunMsg::parse(&queued[1]).unwrap();
+        assert_eq!(bind.msg_type, TYPE_BIND_REQ);
+        // Complete both so the pending list is empty before the refresh step
+        // (otherwise tick would retransmit them, not queue a Refresh).
+        assert!(c
+            .handle_input(&response(TYPE_PERMISSION_OK, perm.trans_id, &[]))
+            .is_none());
+        assert!(c
+            .handle_input(&response(TYPE_BIND_OK, bind.trans_id, &[]))
+            .is_none());
+
+        // ---- ChannelData round-trip: outgoing wraps compactly, incoming
+        // unwraps to the peer address bound above. -------------------------
+        let second = c.wrap_outgoing(peer, b"world");
+        assert!(is_channel_data(&second));
+        let (num, data) = decode_channel_data(&second).unwrap();
+        assert_eq!(num, 0x4000);
+        assert_eq!(data, b"world");
+        let back = encode_channel_data(num, b"reply");
+        match c.handle_input(&back) {
+            Some(TurnPacket { from, payload }) => {
+                assert_eq!(from, peer);
+                assert_eq!(payload, b"reply");
+            }
+            other => panic!("expected ChannelData packet, got {other:?}"),
+        }
+
+        // ---- refresh: tick past refresh_at (lifetime/2) queues a Refresh
+        // request built with the realm + nonce learned at allocate time. ---
+        let later = Instant::now() + Duration::from_secs(400);
+        c.tick(later);
+        let sends = c.take_sends();
+        assert_eq!(sends.len(), 1, "exactly the Refresh request");
+        let refresh = StunMsg::parse(&sends[0]).unwrap();
+        assert_eq!(refresh.msg_type, TYPE_REFRESH_REQ);
+        assert_eq!(refresh.str_attr(ATTR_NONCE), Some("n-1"));
+
+        // ---- 438 stale nonce: the retry learns the fresh nonce and
+        // re-queues exactly one Refresh request carrying it. ---------------
+        let err438 = StunBuilder::with_trans_id(TYPE_REFRESH_ERR, refresh.trans_id)
+            .error_code(438, "Stale Nonce")
+            .realm("bysyc")
+            .nonce("n-fresh")
+            .finish(None);
+        assert!(c.handle_input(&err438).is_none());
+        let retry_sends = c.take_sends();
+        assert_eq!(retry_sends.len(), 1, "438 triggers exactly one retry");
+        let retry_refresh = StunMsg::parse(&retry_sends[0]).unwrap();
+        assert_eq!(retry_refresh.msg_type, TYPE_REFRESH_REQ);
+        assert_eq!(
+            retry_refresh.str_attr(ATTR_NONCE),
+            Some("n-fresh"),
+            "the retry must carry the nonce from the 438 response"
+        );
+
+        // A successful retry closes the loop and reschedules the refresh.
+        let ok_refresh = response(
+            TYPE_REFRESH_OK,
+            retry_refresh.trans_id,
+            &[(ATTR_LIFETIME, 600u32.to_be_bytes().to_vec())],
+        );
+        assert!(c.handle_input(&ok_refresh).is_none());
+        assert!(c.ready());
     }
 }

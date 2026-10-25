@@ -100,6 +100,11 @@ impl SpscRing {
         let mut tail = self.tail.load(Ordering::Relaxed); // producer-owned
         let head = self.head.load(Ordering::Acquire);
         let used = (tail - head) as usize;
+        // Overflow drops the OLDEST samples (advance head past them, not
+        // reject the newest) so latency stays bounded and the producer never
+        // blocks. Release on the head store publishes the bumped read
+        // position so the consumer's next pop_into sees those slots as
+        // already consumed.
         if samples.len() + used > RING_SAMPLES {
             let drop_n = samples.len() + used - RING_SAMPLES;
             self.head.store(head + drop_n as u64, Ordering::Release);
@@ -141,6 +146,12 @@ impl SpscRing {
     pub fn clear(&self) {
         let tail = self.tail.load(Ordering::Acquire);
         self.head.store(tail, Ordering::Release);
+    }
+}
+
+impl Default for SpscRing {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -355,6 +366,58 @@ impl PeerDecoder {
 // cpal engine
 // ---------------------------------------------------------------------------
 
+/// Mix every started peer sink into `out` (an interleaved f32 device
+/// buffer), saturating each frame to [-1, 1]. A sink starts only once it
+/// holds [`PREBUFFER_SAMPLES`] of jitter margin (see [`PeerSink::started`]).
+/// `mix` (one sample per frame) and `peer_scratch` (one buffer per peer) are
+/// caller-owned scratch, grown once and reused so nothing allocates in the
+/// audio callback after warm-up. Factored out of the cpal output callback so
+/// the mix arithmetic is unit-testable without a real device.
+fn mix_peers_into(
+    out: &mut [f32],
+    channels: usize,
+    peers: &[Arc<PeerSink>],
+    mix: &mut Vec<f32>,
+    peer_scratch: &mut Vec<Vec<f32>>,
+) {
+    let frames = out.len() / channels;
+    if peer_scratch.len() < peers.len() {
+        peer_scratch.resize(peers.len(), Vec::new());
+    }
+    mix.clear();
+    mix.resize(frames, 0.0);
+    for (i, peer) in peers.iter().enumerate() {
+        // Prebuffer gate: a sink stays silent until it holds PREBUFFER_SAMPLES
+        // of jitter margin, then auto-starts on the first mix that sees it
+        // full. Without this slack a freshly-arriving stream crackles before
+        // the callback cadence can absorb packet-timing jitter.
+        if !peer.started.load(Ordering::Relaxed) && peer.ring.len() >= PREBUFFER_SAMPLES {
+            peer.started.store(true, Ordering::Relaxed);
+        }
+        if !peer.started.load(Ordering::Relaxed) {
+            continue;
+        }
+        let scratch = &mut peer_scratch[i];
+        if scratch.len() != frames {
+            scratch.clear();
+            scratch.resize(frames, 0.0);
+        }
+        // Bulk-pop this peer's frames once, then mix from the local buffer —
+        // two ring atomics per peer per callback instead of two per sample.
+        let n = peer.ring.pop_into(scratch);
+        for (slot, s) in mix.iter_mut().zip(scratch.iter()).take(n) {
+            *slot += *s;
+        }
+    }
+    for (frame, s) in out.chunks_exact_mut(channels).zip(mix.iter()) {
+        let s = s.clamp(-1.0, 1.0);
+        for ch in frame.iter_mut() {
+            *ch = s;
+        }
+    }
+}
+
+
 /// Open capture + playback and return the shared handles.
 ///
 /// Streams start paused in cpal 0.18 and are played here; dropping the
@@ -422,7 +485,7 @@ fn find_output(host: &cpal::Host, name: Option<&str>) -> Option<cpal::Device> {
         Some(n) => host
             .output_devices()
             .ok()
-            .and_then(|mut it| it.find(|d| dev_name(&d).as_deref() == Some(n)))
+            .and_then(|mut it| it.find(|d| dev_name(d).as_deref() == Some(n)))
             .or_else(|| host.default_output_device()),
         None => host.default_output_device(),
     }
@@ -433,7 +496,7 @@ fn find_input(host: &cpal::Host, name: Option<&str>) -> Option<cpal::Device> {
         Some(n) => host
             .input_devices()
             .ok()
-            .and_then(|mut it| it.find(|d| dev_name(&d).as_deref() == Some(n)))
+            .and_then(|mut it| it.find(|d| dev_name(d).as_deref() == Some(n)))
             .or_else(|| host.default_input_device()),
         None => host.default_input_device(),
     }
@@ -459,8 +522,7 @@ impl AudioIo {
                 in_dev
                     .supported_input_configs()
                     .ok()?
-                    .filter(|r| r.sample_format() == cpal::SampleFormat::F32)
-                    .next()
+                    .find(|r| r.sample_format() == cpal::SampleFormat::F32)
                     .map(|r| r.with_max_sample_rate())
             })
             .ok_or("no f32 microphone format")?;
@@ -513,8 +575,7 @@ impl AudioIo {
                 out_dev
                     .supported_output_configs()
                     .ok()?
-                    .filter(|r| r.sample_format() == cpal::SampleFormat::F32)
-                    .next()
+                    .find(|r| r.sample_format() == cpal::SampleFormat::F32)
                     .map(|r| r.with_max_sample_rate())
             })
             .ok_or("no f32 speaker format")?;
@@ -536,42 +597,13 @@ impl AudioIo {
                     // One lock-free snapshot load; membership changes on the
                     // session thread publish a fresh immutable list.
                     let peers = sinks_out.load_full();
-                    let frames = data.len() / out_channels;
-                    // Grow-only scratch: nothing allocates here once the
-                    // peer count and device buffer size have settled.
-                    if peer_scratch.len() < peers.len() {
-                        peer_scratch.resize(peers.len(), Vec::new());
-                    }
-                    mix_scratch.clear();
-                    mix_scratch.resize(frames, 0.0);
-                    for (i, peer) in peers.iter().enumerate() {
-                        if !peer.started.load(Ordering::Relaxed)
-                            && peer.ring.len() >= PREBUFFER_SAMPLES
-                        {
-                            peer.started.store(true, Ordering::Relaxed);
-                        }
-                        if !peer.started.load(Ordering::Relaxed) {
-                            continue;
-                        }
-                        let scratch = &mut peer_scratch[i];
-                        if scratch.len() != frames {
-                            scratch.clear();
-                            scratch.resize(frames, 0.0);
-                        }
-                        // Bulk-pop this peer's frames once, then mix from
-                        // the local buffer — two ring atomics per peer per
-                        // callback instead of two per sample.
-                        let n = peer.ring.pop_into(scratch);
-                        for (slot, s) in mix_scratch.iter_mut().zip(scratch.iter()).take(n) {
-                            *slot += *s;
-                        }
-                    }
-                    for (frame, s) in data.chunks_exact_mut(out_channels).zip(mix_scratch.iter()) {
-                        let s = s.clamp(-1.0, 1.0);
-                        for ch in frame.iter_mut() {
-                            *ch = s;
-                        }
-                    }
+                    mix_peers_into(
+                        data,
+                        out_channels,
+                        &peers,
+                        &mut mix_scratch,
+                        &mut peer_scratch,
+                    );
                 },
                 |err| {
                     let _ = err;
@@ -813,7 +845,7 @@ mod tests {
         let mut dec = PeerDecoder::new(sink.clone()).expect("decoder");
         dec.conceal();
         dec.conceal();
-        assert!(sink.ring.len() > 0);
+        assert!(!sink.ring.is_empty());
     }
 
     #[test]
@@ -824,5 +856,114 @@ mod tests {
         let p1 = enc.encode_frame(&frame).unwrap();
         assert!(!p0.is_empty() && !p1.is_empty());
         assert!(enc.last_len > 0);
+    }
+
+    // ---- mix_peers_into: the factored output-callback arithmetic ----------
+
+    /// A `PeerSink` pre-filled with `samples`; `start` flips the started flag
+    /// directly so a test is not coupled to the prebuffer gate (or pass false
+    /// to exercise it).
+    fn sink_with(samples: &[f32], start: bool) -> Arc<PeerSink> {
+        let s = PeerSink::new();
+        s.ring.push_slice(samples);
+        if start {
+            s.started.store(true, Ordering::Relaxed);
+        }
+        s
+    }
+
+    /// Run `mix_peers_into` over `frames` frames at `channels` interleaved
+    /// channels, returning the device buffer it would have written. The
+    /// buffer is seeded with 0.5 garbage so a forgotten write is caught.
+    fn mix(channels: usize, peers: &[Arc<PeerSink>], frames: usize) -> Vec<f32> {
+        let mut out = vec![0.5f32; frames * channels];
+        let mut mix = Vec::new();
+        let mut scratch: Vec<Vec<f32>> = Vec::new();
+        mix_peers_into(&mut out, channels, peers, &mut mix, &mut scratch);
+        out
+    }
+
+    #[test]
+    fn mix_empty_peers_yields_silence() {
+        let out = mix(2, &[], 64);
+        assert!(out.iter().all(|s| *s == 0.0), "no peers → silence");
+    }
+
+    #[test]
+    fn mix_single_started_sink_is_passthrough() {
+        // 2-channel interleaved: the same mono sample fills both channels.
+        let sink = sink_with(&[0.25f32; 960], true);
+        let out = mix(2, &[sink], 960);
+        assert!(out.iter().all(|s| *s == 0.25), "single sink passes through");
+    }
+
+    #[test]
+    fn mix_many_sinks_sum() {
+        let a = sink_with(&[0.4f32; 32], true);
+        let b = sink_with(&[0.5f32; 32], true);
+        let out = mix(1, &[a, b], 32);
+        assert!(out.iter().all(|s| *s == 0.9), "two sinks sum per frame");
+    }
+
+    #[test]
+    fn mix_saturates_above_unity_and_below_neg_unity() {
+        // 0.8 + 0.8 = 1.6 → clamp to +1.0.
+        let a = sink_with(&[0.8f32; 16], true);
+        let b = sink_with(&[0.8f32; 16], true);
+        let out = mix(1, &[a, b], 16);
+        assert!(out.iter().all(|s| *s == 1.0), "positive saturation to +1.0");
+        // A single sink at -1.5 clamps to -1.0.
+        let c = sink_with(&[-1.5f32; 16], true);
+        let out = mix(1, &[c], 16);
+        assert!(out.iter().all(|s| *s == -1.0), "negative saturation to -1.0");
+    }
+
+    #[test]
+    fn mix_not_started_sink_is_silent_until_prebuffer() {
+        // 100 samples buffered but started=false AND below PREBUFFER: the
+        // prebuffer gate keeps it silent.
+        let sink = sink_with(&[1.0f32; 100], false);
+        let out = mix(1, std::slice::from_ref(&sink), 100);
+        assert!(out.iter().all(|s| *s == 0.0), "below-prebuffer sink must not play");
+        assert!(
+            !sink.started.load(Ordering::Relaxed),
+            "below PREBUFFER the gate must not auto-start"
+        );
+        // Once the ring holds PREBUFFER_SAMPLES the same call auto-starts it.
+        let full = sink_with(&[1.0f32; PREBUFFER_SAMPLES], false);
+        let out = mix(1, std::slice::from_ref(&full), 64);
+        assert!(full.started.load(Ordering::Relaxed), ">= PREBUFFER auto-starts");
+        assert!(out.iter().all(|s| *s == 1.0), "auto-started sink plays");
+    }
+
+    #[test]
+    fn mix_started_empty_sink_underflows_silently() {
+        // Started but the ring is empty: pop_into returns 0 (underflow counted),
+        // the sink contributes nothing, output stays silent.
+        let sink = sink_with(&[], true);
+        let out = mix(1, std::slice::from_ref(&sink), 64);
+        assert!(out.iter().all(|s| *s == 0.0), "empty started sink is silent");
+        assert!(
+            sink.ring.underflow_count() > 0,
+            "an empty started sink must count the underflow"
+        );
+    }
+
+    #[test]
+    fn mix_overflow_drop_reads_the_tail_after_overflow() {
+        // Fill the ring to capacity with 1.0, then push 960 of 0.5: push_slice
+        // drops the oldest 960 (overflow), so the ring holds 1.0×(N-960) then
+        // 0.5×960. The mix reads the survivor window — the drop is visible as
+        // the boundary between 1.0 and 0.5 exactly where the overflow happened.
+        let sink = sink_with(&[1.0f32; RING_SAMPLES], true);
+        sink.ring.push_slice(&[0.5f32; 960]);
+        assert_eq!(sink.ring.overflow_count(), 960);
+        assert_eq!(sink.ring.len(), RING_SAMPLES);
+
+        let out = mix(1, &[sink], RING_SAMPLES);
+        assert_eq!(out.len(), RING_SAMPLES);
+        assert_eq!(out[0], 1.0, "head is the surviving 1.0");
+        assert_eq!(out[RING_SAMPLES - 960], 0.5, "the pushed 0.5 begins here");
+        assert_eq!(out[RING_SAMPLES - 1], 0.5, "tail is the newest 0.5");
     }
 }

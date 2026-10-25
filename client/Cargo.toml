@@ -28,3 +28,19 @@ directories = "6"
 rfd = "0.15"
 futures-util = "0.3"
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+
+[dev-dependencies]
+# In-process server for the hermetic integration test (client/tests/hermetic.rs).
+# reqwest and tokio-tungstenite are already normal dependencies, so the live
+# REST + WS client paths exercise the real transport.
+bysyc-server = { path = "../server" }
+# Containerized postgres + redis for the hermetic test. The image definitions
+# live in testcontainers-modules (community split of the testcontainers core);
+# testcontainers is the runner/runtime, re-exported through the modules crate.
+testcontainers = "0.23"
+testcontainers-modules = { version = "0.11", features = ["postgres", "redis"] }
+# Direct registration-invite inserts against state.pg (the hermetic test mints
+# its own codes instead of shelling out to the server binary).
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres"] }
+# axum::serve hosts the in-process router on an ephemeral port.
+axum = "0.8"

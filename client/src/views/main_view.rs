@@ -284,6 +284,12 @@ impl MainView {
     }
 }
 
+impl Default for MainView {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub fn show(app: &mut BysycApp, ui: &mut egui::Ui) {
     let BysycApp {
         state,
@@ -434,11 +440,11 @@ fn nav(
                         .clicked()
                     {
                         let mut st = guard(state);
-                        if let Some(m) = st.main_mut() {
-                            if let Some(ch) = m.first_text_channel(g.id) {
-                                m.selected = Selection::Channel(ch);
-                                m.unread.remove(&ch);
-                            }
+                        if let Some(m) = st.main_mut()
+                            && let Some(ch) = m.first_text_channel(g.id)
+                        {
+                            m.selected = Selection::Channel(ch);
+                            m.unread.remove(&ch);
                         }
                     }
                     // Guild-level unread: any channel of the guild with
@@ -466,10 +472,9 @@ fn nav(
             if ui
                 .selectable_label(matches!(selected, Selection::Friends), friends_label)
                 .clicked()
+                && let Some(m) = guard(state).main_mut()
             {
-                if let Some(m) = guard(state).main_mut() {
-                    m.selected = Selection::Friends;
-                }
+                m.selected = Selection::Friends;
             }
 
             ui.add_space(4.0);
@@ -610,10 +615,10 @@ fn spawn_guild_rest<F, Fut>(
                 // out the periodic heartbeat (see NetHandle::heartbeat).
                 h2.heartbeat();
                 let mut st = guard(&state);
-                if let Some(m) = st.main_mut() {
-                    if !m.guilds.iter().any(|x| x.id == g.id) {
-                        m.guilds.push(g);
-                    }
+                if let Some(m) = st.main_mut()
+                    && !m.guilds.iter().any(|x| x.id == g.id)
+                {
+                    m.guilds.push(g);
                 }
             }
             Err(e) => {
@@ -784,10 +789,10 @@ fn invite_window(state: &Arc<Mutex<ClientState>>, ctx: &egui::Context) {
                     o.commands.push(egui::OutputCommand::CopyText(code.clone()));
                 });
             }
-            if ui.button("Close").clicked() {
-                if let Some(m) = guard(state).main_mut() {
-                    m.invite = None;
-                }
+            if ui.button("Close").clicked()
+                && let Some(m) = guard(state).main_mut()
+            {
+                m.invite = None;
             }
         });
 }
@@ -1143,12 +1148,11 @@ fn spawn_channel_rest(
         {
             Ok(c) => {
                 let mut st = guard(&state);
-                if let Some(m) = st.main_mut() {
-                    if let Some(g) = m.guilds.iter_mut().find(|g| g.id == guild_id) {
-                        if !g.channels.iter().any(|x| x.id == c.id) {
-                            g.channels.push(c);
-                        }
-                    }
+                if let Some(m) = st.main_mut()
+                    && let Some(g) = m.guilds.iter_mut().find(|g| g.id == guild_id)
+                    && !g.channels.iter().any(|x| x.id == c.id)
+                {
+                    g.channels.push(c);
                 }
             }
             Err(e) => {
@@ -1297,10 +1301,10 @@ fn friends_panel(
                         Ok(brief) => match h.net.send_friend_request(brief.id).await {
                             Ok(()) => {
                                 let mut st = guard(&state2);
-                                if let Some(m) = st.main_mut() {
-                                    if !m.outgoing_requests.iter().any(|a| a.id == brief.id) {
-                                        m.outgoing_requests.push(brief);
-                                    }
+                                if let Some(m) = st.main_mut()
+                                    && !m.outgoing_requests.iter().any(|a| a.id == brief.id)
+                                {
+                                    m.outgoing_requests.push(brief);
                                 }
                             }
                             Err(e) => {
@@ -1441,10 +1445,10 @@ fn chat(
             ctx.request_repaint_after(NOTICE_TTL - age);
             ui.horizontal(|ui| {
                 ui.colored_label(egui::Color32::RED, n);
-                if ui.small_button("x").clicked() {
-                    if let Some(m) = guard(state).main_mut() {
-                        m.notice = None;
-                    }
+                if ui.small_button("x").clicked()
+                    && let Some(m) = guard(state).main_mut()
+                {
+                    m.notice = None;
                 }
             });
         }
@@ -1771,7 +1775,7 @@ fn chat(
                             .plaintexts
                             .get(&msg.id)
                             .map(String::as_str)
-                            .or_else(|| (msg.id < 0).then(|| msg.content.as_str()));
+                            .or_else(|| (msg.id < 0).then_some(msg.content.as_str()));
                         let h = mv
                             .row_heights
                             .get(&msg.id)
@@ -1841,7 +1845,7 @@ fn chat(
                         .plaintexts
                         .get(&msg.id)
                         .map(String::as_str)
-                        .or_else(|| (msg.id < 0).then(|| msg.content.as_str()));
+                        .or_else(|| (msg.id < 0).then_some(msg.content.as_str()));
                     let h = mv
                         .row_heights
                         .get(&msg.id)
@@ -1860,10 +1864,11 @@ fn chat(
                             att_keep.insert(att.id);
                             // The envelope is immutable per message id —
                             // clone it out once and keep it.
-                            if !mv.file_envs.contains_key(&msg.id) {
-                                if let Some(fe) = m.file_meta.get(&msg.id) {
-                                    mv.file_envs.insert(msg.id, fe.clone());
-                                }
+                            if let std::collections::hash_map::Entry::Vacant(e) =
+                                mv.file_envs.entry(msg.id)
+                                && let Some(fe) = m.file_meta.get(&msg.id)
+                            {
+                                e.insert(fe.clone());
                             }
                         }
                         if msg.id > 0 && !mv.plaintexts.contains_key(&msg.id) {
@@ -1958,7 +1963,7 @@ fn chat(
         let at_top = scrolled.state.offset.y <= 1.0;
         let cooldown = mv
             .last_load_attempt
-            .map_or(true, |(_, t)| t.elapsed() > std::time::Duration::from_millis(800));
+            .is_none_or(|(_, t)| t.elapsed() > std::time::Duration::from_millis(800));
         if load_clicked || (has_more && at_top && !scroll_reset && cooldown) {
             let oldest = guard(state).main().and_then(|m| {
                 m.messages
@@ -2552,6 +2557,7 @@ fn gutter_button(
 /// message: a popup anchored at the row's trash button asks "yes"/"no".
 /// One stray click must not delete a message. "yes" fires the DELETE;
 /// "no", Escape, or a click outside disarms.
+#[allow(clippy::too_many_arguments)]
 fn msg_delete_confirm_popup(
     mv: &mut MainView,
     state: &Arc<Mutex<ClientState>>,
@@ -2667,10 +2673,10 @@ fn spawn_rest<F, Fut>(
     let state = Arc::clone(state);
     let ctx = ctx.clone();
     rt.spawn(async move {
-        if let Err(e) = fut_fn(h).await {
-            if let Some(m) = guard(&state).main_mut() {
-                m.notice = Some(e);
-            }
+        if let Err(e) = fut_fn(h).await
+            && let Some(m) = guard(&state).main_mut()
+        {
+            m.notice = Some(e);
         }
         ctx.request_repaint();
     });
@@ -2681,3 +2687,189 @@ fn fmt_time(ms: i64) -> String {
     let secs = ms.div_euclid(1000).rem_euclid(86_400);
     format!("{:02}:{:02}", secs / 3600, (secs % 3600) / 60)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bysyc_common::protocol::{AttachmentMeta, MessageKind};
+    use std::collections::HashSet;
+
+    fn msg(id: i64, attachment: Option<AttachmentMeta>, content: &str) -> MessageDto {
+        MessageDto {
+            id,
+            channel_id: 10,
+            sender_id: 1,
+            kind: MessageKind::Chat,
+            content: content.into(),
+            reply_to: None,
+            attachment,
+            created_at_ms: id,
+        }
+    }
+
+    #[test]
+    fn truncate_preview_caps_at_40_and_flattens_newlines() {
+        // Short body passes through verbatim.
+        assert_eq!(truncate_preview("short"), "short");
+        // Exactly 40 chars: no ellipsis (the cap is inclusive).
+        let exact: String = "x".repeat(40);
+        assert_eq!(truncate_preview(&exact), exact);
+        // Longer than 40: first 40 chars + ellipsis. Count chars (not bytes
+        // — the ellipsis is one char but three bytes in UTF-8).
+        let long = "y".repeat(60);
+        let p = truncate_preview(&long);
+        assert_eq!(p.chars().count(), 41);
+        assert!(p.ends_with('…'));
+        // Newlines flatten to spaces (the banner is one line).
+        assert_eq!(truncate_preview("a\nb\nc"), "a b c");
+    }
+
+    #[test]
+    fn estimate_row_height_attachment_and_text_branches() {
+        let line_h = 20.0_f32;
+        let spacing = 4.0_f32;
+        let content_w = 200.0_f32;
+        // Attachment branch: INLINE_IMAGE_PX + line_h + 3*spacing + 12.
+        let with_att = msg(
+            1,
+            Some(AttachmentMeta {
+                id: 300,
+                name: "cat.png".into(),
+                size: 4096,
+                nonce: "bm9uY2U=".into(),
+                encrypted: true,
+            }),
+            "ct",
+        );
+        assert_eq!(
+            estimate_row_height(&with_att, line_h, spacing, content_w, None),
+            attachments::INLINE_IMAGE_PX + line_h + 3.0 * spacing + 12.0
+        );
+
+        // Text branch: cpl = (200.0 / (20.0 * 0.55)) as usize = 18.
+        let cpl = (content_w / (line_h * 0.55)) as usize;
+        assert_eq!(cpl, 18);
+        // 1 wrapped line for a short body.
+        let one_line = msg(2, None, "hi");
+        assert_eq!(
+            estimate_row_height(&one_line, line_h, spacing, content_w, Some("hi")),
+            (1 + 1) as f32 * line_h + spacing
+        );
+        // 40 chars at cpl=18 → 3 wrapped lines (ceil(40/18)=3).
+        let body = "x".repeat(40);
+        let long = msg(3, None, &body);
+        assert_eq!(
+            estimate_row_height(&long, line_h, spacing, content_w, Some(&body)),
+            (1 + 3) as f32 * line_h + spacing
+        );
+        // No body supplied → 1 line.
+        let no_body = msg(4, None, "ct");
+        assert_eq!(
+            estimate_row_height(&no_body, line_h, spacing, content_w, None),
+            (1 + 1) as f32 * line_h + spacing
+        );
+    }
+
+    #[test]
+    fn fmt_time_utc_hh_mm_wraps_day() {
+        assert_eq!(fmt_time(0), "00:00");
+        assert_eq!(fmt_time(3_661_000), "01:01"); // 1h 1m 1s
+        assert_eq!(fmt_time(7_320_000), "02:02"); // 2h 2m
+        assert_eq!(fmt_time(86_400_000), "00:00"); // exactly one day → wraps
+        // Negative timestamps (clock skew) floor into the previous day.
+        assert_eq!(fmt_time(-1000), "23:59");
+    }
+
+    /// LRU eviction: untouched textures drop past the idle window, the keep
+    /// set pins entries past it, and the frames index never outlives its
+    /// texture. Mirrors how `touch_image`/`evict_stale_images` feed each
+    /// other in the render loop.
+    #[test]
+    fn evict_stale_images_idle_keep_and_cap() {
+        let ctx = egui::Context::default();
+        let img = egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]);
+        let tex = |id: i64| {
+            ctx.load_texture(
+                format!("t{id}"),
+                img.clone(),
+                egui::TextureOptions::default(),
+            )
+        };
+
+        let mut mv = MainView::new();
+        // 3 textures inserted and touched at frame 0.
+        mv.frame_no = 0;
+        for id in 1..=3 {
+            mv.image_cache.insert(id, tex(id));
+            mv.touch_image(id);
+        }
+        // touch_image on a texture that isn't cached is a no-op (and never
+        // invents a frames entry for it).
+        mv.touch_image(99);
+        assert!(!mv.image_frames.contains_key(&99));
+
+        // Frame 500: re-touch 1 and 2 only; id 3 is going stale.
+        mv.frame_no = 500;
+        mv.touch_image(1);
+        mv.touch_image(2);
+        assert_eq!(mv.image_frames.get(&1).copied(), Some(500));
+        assert_eq!(mv.image_frames.get(&3).copied(), Some(0));
+
+        // Evict at the idle boundary (500 + IMAGE_IDLE_FRAMES): id 3 drops.
+        mv.frame_no = 500 + IMAGE_IDLE_FRAMES;
+        mv.evict_stale_images(&HashSet::new());
+        assert!(!mv.image_cache.contains_key(&3), "stale texture evicted");
+        assert!(mv.image_cache.contains_key(&1) && mv.image_cache.contains_key(&2));
+        // The frames index does not outlive the texture.
+        assert!(!mv.image_frames.contains_key(&3));
+
+        // Far past the idle window: only the keep set survives.
+        mv.frame_no = 500 + IMAGE_IDLE_FRAMES * 3;
+        let mut keep = HashSet::new();
+        keep.insert(1);
+        mv.evict_stale_images(&keep);
+        assert!(mv.image_cache.contains_key(&1), "keep pins an idle texture");
+        assert!(!mv.image_cache.contains_key(&2), "unpinned idle texture goes");
+        assert!(!mv.image_frames.contains_key(&2));
+    }
+
+    /// The hard cap evicts least-recently-touched first; pinned entries
+    /// survive even when their frame stamp is the oldest in the cache.
+    #[test]
+    fn evict_stale_images_cap_drops_lru_first_and_respects_keep() {
+        let ctx = egui::Context::default();
+        let img = egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]);
+        let tex = |id: i64| {
+            ctx.load_texture(
+                format!("cap-{id}"),
+                img.clone(),
+                egui::TextureOptions::default(),
+            )
+        };
+
+        let mut mv = MainView::new();
+        // 50 textures, each touched at frame = id (id 1 is the LRU).
+        for id in 1..=50 {
+            mv.image_cache.insert(id, tex(id));
+            mv.frame_no = id as u64;
+            mv.touch_image(id);
+        }
+        assert_eq!(mv.image_cache.len(), 50);
+
+        // Evict at frame 50: everything is fresh (50 - id <= 900), so the
+        // idle pass keeps them all; the hard cap (48) then drops the 2 LRU
+        // that are not pinned.
+        mv.frame_no = 50;
+        let mut keep = HashSet::new();
+        keep.insert(1); // oldest stamp, but pinned
+        mv.evict_stale_images(&keep);
+        assert_eq!(mv.image_cache.len(), IMAGE_CACHE_CAP, "cap holds");
+        assert!(mv.image_cache.contains_key(&1), "pinned LRU survives");
+        assert!(!mv.image_cache.contains_key(&2), "next-LRU dropped");
+        assert!(!mv.image_cache.contains_key(&3), "second-LRU dropped");
+        assert!(mv.image_cache.contains_key(&4));
+        assert!(mv.image_cache.contains_key(&50), "MRU kept");
+        assert!(!mv.image_frames.contains_key(&2));
+    }
+}
+
