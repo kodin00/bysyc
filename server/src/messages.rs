@@ -114,6 +114,10 @@ pub(crate) fn message_kind_str(kind: MessageKind) -> &'static str {
     match kind {
         MessageKind::Chat => "chat",
         MessageKind::Control => "control",
+        // `MessageKind` is `#[non_exhaustive]`; Unknown (a `#[serde(other)]`
+        // fallback from a newer peer) or any future variant never reaches here
+        // — `send_message` rejects non-Chat/Control before calling this.
+        _ => "chat",
     }
 }
 
@@ -147,6 +151,13 @@ async fn send_message(
     let req: SendMessageRequest = serde_json::from_slice(&body)
         .map_err(|e| ApiError::invalid(format!("malformed request body: {e}")))?;
     check_ciphertext(&req.content)?;
+    // `MessageKind` is `#[non_exhaustive]` with a `#[serde(other)]` Unknown
+    // fallback; the DB's `messages.kind` CHECK only allows 'chat'|'control',
+    // so anything else is rejected up front rather than turned into a
+    // CHECK-violation 500.
+    if !matches!(req.kind, MessageKind::Chat | MessageKind::Control) {
+        return Err(ApiError::invalid("unknown message kind"));
+    }
 
     // Both preconditions in one round trip: channel membership, and — only
     // when the request is a reply — that the target lives in this channel.
@@ -496,6 +507,9 @@ mod tests {
                 ChannelKind::Text => "text",
                 ChannelKind::Voice => "voice",
                 ChannelKind::Dm => "dm",
+                // `ChannelKind` is non_exhaustive; the loop above lists every
+                // variant this version knows, so this is unreachable.
+                _ => continue,
             };
             assert_eq!(parse_channel_kind(s), Some(k));
         }
