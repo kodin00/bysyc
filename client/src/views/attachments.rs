@@ -177,7 +177,10 @@ pub fn add_pending(mv: &mut MainView, ch: i64, path: PathBuf) {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "file".into()),
     );
-    mv.pending.entry(ch).or_default().push(PendingFile { path, name });
+    mv.pending
+        .entry(ch)
+        .or_default()
+        .push(PendingFile { path, name });
 }
 
 /// Files dropped onto the window this frame queue with the viewed
@@ -522,6 +525,7 @@ async fn upload_and_send(
 ///
 /// On `Err` nothing is cleaned up — the caller owns the temp row and
 /// decides what the user sees.
+#[allow(clippy::too_many_arguments)]
 pub async fn encrypt_share_and_send(
     state: &Arc<Mutex<ClientState>>,
     store: &Arc<Mutex<Store>>,
@@ -843,11 +847,7 @@ async fn put_presigned(url: &str, body: &[u8]) -> Result<(), String> {
 }
 
 async fn get_presigned(url: &str) -> Result<Vec<u8>, String> {
-    let rsp = PRESIGNED
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
+    let rsp = PRESIGNED.get(url).send().await.map_err(|e| e.to_string())?;
     if !rsp.status().is_success() {
         return Err(format!("HTTP {}", rsp.status()));
     }
@@ -986,7 +986,9 @@ fn read_cached_thumb(attachment_id: i64) -> Option<Vec<u8>> {
 /// write only costs the next load the full pipeline.
 fn write_cached_thumb(attachment_id: i64, img: &DecodedImage) {
     use image::ImageEncoder as _;
-    let Some(p) = thumb_path(attachment_id) else { return };
+    let Some(p) = thumb_path(attachment_id) else {
+        return;
+    };
     let (width, height) = (img.color.size[0] as u32, img.color.size[1] as u32);
     let mut raw = Vec::with_capacity(img.color.pixels.len() * 4);
     for c in &img.color.pixels {
@@ -997,7 +999,12 @@ fn write_cached_thumb(attachment_id: i64, img: &DecodedImage) {
     };
     let mut png = Vec::new();
     if image::codecs::png::PngEncoder::new(&mut png)
-        .write_image(frame.as_raw(), width, height, image::ExtendedColorType::Rgba8)
+        .write_image(
+            frame.as_raw(),
+            width,
+            height,
+            image::ExtendedColorType::Rgba8,
+        )
         .is_ok()
     {
         let _ = std::fs::write(p, png);
@@ -1399,12 +1406,7 @@ fn popup_memo() -> std::sync::MutexGuard<'static, Option<Popup>> {
 /// the MESSAGE id (the `file_meta` key), which `mv.image_popup` now
 /// carries, and the envelope's strings are memoized here so the popup
 /// body never touches `file_meta` again while it is open.
-fn open_popup(
-    state: &Arc<Mutex<ClientState>>,
-    mv: &mut MainView,
-    att_id: i64,
-    fe: &Envelope,
-) {
+fn open_popup(state: &Arc<Mutex<ClientState>>, mv: &mut MainView, att_id: i64, fe: &Envelope) {
     let msg_id = {
         let st = guard(state);
         st.main().and_then(|m| {
@@ -1443,14 +1445,21 @@ pub fn image_popup(
             let st = guard(state);
             st.main().and_then(|m| m.file_meta.get(&msg_id).cloned())
         };
-        *memo = found.as_ref().and_then(|fe| Popup::from_envelope(msg_id, fe));
+        *memo = found
+            .as_ref()
+            .and_then(|fe| Popup::from_envelope(msg_id, fe));
     }
     let Some(popup) = memo.as_ref() else {
         mv.image_popup = None; // envelope gone (restarted before decrypt?)
         return;
     };
-    let (att_id, name, key, nonce, encrypted) =
-        (popup.att_id, &popup.name, &popup.key, &popup.nonce, popup.encrypted);
+    let (att_id, name, key, nonce, encrypted) = (
+        popup.att_id,
+        &popup.name,
+        &popup.key,
+        &popup.nonce,
+        popup.encrypted,
+    );
     // Synthetic meta for fetch/save/open (only the id drives them).
     let att = AttachmentMeta {
         id: att_id,
@@ -1526,10 +1535,28 @@ pub fn image_popup(
             }
             ui.horizontal(|ui| {
                 if ui.button("Save").clicked() {
-                    save_attachment(state, rt, ui.ctx(), att_id, name.clone(), encrypted, key, nonce);
+                    save_attachment(
+                        state,
+                        rt,
+                        ui.ctx(),
+                        att_id,
+                        name.clone(),
+                        encrypted,
+                        key,
+                        nonce,
+                    );
                 }
                 if ui.button("Open").clicked() {
-                    open_attachment(state, rt, ui.ctx(), att_id, name.clone(), encrypted, key, nonce);
+                    open_attachment(
+                        state,
+                        rt,
+                        ui.ctx(),
+                        att_id,
+                        name.clone(),
+                        encrypted,
+                        key,
+                        nonce,
+                    );
                 }
             });
         });
@@ -1759,6 +1786,7 @@ fn save_attachment(
 /// Download + (E2EE only) decrypt to a temp path and hand it to the OS
 /// opener — every phase, including the opener's own verdict, is a strip
 /// row.
+#[allow(clippy::too_many_arguments)]
 fn open_attachment(
     state: &Arc<Mutex<ClientState>>,
     rt: &tokio::runtime::Handle,
@@ -1900,10 +1928,10 @@ fn drop_upload(state: &Arc<Mutex<ClientState>>, id: u64) {
 
 fn remove_temp(state: &Arc<Mutex<ClientState>>, ch: i64, temp: i64) {
     let mut st = guard(state);
-    if let Some(m) = st.main_mut() {
-        if let Some(v) = m.messages.get_mut(&ch) {
-            v.retain(|x| x.id != temp);
-        }
+    if let Some(m) = st.main_mut()
+        && let Some(v) = m.messages.get_mut(&ch)
+    {
+        v.retain(|x| x.id != temp);
     }
 }
 

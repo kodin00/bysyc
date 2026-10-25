@@ -34,9 +34,7 @@ use bysyc_common::protocol::{
 use crate::app::BysycApp;
 use crate::crypto::Envelope;
 use crate::net::{self, NetHandle};
-use crate::state::{
-    ClientState, ConnStatus, MainState, Selection, TYPING_TTL_SECS, guard, now_ms,
-};
+use crate::state::{ClientState, ConnStatus, MainState, Selection, TYPING_TTL_SECS, guard, now_ms};
 use crate::store::Store;
 use crate::views::attachments;
 
@@ -257,9 +255,13 @@ impl MainView {
         for id in self.image_cache.keys() {
             self.image_frames.entry(*id).or_insert(now);
         }
-        self.image_cache
-            .retain(|id, _| keep.contains(id) || now.saturating_sub(self.image_frames.get(id).copied().unwrap_or(now)) <= IMAGE_IDLE_FRAMES);
-        self.image_frames.retain(|id, _| self.image_cache.contains_key(id));
+        self.image_cache.retain(|id, _| {
+            keep.contains(id)
+                || now.saturating_sub(self.image_frames.get(id).copied().unwrap_or(now))
+                    <= IMAGE_IDLE_FRAMES
+        });
+        self.image_frames
+            .retain(|id, _| self.image_cache.contains_key(id));
         if self.image_cache.len() > IMAGE_CACHE_CAP {
             let mut by_use: Vec<(i64, u64)> = self
                 .image_cache
@@ -281,6 +283,12 @@ impl MainView {
                 dropped += 1;
             }
         }
+    }
+}
+
+impl Default for MainView {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -312,7 +320,9 @@ pub fn show(app: &mut BysycApp, ui: &mut egui::Ui) {
         .default_size(140.0)
         .min_size(140.0)
         .max_size(400.0)
-        .show(ui, |ui| nav(ui, state, store, rt, main_view, &ctx, snap.as_ref()));
+        .show(ui, |ui| {
+            nav(ui, state, store, rt, main_view, &ctx, snap.as_ref())
+        });
 
     // The middle column's minimum (and first-run default) is its intrinsic
     // width — the widest visible row measured against the live state, so
@@ -327,9 +337,13 @@ pub fn show(app: &mut BysycApp, ui: &mut egui::Ui) {
         .default_size(mid_min)
         .min_size(mid_min)
         .max_size(400.0)
-        .show(ui, |ui| middle(ui, state, rt, main_view, &ctx, snap.as_ref()));
+        .show(ui, |ui| {
+            middle(ui, state, rt, main_view, &ctx, snap.as_ref())
+        });
 
-    egui::CentralPanel::default().show(ui, |ui| chat(ui, state, store, rt, main_view, &ctx, snap.as_ref()));
+    egui::CentralPanel::default().show(ui, |ui| {
+        chat(ui, state, store, rt, main_view, &ctx, snap.as_ref())
+    });
 
     // Transient popups driven by background tasks (invite codes).
     invite_window(state, &ctx);
@@ -434,12 +448,11 @@ fn nav(
                         .clicked()
                     {
                         let mut st = guard(state);
-                        if let Some(m) = st.main_mut() {
-                            if let Some(ch) = m.first_text_channel(g.id) {
+                        if let Some(m) = st.main_mut()
+                            && let Some(ch) = m.first_text_channel(g.id) {
                                 m.selected = Selection::Channel(ch);
                                 m.unread.remove(&ch);
                             }
-                        }
                     }
                     // Guild-level unread: any channel of the guild with
                     // unseen messages shows the same dot the DM rows use,
@@ -466,11 +479,9 @@ fn nav(
             if ui
                 .selectable_label(matches!(selected, Selection::Friends), friends_label)
                 .clicked()
-            {
-                if let Some(m) = guard(state).main_mut() {
+                && let Some(m) = guard(state).main_mut() {
                     m.selected = Selection::Friends;
                 }
-            }
 
             ui.add_space(4.0);
             for dm in dms {
@@ -610,10 +621,10 @@ fn spawn_guild_rest<F, Fut>(
                 // out the periodic heartbeat (see NetHandle::heartbeat).
                 h2.heartbeat();
                 let mut st = guard(&state);
-                if let Some(m) = st.main_mut() {
-                    if !m.guilds.iter().any(|x| x.id == g.id) {
-                        m.guilds.push(g);
-                    }
+                if let Some(m) = st.main_mut()
+                    && !m.guilds.iter().any(|x| x.id == g.id)
+                {
+                    m.guilds.push(g);
                 }
             }
             Err(e) => {
@@ -784,10 +795,10 @@ fn invite_window(state: &Arc<Mutex<ClientState>>, ctx: &egui::Context) {
                     o.commands.push(egui::OutputCommand::CopyText(code.clone()));
                 });
             }
-            if ui.button("Close").clicked() {
-                if let Some(m) = guard(state).main_mut() {
-                    m.invite = None;
-                }
+            if ui.button("Close").clicked()
+                && let Some(m) = guard(state).main_mut()
+            {
+                m.invite = None;
             }
         });
 }
@@ -937,7 +948,12 @@ fn cached_middle_min_width(
         d.channel.id.hash(&mut h);
         d.peer.username.hash(&mut h);
     }
-    for f in snap.incoming.iter().chain(&snap.friends).chain(&snap.outgoing) {
+    for f in snap
+        .incoming
+        .iter()
+        .chain(&snap.friends)
+        .chain(&snap.outgoing)
+    {
         f.username.hash(&mut h);
     }
     let mut voice: Vec<(&i64, &(usize, bool))> = snap.voice.iter().collect();
@@ -982,7 +998,11 @@ fn middle(
         .show(ui, |ui| match selected {
             Selection::Friends => friends_panel(ui, state, rt, mv, ctx, snap),
             Selection::Dm(ch) => {
-                let Some(peer) = snap.dms.iter().find(|d| d.channel.id == ch).map(|d| &d.peer)
+                let Some(peer) = snap
+                    .dms
+                    .iter()
+                    .find(|d| d.channel.id == ch)
+                    .map(|d| &d.peer)
                 else {
                     return;
                 };
@@ -1143,12 +1163,11 @@ fn spawn_channel_rest(
         {
             Ok(c) => {
                 let mut st = guard(&state);
-                if let Some(m) = st.main_mut() {
-                    if let Some(g) = m.guilds.iter_mut().find(|g| g.id == guild_id) {
-                        if !g.channels.iter().any(|x| x.id == c.id) {
-                            g.channels.push(c);
-                        }
-                    }
+                if let Some(m) = st.main_mut()
+                    && let Some(g) = m.guilds.iter_mut().find(|g| g.id == guild_id)
+                    && !g.channels.iter().any(|x| x.id == c.id)
+                {
+                    g.channels.push(c);
                 }
             }
             Err(e) => {
@@ -1297,10 +1316,10 @@ fn friends_panel(
                         Ok(brief) => match h.net.send_friend_request(brief.id).await {
                             Ok(()) => {
                                 let mut st = guard(&state2);
-                                if let Some(m) = st.main_mut() {
-                                    if !m.outgoing_requests.iter().any(|a| a.id == brief.id) {
-                                        m.outgoing_requests.push(brief);
-                                    }
+                                if let Some(m) = st.main_mut()
+                                    && !m.outgoing_requests.iter().any(|a| a.id == brief.id)
+                                {
+                                    m.outgoing_requests.push(brief);
                                 }
                             }
                             Err(e) => {
@@ -1441,10 +1460,10 @@ fn chat(
             ctx.request_repaint_after(NOTICE_TTL - age);
             ui.horizontal(|ui| {
                 ui.colored_label(egui::Color32::RED, n);
-                if ui.small_button("x").clicked() {
-                    if let Some(m) = guard(state).main_mut() {
-                        m.notice = None;
-                    }
+                if ui.small_button("x").clicked()
+                    && let Some(m) = guard(state).main_mut()
+                {
+                    m.notice = None;
                 }
             });
         }
@@ -1605,50 +1624,45 @@ fn chat(
             // `mv.composer`).
             let line_height = ui.text_style_height(&egui::TextStyle::Body);
             let (send_clicked, field) = {
-                ui.with_layout(
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| {
-                        let mut send_clicked = false;
-                        if icon_button(ui, "bytes://attach.svg", ICON_ATTACH, "Attach file")
-                            .clicked()
-                        {
-                            attachments::begin_attach(ctx, mv, ch);
-                        }
-                        if icon_button(ui, "bytes://send.svg", ICON_SEND, "Send").clicked() {
-                            send_clicked = true;
-                        }
-                        let buf = mv.composer.entry(ch).or_default();
-                        // The wrapping ScrollArea grows with the text up
-                        // to COMPOSER_MAX_ROWS rows and scrolls past that,
-                        // so a long draft never pushes the message list
-                        // away. The TextEdit itself drives the scroll to
-                        // keep the caret visible.
-                        let field = egui::ScrollArea::vertical()
-                            .id_salt(("composer_scroll", ch))
-                            .auto_shrink([false, true])
-                            .max_height(COMPOSER_MAX_ROWS as f32 * line_height)
-                            .scroll_bar_visibility(
-                                egui::containers::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let mut send_clicked = false;
+                    if icon_button(ui, "bytes://attach.svg", ICON_ATTACH, "Attach file").clicked() {
+                        attachments::begin_attach(ctx, mv, ch);
+                    }
+                    if icon_button(ui, "bytes://send.svg", ICON_SEND, "Send").clicked() {
+                        send_clicked = true;
+                    }
+                    let buf = mv.composer.entry(ch).or_default();
+                    // The wrapping ScrollArea grows with the text up
+                    // to COMPOSER_MAX_ROWS rows and scrolls past that,
+                    // so a long draft never pushes the message list
+                    // away. The TextEdit itself drives the scroll to
+                    // keep the caret visible.
+                    let field = egui::ScrollArea::vertical()
+                        .id_salt(("composer_scroll", ch))
+                        .auto_shrink([false, true])
+                        .max_height(COMPOSER_MAX_ROWS as f32 * line_height)
+                        .scroll_bar_visibility(
+                            egui::containers::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                        )
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::TextEdit::multiline(buf)
+                                    .id_salt(("composer", ch))
+                                    .hint_text(
+                                        "Message…  (Enter to send, Shift+Enter for a new line)",
+                                    )
+                                    .desired_width(f32::INFINITY)
+                                    .desired_rows(1)
+                                    // Keep only the horizontal inset:
+                                    // no vertical padding, the field
+                                    // hugs its lines exactly.
+                                    .margin(egui::Margin::symmetric(4, 0)),
                             )
-                            .show(ui, |ui| {
-                                ui.add(
-                                    egui::TextEdit::multiline(buf)
-                                        .id_salt(("composer", ch))
-                                        .hint_text(
-                                            "Message…  (Enter to send, Shift+Enter for a new line)",
-                                        )
-                                        .desired_width(f32::INFINITY)
-                                        .desired_rows(1)
-                                        // Keep only the horizontal inset:
-                                        // no vertical padding, the field
-                                        // hugs its lines exactly.
-                                        .margin(egui::Margin::symmetric(4, 0)),
-                                )
-                            })
-                            .inner;
-                        (send_clicked, field)
-                    },
-                )
+                        })
+                        .inner;
+                    (send_clicked, field)
+                })
                 .inner
             };
             if field.changed() {
@@ -1771,14 +1785,10 @@ fn chat(
                             .plaintexts
                             .get(&msg.id)
                             .map(String::as_str)
-                            .or_else(|| (msg.id < 0).then(|| msg.content.as_str()));
-                        let h = mv
-                            .row_heights
-                            .get(&msg.id)
-                            .copied()
-                            .unwrap_or_else(|| {
-                                estimate_row_height(msg, line_h, spacing, content_w, body)
-                            });
+                            .or_else(|| (msg.id < 0).then_some(msg.content.as_str()));
+                        let h = mv.row_heights.get(&msg.id).copied().unwrap_or_else(|| {
+                            estimate_row_height(msg, line_h, spacing, content_w, body)
+                        });
                         off += h + spacing;
                     }
                 }
@@ -1808,7 +1818,9 @@ fn chat(
                 // locked after state is released (state → store order).
                 let st = guard(state);
                 let Some(m) = st.main() else { return };
-                let Some(msgs) = m.messages.get(&ch) else { return };
+                let Some(msgs) = m.messages.get(&ch) else {
+                    return;
+                };
                 // Reply-prefix index for the loaded channel: message id →
                 // sender id, rebuilt when the message list moves. Resolves
                 // the ↪ prefixes in O(1) instead of a linear scan per
@@ -1841,14 +1853,10 @@ fn chat(
                         .plaintexts
                         .get(&msg.id)
                         .map(String::as_str)
-                        .or_else(|| (msg.id < 0).then(|| msg.content.as_str()));
-                    let h = mv
-                        .row_heights
-                        .get(&msg.id)
-                        .copied()
-                        .unwrap_or_else(|| {
-                            estimate_row_height(msg, line_h, spacing, content_w, body)
-                        });
+                        .or_else(|| (msg.id < 0).then_some(msg.content.as_str()));
+                    let h = mv.row_heights.get(&msg.id).copied().unwrap_or_else(|| {
+                        estimate_row_height(msg, line_h, spacing, content_w, body)
+                    });
                     if cursor < viewport.max.y + ROW_OVERDRAW_PX
                         && cursor + h > viewport.min.y - ROW_OVERDRAW_PX
                     {
@@ -1860,10 +1868,10 @@ fn chat(
                             att_keep.insert(att.id);
                             // The envelope is immutable per message id —
                             // clone it out once and keep it.
-                            if !mv.file_envs.contains_key(&msg.id) {
-                                if let Some(fe) = m.file_meta.get(&msg.id) {
-                                    mv.file_envs.insert(msg.id, fe.clone());
-                                }
+                            if !mv.file_envs.contains_key(&msg.id)
+                                && let Some(fe) = m.file_meta.get(&msg.id)
+                            {
+                                mv.file_envs.insert(msg.id, fe.clone());
                             }
                         }
                         if msg.id > 0 && !mv.plaintexts.contains_key(&msg.id) {
@@ -1932,10 +1940,8 @@ fn chat(
             if rows.is_empty() {
                 return;
             }
-            let rect = egui::Rect::from_x_y_ranges(
-                ui.max_rect().x_range(),
-                (top + y0)..=(top + y1),
-            );
+            let rect =
+                egui::Rect::from_x_y_ranges(ui.max_rect().x_range(), (top + y0)..=(top + y1));
             ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |vui| {
                 vui.skip_ahead_auto_ids(i0);
                 for row in &rows {
@@ -1958,7 +1964,7 @@ fn chat(
         let at_top = scrolled.state.offset.y <= 1.0;
         let cooldown = mv
             .last_load_attempt
-            .map_or(true, |(_, t)| t.elapsed() > std::time::Duration::from_millis(800));
+            .is_none_or(|(_, t)| t.elapsed() > std::time::Duration::from_millis(800));
         if load_clicked || (has_more && at_top && !scroll_reset && cooldown) {
             let oldest = guard(state).main().and_then(|m| {
                 m.messages
@@ -2061,7 +2067,10 @@ fn resolve_name(names: &mut HashMap<i64, String>, m: &MainState, id: i64) -> Str
 /// armed (replacing the old per-frame store-locking `preview_body`).
 fn truncate_preview(body: &str) -> String {
     const LEN: usize = 40;
-    let flat: Vec<char> = body.chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
+    let flat: Vec<char> = body
+        .chars()
+        .map(|c| if c == '\n' { ' ' } else { c })
+        .collect();
     let mut s: String = flat.iter().take(LEN).collect();
     if flat.len() > LEN {
         s.push('…');
@@ -2179,8 +2188,7 @@ fn message_row(
                             attachments::attachment_row(ui, state, rt, ctx, mv, att, fe);
                         } else {
                             ui.add(
-                                egui::Label::new("[encrypted]")
-                                    .wrap_mode(egui::TextWrapMode::Wrap),
+                                egui::Label::new("[encrypted]").wrap_mode(egui::TextWrapMode::Wrap),
                             );
                         }
                         if let Some(fe) = fe {
@@ -2552,6 +2560,7 @@ fn gutter_button(
 /// message: a popup anchored at the row's trash button asks "yes"/"no".
 /// One stray click must not delete a message. "yes" fires the DELETE;
 /// "no", Escape, or a click outside disarms.
+#[allow(clippy::too_many_arguments)]
 fn msg_delete_confirm_popup(
     mv: &mut MainView,
     state: &Arc<Mutex<ClientState>>,
@@ -2667,10 +2676,10 @@ fn spawn_rest<F, Fut>(
     let state = Arc::clone(state);
     let ctx = ctx.clone();
     rt.spawn(async move {
-        if let Err(e) = fut_fn(h).await {
-            if let Some(m) = guard(&state).main_mut() {
-                m.notice = Some(e);
-            }
+        if let Err(e) = fut_fn(h).await
+            && let Some(m) = guard(&state).main_mut()
+        {
+            m.notice = Some(e);
         }
         ctx.request_repaint();
     });

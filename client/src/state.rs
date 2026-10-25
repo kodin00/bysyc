@@ -76,6 +76,7 @@ fn push_capped<T>(v: &mut Vec<T>, item: T, cap: usize) {
 /// Top-level application phase. `Connecting` exists only between a
 /// login/restore click and the first WS `Ready`; once [`Phase::LoggedIn`],
 /// a dropped socket keeps the world and flips [`MainState::connection`].
+#[allow(clippy::large_enum_variant)] // lives behind Arc<Mutex<ClientState>>; boxing the live variant would only add an alloc
 pub enum Phase {
     /// No session — show the login view.
     Disconnected,
@@ -229,6 +230,7 @@ pub struct MainState {
 }
 
 impl MainState {
+    #[allow(clippy::too_many_arguments)]
     fn from_ready(
         account: AccountInfo,
         friends: Vec<AccountBrief>,
@@ -361,7 +363,12 @@ impl MainState {
     /// Append a server-confirmed message, deduplicating by id (the same dto
     /// can arrive via both the REST response and the WS echo).
     pub fn append_message(&mut self, dto: MessageDto) {
-        if self.known_ids.entry(dto.channel_id).or_default().insert(dto.id) {
+        if self
+            .known_ids
+            .entry(dto.channel_id)
+            .or_default()
+            .insert(dto.id)
+        {
             self.messages.entry(dto.channel_id).or_default().push(dto);
         }
     }
@@ -562,10 +569,10 @@ fn decrypt_envelope_text(engine: &Engine, channel: i64, sender: i64, content: &s
 /// only costs the chip after the next restart, so it is logged, not
 /// propagated.
 fn persist_file_envelope(store: &Arc<Mutex<Store>>, msg_id: i64, fe: &Envelope) {
-    if let Ok(json) = fe.to_json() {
-        if let Err(e) = guard(store).set_file_envelope(msg_id, &json) {
-            eprintln!("bysyc: persisting file envelope for message {msg_id} failed: {e}");
-        }
+    if let Ok(json) = fe.to_json()
+        && let Err(e) = guard(store).set_file_envelope(msg_id, &json)
+    {
+        eprintln!("bysyc: persisting file envelope for message {msg_id} failed: {e}");
     }
 }
 
@@ -581,10 +588,10 @@ fn load_file_envelopes(
 ) -> Vec<(i64, Envelope)> {
     let mut out = Vec::new();
     for (id, json) in guard(store).file_envelopes(channel_id) {
-        if !known.contains(&id) {
-            if let Ok(fe) = Envelope::from_json(&json) {
-                out.push((id, fe));
-            }
+        if !known.contains(&id)
+            && let Ok(fe) = Envelope::from_json(&json)
+        {
+            out.push((id, fe));
         }
     }
     out
@@ -597,6 +604,7 @@ fn load_file_envelopes(
 /// order state → engine → store). Returns the plaintexts written and the
 /// File envelopes stashed, for the caller to publish into `file_meta`.
 /// Touches engine and store only — safe to run with no state lock held.
+#[allow(clippy::type_complexity)]
 fn retry_undecrypted(
     engine: &Engine,
     own_id: i64,
@@ -908,7 +916,7 @@ mod tests {
             .cloned()
             .expect("file envelope stashed");
         assert_eq!(stashed, fe, "stashed by message id, not attachment id");
-        assert!(m.file_meta.get(&ATT).is_none(), "keyed by message id");
+        assert!(!m.file_meta.contains_key(&ATT), "keyed by message id");
         assert_eq!(
             guard(&store).plaintext(MSG).as_deref(),
             Some("[file: cat.png (12.1 KiB)]")
@@ -1037,6 +1045,12 @@ impl ClientState {
     }
 }
 
+impl Default for ClientState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Crypto worker
 // ---------------------------------------------------------------------------
@@ -1061,7 +1075,10 @@ enum CryptoJob {
     },
     /// Olm-decrypt + import a batch of mailbox items, ack what was consumed
     /// and retry-decrypt every channel a fresh share unlocked.
-    Mailbox { generation: u64, items: Vec<MailboxItem> },
+    Mailbox {
+        generation: u64,
+        items: Vec<MailboxItem>,
+    },
     /// Bootstrap the engine from the local store when login staged none
     /// (crash between WS connect and login task). The KDF plus unpickling
     /// of every session is far too slow for the state lock the UI needs
@@ -1116,7 +1133,15 @@ fn stage_crypto_job(
         let state = Arc::clone(state);
         let store = Arc::clone(store);
         let ctx = ctx.clone();
-        std::thread::spawn(move || CryptoWorker { q, state, store, ctx }.run());
+        std::thread::spawn(move || {
+            CryptoWorker {
+                q,
+                state,
+                store,
+                ctx,
+            }
+            .run()
+        });
     }
 }
 
@@ -1147,8 +1172,7 @@ impl CryptoWorker {
                     }
                 }
             };
-            if let Err(p) =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.job(job)))
+            if let Err(p) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.job(job)))
             {
                 eprintln!("bysyc: crypto worker job panicked: {p:?}");
             }
@@ -1169,12 +1193,14 @@ impl CryptoWorker {
                 message_id,
             } => self.deleted(generation, channel_id, message_id),
             CryptoJob::Mailbox { generation, items } => self.mailbox(generation, items),
-            CryptoJob::EnsureEngine { generation, username } => {
-                self.ensure_engine(generation, username)
-            }
-            CryptoJob::Backfill { generation, channel_id } => {
-                self.backfill(generation, channel_id)
-            }
+            CryptoJob::EnsureEngine {
+                generation,
+                username,
+            } => self.ensure_engine(generation, username),
+            CryptoJob::Backfill {
+                generation,
+                channel_id,
+            } => self.backfill(generation, channel_id),
         }
     }
 
@@ -1236,7 +1262,9 @@ impl CryptoWorker {
                     false
                 }
                 Decrypted::Failed => {
-                    guard(&self.store).set_plaintext(msg_id, "[undecryptable]").ok();
+                    guard(&self.store)
+                        .set_plaintext(msg_id, "[undecryptable]")
+                        .ok();
                     true
                 }
             }
@@ -1386,9 +1414,7 @@ impl CryptoWorker {
                     .out
                     .try_send(WsClientMsg {
                         id: crate::net::next_msg_id(),
-                        body: WsClientBody::AckMailbox {
-                            ids: acks.clone(),
-                        },
+                        body: WsClientBody::AckMailbox { ids: acks.clone() },
                     })
                     .is_ok(),
                 None => false,
@@ -1407,7 +1433,10 @@ impl CryptoWorker {
         for channel_id in imported {
             stage_crypto_job(
                 &self.q,
-                CryptoJob::Backfill { generation, channel_id },
+                CryptoJob::Backfill {
+                    generation,
+                    channel_id,
+                },
                 &self.state,
                 &self.store,
                 &self.ctx,
@@ -1593,7 +1622,10 @@ pub fn apply_server_msg(
                 let items = std::mem::take(&mut m.mailbox);
                 let loaded: Vec<i64> = m.loaded.iter().copied().collect();
                 if need_boot {
-                    jobs.push(CryptoJob::EnsureEngine { generation, username });
+                    jobs.push(CryptoJob::EnsureEngine {
+                        generation,
+                        username,
+                    });
                 }
                 if !items.is_empty() {
                     jobs.push(CryptoJob::Mailbox { generation, items });
@@ -1696,12 +1728,11 @@ pub fn apply_server_msg(
             }
         }
         WsServerBody::ChannelCreated { guild_id, channel } => {
-            if let Some(m) = st.main_mut() {
-                if let Some(g) = m.guilds.iter_mut().find(|g| g.id == guild_id) {
-                    if !g.channels.iter().any(|c| c.id == channel.id) {
-                        g.channels.push(channel);
-                    }
-                }
+            if let Some(m) = st.main_mut()
+                && let Some(g) = m.guilds.iter_mut().find(|g| g.id == guild_id)
+                && !g.channels.iter().any(|c| c.id == channel.id)
+            {
+                g.channels.push(channel);
             }
         }
         WsServerBody::ChannelDeleted {
@@ -1743,10 +1774,10 @@ pub fn apply_server_msg(
             guild_id,
             account_id,
         } => {
-            if let Some(m) = st.main_mut() {
-                if let Some(roster) = m.guild_members.get_mut(&guild_id) {
-                    roster.remove(&account_id);
-                }
+            if let Some(m) = st.main_mut()
+                && let Some(roster) = m.guild_members.get_mut(&guild_id)
+            {
+                roster.remove(&account_id);
             }
         }
         WsServerBody::VoiceState {
@@ -1770,7 +1801,11 @@ pub fn apply_server_msg(
             kind,
         } => {
             if let Some(m) = st.main_mut() {
-                push_capped(&mut m.pending_signals, (from, call_id, kind), MAX_PENDING_SIGNALS);
+                push_capped(
+                    &mut m.pending_signals,
+                    (from, call_id, kind),
+                    MAX_PENDING_SIGNALS,
+                );
             }
         }
         WsServerBody::Error {

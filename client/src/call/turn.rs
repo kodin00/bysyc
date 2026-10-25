@@ -65,7 +65,7 @@ fn md5(data: &[u8]) -> [u8; 16] {
         0x1032_5476u32,
     );
 
-    for chunk in msg.chunks_exact(64) {
+    for chunk in msg.as_chunks::<64>().0 {
         let mut m = [0u32; 16];
         for (i, w) in m.iter_mut().enumerate() {
             *w = u32::from_le_bytes(chunk[i * 4..i * 4 + 4].try_into().unwrap());
@@ -117,7 +117,7 @@ fn sha1(data: &[u8]) -> [u8; 20] {
         0xC3D2_E1F0,
     ];
 
-    for chunk in msg.chunks_exact(64) {
+    for chunk in msg.as_chunks::<64>().0 {
         let mut w = [0u32; 80];
         for i in 0..16 {
             w[i] = u32::from_be_bytes(chunk[i * 4..i * 4 + 4].try_into().unwrap());
@@ -262,7 +262,7 @@ impl StunBuilder {
         self.attrs
             .extend_from_slice(&(value.len() as u16).to_be_bytes());
         self.attrs.extend_from_slice(value);
-        while self.attrs.len() % 4 != 0 {
+        while !self.attrs.len().is_multiple_of(4) {
             self.attrs.push(0); // padding not counted in the length
         }
         self

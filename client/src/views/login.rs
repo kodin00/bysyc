@@ -93,11 +93,11 @@ fn submit(
         // to decrypt). ADR 0001: one device per account.
         {
             let s = guard(&store);
-            if let Some(prev) = s.setting("username") {
-                if prev != username {
-                    let _ = s.clear_pickles();
-                    let _ = s.del_setting("outbound_channels");
-                }
+            if let Some(prev) = s.setting("username")
+                && prev != username
+            {
+                let _ = s.clear_pickles();
+                let _ = s.del_setting("outbound_channels");
             }
         }
         // The engine must exist before registration (it supplies
