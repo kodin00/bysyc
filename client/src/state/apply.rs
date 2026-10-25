@@ -28,11 +28,11 @@ use eframe::egui::Context;
 use crate::crypto::{Engine, Envelope};
 use crate::store::Store;
 
+use super::worker::{CryptoJob, stage_crypto_job};
 use super::{
-    guard, push_capped, ClientState, ConnStatus, MainState, Phase, Selection,
-    MAX_PENDING_NEWCOMERS, MAX_PENDING_SIGNALS,
+    ClientState, ConnStatus, MAX_PENDING_NEWCOMERS, MAX_PENDING_SIGNALS, MainState, Phase,
+    Selection, guard, push_capped,
 };
-use super::worker::{stage_crypto_job, CryptoJob};
 
 /// Result of decrypting one message ciphertext into renderable text.
 pub(super) enum Decrypted {
@@ -73,10 +73,10 @@ pub(super) fn decrypt_envelope_text(
 /// only costs the chip after the next restart, so it is logged, not
 /// propagated.
 pub(super) fn persist_file_envelope(store: &Arc<Mutex<Store>>, msg_id: i64, fe: &Envelope) {
-    if let Ok(json) = fe.to_json() {
-        if let Err(e) = guard(store).set_file_envelope(msg_id, &json) {
-            eprintln!("bysyc: persisting file envelope for message {msg_id} failed: {e}");
-        }
+    if let Ok(json) = fe.to_json()
+        && let Err(e) = guard(store).set_file_envelope(msg_id, &json)
+    {
+        eprintln!("bysyc: persisting file envelope for message {msg_id} failed: {e}");
     }
 }
 
@@ -92,10 +92,10 @@ pub(super) fn load_file_envelopes(
 ) -> Vec<(i64, Envelope)> {
     let mut out = Vec::new();
     for (id, json) in guard(store).file_envelopes(channel_id) {
-        if !known.contains(&id) {
-            if let Ok(fe) = Envelope::from_json(&json) {
-                out.push((id, fe));
-            }
+        if !known.contains(&id)
+            && let Ok(fe) = Envelope::from_json(&json)
+        {
+            out.push((id, fe));
         }
     }
     out
@@ -108,6 +108,7 @@ pub(super) fn load_file_envelopes(
 /// order state → engine → store). Returns the plaintexts written and the
 /// File envelopes stashed, for the caller to publish into `file_meta`.
 /// Touches engine and store only — safe to run with no state lock held.
+#[allow(clippy::type_complexity)]
 pub(super) fn retry_undecrypted(
     engine: &Engine,
     own_id: i64,
@@ -268,7 +269,10 @@ pub fn apply_server_msg(
                 let items = std::mem::take(&mut m.mailbox);
                 let loaded: Vec<i64> = m.loaded.iter().copied().collect();
                 if need_boot {
-                    jobs.push(CryptoJob::EnsureEngine { generation, username });
+                    jobs.push(CryptoJob::EnsureEngine {
+                        generation,
+                        username,
+                    });
                 }
                 if !items.is_empty() {
                     jobs.push(CryptoJob::Mailbox { generation, items });
@@ -371,12 +375,11 @@ pub fn apply_server_msg(
             }
         }
         WsServerBody::ChannelCreated { guild_id, channel } => {
-            if let Some(m) = st.main_mut() {
-                if let Some(g) = m.guilds.iter_mut().find(|g| g.id == guild_id) {
-                    if !g.channels.iter().any(|c| c.id == channel.id) {
-                        g.channels.push(channel);
-                    }
-                }
+            if let Some(m) = st.main_mut()
+                && let Some(g) = m.guilds.iter_mut().find(|g| g.id == guild_id)
+                && !g.channels.iter().any(|c| c.id == channel.id)
+            {
+                g.channels.push(channel);
             }
         }
         WsServerBody::ChannelDeleted {
@@ -418,10 +421,10 @@ pub fn apply_server_msg(
             guild_id,
             account_id,
         } => {
-            if let Some(m) = st.main_mut() {
-                if let Some(roster) = m.guild_members.get_mut(&guild_id) {
-                    roster.remove(&account_id);
-                }
+            if let Some(m) = st.main_mut()
+                && let Some(roster) = m.guild_members.get_mut(&guild_id)
+            {
+                roster.remove(&account_id);
             }
         }
         WsServerBody::VoiceState {
@@ -445,7 +448,11 @@ pub fn apply_server_msg(
             kind,
         } => {
             if let Some(m) = st.main_mut() {
-                push_capped(&mut m.pending_signals, (from, call_id, kind), MAX_PENDING_SIGNALS);
+                push_capped(
+                    &mut m.pending_signals,
+                    (from, call_id, kind),
+                    MAX_PENDING_SIGNALS,
+                );
             }
         }
         WsServerBody::Error {

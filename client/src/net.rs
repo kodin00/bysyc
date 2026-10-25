@@ -89,7 +89,8 @@ pub fn next_msg_id() -> u64 {
 static HTTP: OnceLock<Arc<reqwest::Client>> = OnceLock::new();
 
 fn shared_http() -> Arc<reqwest::Client> {
-    HTTP.get_or_init(|| Arc::new(reqwest::Client::new())).clone()
+    HTTP.get_or_init(|| Arc::new(reqwest::Client::new()))
+        .clone()
 }
 
 /// HTTP client for one Instance. Cheap to clone (`reqwest::Client` inside);
@@ -198,8 +199,9 @@ impl Net {
     /// Admin-only: mint a single-use registration invite code. Returns the
     /// bare code; non-admin callers get a 403 from the server.
     pub async fn create_invite(&self) -> Result<String, String> {
-        let v: serde_json::Value =
-            self.exec(self.authed(reqwest::Method::POST, "/auth/invites")).await?;
+        let v: serde_json::Value = self
+            .exec(self.authed(reqwest::Method::POST, "/auth/invites"))
+            .await?;
         v.get("code")
             .and_then(|c| c.as_str())
             .map(|s| s.to_string())
@@ -394,12 +396,10 @@ impl Net {
     /// `MessageDeleted` to every member (including us — the local removal
     /// done at send time just makes it instant, and is idempotent).
     pub async fn delete_message(&self, channel_id: i64, message_id: i64) -> Result<(), String> {
-        self.exec_empty(
-            self.authed(
-                reqwest::Method::DELETE,
-                &format!("/channels/{channel_id}/messages/{message_id}"),
-            ),
-        )
+        self.exec_empty(self.authed(
+            reqwest::Method::DELETE,
+            &format!("/channels/{channel_id}/messages/{message_id}"),
+        ))
         .await
     }
 
@@ -474,15 +474,14 @@ pub async fn publish_keys(net: &Net, engine: &Arc<Engine>) {
         eprintln!("bysyc: identity key upload failed: {e}");
     }
     let otks = engine.uploadable_otks(10);
-    if !otks.is_empty() {
-        if let Err(e) = net
+    if !otks.is_empty()
+        && let Err(e) = net
             .upload_otks(&UploadOtkRequest {
                 one_time_keys: otks,
             })
             .await
-        {
-            eprintln!("bysyc: one-time key upload failed: {e}");
-        }
+    {
+        eprintln!("bysyc: one-time key upload failed: {e}");
     }
 }
 
@@ -498,6 +497,7 @@ pub async fn publish_keys(net: &Net, engine: &Arc<Engine>) {
 /// Order matters (see the engine docs): this runs *before*
 /// [`Engine::drain_pending_shares`], so a creation/rotation share still
 /// carries its index-0 key. Returns how many peers received the share.
+#[allow(clippy::type_complexity)] // (account, username, Option<(identity, signing)>) peer batch
 pub async fn share_session_with_peers(
     state: &Arc<Mutex<ClientState>>,
     engine: &Arc<Engine>,
@@ -759,10 +759,10 @@ fn flush_pending(store: &Arc<Mutex<Store>>, pending: &mut Vec<MessageDto>) {
         return;
     }
     let dtos = std::mem::take(pending);
-    if let Ok(s) = store.lock() {
-        if let Err(e) = s.insert_message_page(&dtos) {
-            eprintln!("bysyc: caching {} ws message(s) failed: {e}", dtos.len());
-        }
+    if let Ok(s) = store.lock()
+        && let Err(e) = s.insert_message_page(&dtos)
+    {
+        eprintln!("bysyc: caching {} ws message(s) failed: {e}", dtos.len());
     }
 }
 
@@ -966,14 +966,14 @@ pub async fn run_ws(
 
 /// Cheap reconnect resync: fresh friend graph + guild list over REST.
 async fn resync(net: &Net, state: &Arc<Mutex<ClientState>>) {
-    if let Ok(fl) = net.friends().await {
-        if let Some(m) = guard(state).main_mut() {
-            m.resync_friends(fl);
-        }
+    if let Ok(fl) = net.friends().await
+        && let Some(m) = guard(state).main_mut()
+    {
+        m.resync_friends(fl);
     }
-    if let Ok(guilds) = net.guilds().await {
-        if let Some(m) = guard(state).main_mut() {
-            m.resync_guilds(guilds);
-        }
+    if let Ok(guilds) = net.guilds().await
+        && let Some(m) = guard(state).main_mut()
+    {
+        m.resync_guilds(guilds);
     }
 }

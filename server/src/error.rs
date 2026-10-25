@@ -6,6 +6,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use bysyc_common::protocol::{ApiError as ApiErrorDto, ErrorCode};
 
+#[derive(Debug)]
 pub struct ApiError {
     pub status: StatusCode,
     pub code: ErrorCode,
@@ -43,6 +44,12 @@ impl ApiError {
     }
     pub fn internal(msg: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, msg)
+    }
+}
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({:?})", self.message, self.code)
     }
 }
 

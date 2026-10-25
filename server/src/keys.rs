@@ -41,10 +41,10 @@ async fn put_identity(
     // identity key; re-fetch and refresh so /auth/me serves the new key
     // without a Postgres fallback. Best-effort: a Redis hiccup just means
     // the next /me misses the cache, reads Postgres, and re-caches.
-    if let Some(info) = crate::auth::fetch_account_info(&state.pg, me).await? {
-        if let Err(e) = crate::session::cache_account_info(&state.redis, me, &info).await {
-            tracing::warn!(me, "identity-key upload cache refresh failed: {e}");
-        }
+    if let Some(info) = crate::auth::fetch_account_info(&state.pg, me).await?
+        && let Err(e) = crate::session::cache_account_info(&state.redis, me, &info).await
+    {
+        tracing::warn!(me, "identity-key upload cache refresh failed: {e}");
     }
     Ok(StatusCode::NO_CONTENT)
 }

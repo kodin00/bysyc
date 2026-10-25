@@ -69,13 +69,15 @@ pub async fn ensure_bucket(state: &AppState) -> ApiResult<()> {
                     Ok(())
                 }
                 Err(e) => {
+                    // Rely only on the SDK's typed matchers — the previous
+                    // `contains("already exist")` string fallback could mask a
+                    // genuinely broken bucket as "already ours" and move on.
                     let already = e
                         .as_service_error()
                         .map(|svc| {
                             svc.is_bucket_already_owned_by_you() || svc.is_bucket_already_exists()
                         })
-                        .unwrap_or(false)
-                        || e.to_string().to_lowercase().contains("already exist");
+                        .unwrap_or(false);
                     if already {
                         Ok(())
                     } else {
@@ -123,10 +125,12 @@ pub async fn put_object(state: &AppState, key: &str, body: Bytes) -> ApiResult<(
     Ok(())
 }
 
-/// DELETE the object at `key`. Best-effort by contract: this helper does
-/// not log — callers tolerate the failure (message deletion must not fail
-/// because a stray object survived) and log it themselves. An orphaned
-/// object behind an unguessable 128-bit key leaks nothing.
+/// DELETE the object at `key`. Best-effort by contract: the S3 error (if
+/// any) is logged here at `error` level; callers tolerate the failure
+/// (message deletion must not fail because a stray object survived) and warn
+/// about the orphaned-object consequence themselves. The message they see is
+/// generic; the detail stays server-side. An orphaned object behind an
+/// unguessable 128-bit key leaks nothing.
 pub async fn delete_object(state: &AppState, key: &str) -> ApiResult<()> {
     state
         .s3
@@ -135,7 +139,10 @@ pub async fn delete_object(state: &AppState, key: &str) -> ApiResult<()> {
         .key(key)
         .send()
         .await
-        .map_err(|e| ApiError::internal(format!("could not delete object: {e}")))?;
+        .map_err(|e| {
+            tracing::error!(key, "object delete failed: {e}");
+            ApiError::internal("could not delete object")
+        })?;
     Ok(())
 }
 

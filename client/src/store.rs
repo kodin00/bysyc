@@ -42,7 +42,9 @@ use crate::state::guard;
 /// column); v2 is the `ALTER TABLE` that was previously swallowed by a
 /// best-effort `execute` whose error meant "already there".
 const MIGRATIONS: &[(u32, &str)] = &[
-    (1, "
+    (
+        1,
+        "
 CREATE TABLE IF NOT EXISTS settings(
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -87,8 +89,12 @@ CREATE TABLE IF NOT EXISTS dm(
     channel_id INTEGER PRIMARY KEY,
     peer_id    INTEGER NOT NULL
 );
-"),
-    (2, "ALTER TABLE messages ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0"),
+",
+    ),
+    (
+        2,
+        "ALTER TABLE messages ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0",
+    ),
 ];
 
 // ---------------------------------------------------------------------------
@@ -122,7 +128,22 @@ impl Store {
 
     /// Open (and migrate) the store at an explicit path.
     pub fn open(path: &Path) -> Result<Self, String> {
-        let write = Connection::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        // `:memory:` is private per connection, so the read partner would
+        // see an empty, unmigrated database. Map it to a uniquely named
+        // shared-cache in-memory URI that both connections attach to (and
+        // that stays isolated from every other `Store`).
+        let target = if path.as_os_str() == ":memory:" {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            std::borrow::Cow::Owned(std::path::PathBuf::from(format!(
+                "file:bysyc-mem-{}-{n}?mode=memory&cache=shared",
+                std::process::id()
+            )))
+        } else {
+            std::borrow::Cow::Borrowed(path)
+        };
+        let write =
+            Connection::open(&target).map_err(|e| format!("open {}: {e}", path.display()))?;
         // WAL lets the read-only partner serve a consistent snapshot
         // alongside one writer, and NORMAL sync under WAL trades a crash's
         // very last commits for far faster writes, fine for a cache
@@ -133,7 +154,8 @@ impl Store {
         // Open the read partner AFTER migrating so it observes the final
         // schema; `query_only = ON` turns any accidental write on this
         // connection into a hard error rather than a silent mutation.
-        let read = Connection::open(path).map_err(|e| format!("open read {}: {e}", path.display()))?;
+        let read =
+            Connection::open(&target).map_err(|e| format!("open read {}: {e}", path.display()))?;
         let _ = read.execute_batch("PRAGMA query_only = ON;");
         Ok(Store {
             write: Mutex::new(write),
@@ -295,10 +317,10 @@ impl Store {
         {
             let mut stmt = conn.prepare_cached(Self::INSERT_MESSAGE)?;
             for m in dtos {
-                let attachment_json = match &m.attachment {
-                    Some(a) => Some(serde_json::to_string(a).unwrap_or_default()),
-                    None => None,
-                };
+                let attachment_json = m
+                    .attachment
+                    .as_ref()
+                    .map(|a| serde_json::to_string(a).unwrap_or_default());
                 stmt.execute(params![
                     m.id,
                     m.channel_id,
@@ -370,9 +392,7 @@ impl Store {
     pub fn plaintext(&self, msg_id: i64) -> Option<String> {
         let conn = guard(&self.read);
         conn.prepare_cached("SELECT plaintext FROM messages WHERE id = ?1")
-            .and_then(|mut stmt| {
-                stmt.query_row(params![msg_id], |r| r.get::<_, Option<String>>(0))
-            })
+            .and_then(|mut stmt| stmt.query_row(params![msg_id], |r| r.get::<_, Option<String>>(0)))
             .optional()
             .ok()
             .flatten()
@@ -474,7 +494,9 @@ impl Store {
         // a WAL fsync per friend. `unchecked_transaction` is the `&self`
         // form (the Store is shared behind a Mutex, never `&mut`).
         let conn = guard(&self.write);
-        let tx = conn.unchecked_transaction().map_err(|e| format!("friends: {e}"))?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("friends: {e}"))?;
         {
             let mut stmt = conn
                 .prepare_cached(
@@ -493,8 +515,8 @@ impl Store {
 
     pub fn friends(&self) -> Vec<AccountBrief> {
         let conn = guard(&self.read);
-        let Ok(mut stmt) = conn
-            .prepare_cached("SELECT id, username, identity_key FROM friends ORDER BY username")
+        let Ok(mut stmt) =
+            conn.prepare_cached("SELECT id, username, identity_key FROM friends ORDER BY username")
         else {
             return Vec::new();
         };
@@ -515,7 +537,9 @@ impl Store {
         // One transaction across every guild and channel row (see
         // [`Store::upsert_friends`]).
         let conn = guard(&self.write);
-        let tx = conn.unchecked_transaction().map_err(|e| format!("guilds: {e}"))?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("guilds: {e}"))?;
         {
             let mut guild_stmt = conn
                 .prepare_cached(
@@ -548,8 +572,8 @@ impl Store {
     pub fn guilds(&self) -> Vec<GuildInfo> {
         let conn = guard(&self.read);
         let mut out: Vec<GuildInfo> = Vec::new();
-        let Ok(mut stmt) = conn
-            .prepare_cached("SELECT id, name, owner_id FROM guilds ORDER BY name")
+        let Ok(mut stmt) =
+            conn.prepare_cached("SELECT id, name, owner_id FROM guilds ORDER BY name")
         else {
             return out;
         };
@@ -566,26 +590,25 @@ impl Store {
         for g in rows.filter_map(|r| r.ok()) {
             out.push(g);
         }
-        if let Ok(mut stmt) = conn.prepare_cached(
-            "SELECT id, guild_id, kind, name FROM channels ORDER BY name",
-        ) {
-            if let Ok(rows) = stmt.query_map([], |r| {
+        if let Ok(mut stmt) =
+            conn.prepare_cached("SELECT id, guild_id, kind, name FROM channels ORDER BY name")
+            && let Ok(rows) = stmt.query_map([], |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
                     r.get::<_, i64>(1)?,
                     r.get::<_, String>(2)?,
                     r.get::<_, String>(3)?,
                 ))
-            }) {
-                for (id, guild_id, kind, name) in rows.filter_map(|r| r.ok()) {
-                    if let Some(g) = out.iter_mut().find(|g| g.id == guild_id) {
-                        g.channels.push(ChannelInfo {
-                            id,
-                            guild_id: Some(guild_id),
-                            kind: parse_kind_channel(&kind),
-                            name,
-                        });
-                    }
+            })
+        {
+            for (id, guild_id, kind, name) in rows.filter_map(|r| r.ok()) {
+                if let Some(g) = out.iter_mut().find(|g| g.id == guild_id) {
+                    g.channels.push(ChannelInfo {
+                        id,
+                        guild_id: Some(guild_id),
+                        kind: parse_kind_channel(&kind),
+                        name,
+                    });
                 }
             }
         }
@@ -641,11 +664,26 @@ fn secrets_store(map: &BTreeMap<String, String>) -> Result<(), String> {
         std::fs::create_dir_all(parent).map_err(|e| format!("secrets: {e}"))?;
     }
     let json = serde_json::to_string_pretty(map).map_err(|e| format!("secrets: {e}"))?;
-    std::fs::write(&path, json).map_err(|e| format!("secrets: {e}"))?;
+    // Open already at mode 0600 so the file is never briefly world-readable
+    // (write-then-chmod leaves a TOCTOU window for the token + passphrase).
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|e| format!("secrets: {e}"))?;
+        f.write_all(json.as_bytes())
+            .map_err(|e| format!("secrets: {e}"))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&path, json).map_err(|e| format!("secrets: {e}"))?;
     }
     Ok(())
 }
@@ -995,7 +1033,10 @@ mod tests {
         // Opening a brand-new DB runs every migration and lands at the
         // latest user_version.
         let latest = MIGRATIONS.last().unwrap().0;
-        let v: u32 = s.read().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        let v: u32 = s
+            .read()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(v, latest);
         // The v2 column is present and defaults to 0 (filterable).
         assert!(has_column(&s.read(), "messages", "deleted").unwrap());
@@ -1012,11 +1053,17 @@ mod tests {
             now_tag()
         ));
         let s = Store::open(&path).expect("open");
-        let first: u32 = s.read().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        let first: u32 = s
+            .read()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
         drop(s);
         // Reopening an already-migrated DB must not re-run migrations.
         let s = Store::open(&path).expect("reopen");
-        let second: u32 = s.read().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        let second: u32 = s
+            .read()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(first, second);
         assert_eq!(first, MIGRATIONS.last().unwrap().0);
     }
@@ -1049,7 +1096,10 @@ mod tests {
         }
         let s = Store::open(&path).expect("open pre-migration store");
         let latest = MIGRATIONS.last().unwrap().0;
-        let v: u32 = s.read().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        let v: u32 = s
+            .read()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(v, latest);
         // And the store is usable after the fast-forward.
         s.append_message(&msg(1, 10)).unwrap();

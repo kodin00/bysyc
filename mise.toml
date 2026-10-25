@@ -4,6 +4,15 @@ rust = "1.99.0"
 [tasks.check]
 run = "cargo check --workspace"
 
+[tasks.clippy]
+run = "cargo clippy --workspace --all-targets -- -D warnings"
+
+[tasks.fmt]
+run = "cargo fmt --all --check"
+
+[tasks.test]
+run = "cargo test --workspace"
+
 [tasks.dev-server]
 run = "set -a; . ./.env; set +a; cargo run -p bysyc-server"
 

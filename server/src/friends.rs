@@ -197,8 +197,14 @@ async fn send_request(
         .bind(peer)
         .fetch_optional(&state.pg)
         .await?;
-    let (peer_id, peer_username, peer_identity_key, already_friends, reverse_present, outgoing_present) =
-        row.ok_or_else(|| ApiError::not_found("no such account"))?;
+    let (
+        peer_id,
+        peer_username,
+        peer_identity_key,
+        already_friends,
+        reverse_present,
+        outgoing_present,
+    ) = row.ok_or_else(|| ApiError::not_found("no such account"))?;
     if already_friends {
         return Err(ApiError::invalid("already friends with this account"));
     }

@@ -671,7 +671,7 @@ pub struct WsClientMsg {
 
 /// Payload of a client→server WebSocket message.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(rename_all = "snake_case")]
+#[serde(remote = "Self", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum WsClientBody {
     /// Liveness ping; the server answers nothing special (the transport
@@ -750,7 +750,7 @@ pub struct MailboxItem {
 
 /// Payload of a server→client WebSocket message.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(rename_all = "snake_case")]
+#[serde(remote = "Self", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum WsServerBody {
     /// Initial snapshot, sent as the first message of the connection:
@@ -892,6 +892,68 @@ pub enum WsServerBody {
     /// emit variants this version does not yet know.
     #[serde(other)]
     Unknown,
+}
+
+// The two body enums carry payloads, so `#[serde(other)]` alone is not enough:
+// serde resolves the unknown tag to `Unknown` but then asks the format for a
+// *unit* variant, which fails when the tag arrives as `{"tag": {..payload..}}`.
+// They therefore derive with `remote = "Self"` (generating inherent
+// `serialize`/`deserialize` fns) and wrap them below.
+
+/// Deserialize a payload-carrying wire enum, mapping an unrecognized tag —
+/// bare string or single-key map with any payload — to its `Unknown` variant.
+///
+/// The input is buffered once as a [`serde_json::Value`] (a self-describing
+/// intermediate, whatever the source format). A tag is "unrecognized" when the
+/// derived impl maps the bare tag string to `Unknown`; a known tag with a
+/// malformed payload still errors.
+fn deserialize_forward_compat<'de, D, T>(
+    deserializer: D,
+    derived: fn(serde_json::Value) -> Result<T, serde_json::Error>,
+    is_unknown: fn(&T) -> bool,
+) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let value = serde_json::Value::deserialize(deserializer)?;
+    if let serde_json::Value::Object(map) = &value
+        && map.len() == 1
+        && let Some(tag) = map.keys().next()
+        && let Ok(unknown) = derived(serde_json::Value::String(tag.clone()))
+        && is_unknown(&unknown)
+    {
+        return Ok(unknown);
+    }
+    derived(value).map_err(D::Error::custom)
+}
+
+impl Serialize for WsClientBody {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Self::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for WsClientBody {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserialize_forward_compat(deserializer, Self::deserialize, |b| {
+            matches!(b, Self::Unknown)
+        })
+    }
+}
+
+impl Serialize for WsServerBody {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Self::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for WsServerBody {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserialize_forward_compat(deserializer, Self::deserialize, |b| {
+            matches!(b, Self::Unknown)
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------

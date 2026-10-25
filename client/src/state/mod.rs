@@ -33,7 +33,6 @@ use bysyc_common::protocol::{
     AccountBrief, AccountInfo, CallSignalKind, ChannelKind, DmChannel, FriendList, GuildInfo,
     MailboxItem, MessageDto,
 };
-use eframe::egui::Context;
 
 use crate::crypto::{Engine, Envelope};
 use crate::net::NetHandle;
@@ -99,6 +98,7 @@ pub(super) fn push_capped<T>(v: &mut Vec<T>, item: T, cap: usize) {
 /// Top-level application phase. `Connecting` exists only between a
 /// login/restore click and the first WS `Ready`; once [`Phase::LoggedIn`],
 /// a dropped socket keeps the world and flips [`MainState::connection`].
+#[allow(clippy::large_enum_variant)] // lives behind Arc<Mutex<ClientState>>; boxing the live variant would only add an alloc
 pub enum Phase {
     /// No session — show the login view.
     Disconnected,
@@ -252,6 +252,7 @@ pub struct MainState {
 }
 
 impl MainState {
+    #[allow(clippy::too_many_arguments)]
     fn from_ready(
         account: AccountInfo,
         friends: Vec<AccountBrief>,
@@ -384,7 +385,12 @@ impl MainState {
     /// Append a server-confirmed message, deduplicating by id (the same dto
     /// can arrive via both the REST response and the WS echo).
     pub fn append_message(&mut self, dto: MessageDto) {
-        if self.known_ids.entry(dto.channel_id).or_default().insert(dto.id) {
+        if self
+            .known_ids
+            .entry(dto.channel_id)
+            .or_default()
+            .insert(dto.id)
+        {
             self.messages.entry(dto.channel_id).or_default().push(dto);
         }
     }
@@ -631,6 +637,12 @@ impl ClientState {
     }
 }
 
+impl Default for ClientState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -869,7 +881,7 @@ mod tests {
             .cloned()
             .expect("file envelope stashed");
         assert_eq!(stashed, fe, "stashed by message id, not attachment id");
-        assert!(m.file_meta.get(&ATT).is_none(), "keyed by message id");
+        assert!(!m.file_meta.contains_key(&ATT), "keyed by message id");
         assert_eq!(
             guard(&store).plaintext(MSG).as_deref(),
             Some("[file: cat.png (12.1 KiB)]")

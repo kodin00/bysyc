@@ -2,6 +2,12 @@
 
 Status: pending (offline query data not yet checked in).
 
+Amendment: the `macros` feature is **disabled** again. Enabling it pulls
+`sqlx-sqlite` into the lockfile, whose `libsqlite3-sys` collides on
+`links = "sqlite3"` with the client's bundled rusqlite, so the workspace
+fails dependency resolution. Re-enable it together with the `.sqlx/` data
+once that clash is resolved (e.g. aligned `libsqlite3-sys` versions).
+
 ## Context
 
 `server/Cargo.toml` enables sqlx's `macros` feature so the crate can adopt

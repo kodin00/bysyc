@@ -516,10 +516,10 @@ async fn two_accounts_full_flow() {
     let dm_ch = dm.channel.id;
     {
         let mut st = guard(&a.state);
-        if let Some(m) = st.main_mut() {
-            if !m.dms.iter().any(|d| d.channel.id == dm_ch) {
-                m.dms.push(dm.clone());
-            }
+        if let Some(m) = st.main_mut()
+            && !m.dms.iter().any(|d| d.channel.id == dm_ch)
+        {
+            m.dms.push(dm.clone());
         }
     }
     println!("e2e: DM channel {dm_ch} open");
@@ -549,10 +549,10 @@ async fn two_accounts_full_flow() {
     }
     {
         let mut st = guard(&a.state);
-        if let Some(m) = st.main_mut() {
-            if let Some(h) = m.net.as_ref() {
-                h.heartbeat();
-            }
+        if let Some(m) = st.main_mut()
+            && let Some(h) = m.net.as_ref()
+        {
+            h.heartbeat();
         }
     }
     // Let the gateway apply the new chan:{dm_ch} subscriptions before any
@@ -641,10 +641,10 @@ async fn two_accounts_full_flow() {
     {
         // View-side bookkeeping (spawn_guild_rest pushes the REST result).
         let mut st = guard(&b.state);
-        if let Some(m) = st.main_mut() {
-            if !m.guilds.iter().any(|g| g.id == guild_id) {
-                m.guilds.push(guild.clone());
-            }
+        if let Some(m) = st.main_mut()
+            && !m.guilds.iter().any(|g| g.id == guild_id)
+        {
+            m.guilds.push(guild.clone());
         }
     }
     let text_channel = guild
@@ -671,10 +671,10 @@ async fn two_accounts_full_flow() {
         // spawn_guild_rest heartbeats after a successful join (new channels
         // → gateway subscription sync); replicate that here.
         let mut st = guard(&a.state);
-        if let Some(m) = st.main_mut() {
-            if let Some(h) = m.net.as_ref() {
-                h.heartbeat();
-            }
+        if let Some(m) = st.main_mut()
+            && let Some(h) = m.net.as_ref()
+        {
+            h.heartbeat();
         }
     }
     a.wait_until(

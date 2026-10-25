@@ -24,8 +24,8 @@
 //! the oldest samples to bound latency.
 
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -121,7 +121,10 @@ impl SpscRing {
     /// Consumer side: pop up to `out.len()` samples, returning how many
     /// were filled. The remainder is left untouched.
     pub fn pop_into(&self, out: &mut [f32]) -> usize {
-        let head = self.head.load(Ordering::Relaxed); // consumer-owned
+        // Acquire pairs with the producer's Release store of `head` on overflow,
+        // so the slots it dropped (advancing head past) are visible before we
+        // read past them; loading Relaxed here would race the producer.
+        let head = self.head.load(Ordering::Acquire);
         let tail = self.tail.load(Ordering::Acquire);
         let avail = (tail - head) as usize;
         let n = avail.min(out.len());
@@ -145,6 +148,12 @@ impl SpscRing {
     pub fn clear(&self) {
         let tail = self.tail.load(Ordering::Acquire);
         self.head.store(tail, Ordering::Release);
+    }
+}
+
+impl Default for SpscRing {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -205,10 +214,10 @@ pub struct LinearResampler {
     last: f32,
     /// Fractional position within the virtual source stream since `last`.
     frac: f32,
-    /// One-pole low-pass state for downsampling anti-aliasing (see
-    /// [`LinearResampler::process_into`]). Only touched when
-    /// `from_rate > SAMPLE_RATE`.
-    lp_state: f32,
+    /// Anti-aliasing low-pass state: two cascaded biquad sections, each with
+    /// two delay taps (see [`LinearResampler::process_into`]). Only touched
+    /// when `from_rate > SAMPLE_RATE`.
+    lp_state: [[f32; 2]; 2],
     /// Reused scratch holding the low-passed input (no steady-state alloc).
     lp_scratch: Vec<f32>,
 }
@@ -220,11 +229,12 @@ impl LinearResampler {
     /// 48 kHz) the input is borrowed directly, no copy at all.
     ///
     /// When *downsampling* (`from_rate > SAMPLE_RATE`) the input is run
-    /// through a one-pole IIR low-pass (cutoff at the new Nyquist,
-    /// `SAMPLE_RATE / 2`) before the linear interpolation/decimation, so
-    /// energy above the new Nyquist does not fold back into the passband as
-    /// aliasing. The filter state carries across calls alongside `last` and
-    /// `frac`, so the streaming fractional read position is preserved.
+    /// through a 4th-order Butterworth low-pass (see [`lp_coeffs`]) with its
+    /// cutoff just under the new Nyquist (`SAMPLE_RATE / 2`) before the
+    /// linear interpolation/decimation, so energy above the new Nyquist does
+    /// not fold back into the passband as aliasing. The filter state carries
+    /// across calls alongside `last` and `frac`, so the streaming fractional
+    /// read position is preserved.
     /// Upsampling needs no filter: the original signal is already below the
     /// new, higher Nyquist.
     pub fn process_into<'a>(
@@ -241,16 +251,20 @@ impl LinearResampler {
             return input;
         }
         let (new_frac, new_last) = if from_rate > SAMPLE_RATE {
-            let a = lp_coeff(from_rate);
-            let mut prev = self.lp_state;
+            let coeffs = lp_coeffs(from_rate);
             self.lp_scratch.clear();
             self.lp_scratch.reserve(input.len());
             for &s in input {
-                // y[n] = (1-a)*x[n] + a*y[n-1]; DC gain 1.
-                prev = (1.0 - a) * s + a * prev;
-                self.lp_scratch.push(prev);
+                let mut x = s;
+                for (c, z) in coeffs.iter().zip(self.lp_state.iter_mut()) {
+                    // Transposed direct form II biquad.
+                    let y = c.b0 * x + z[0];
+                    z[0] = c.b1 * x - c.a1 * y + z[1];
+                    z[1] = c.b2 * x - c.a2 * y;
+                    x = y;
+                }
+                self.lp_scratch.push(x);
             }
-            self.lp_state = prev;
             interpolate(&self.lp_scratch, self.last, self.frac, from_rate, out)
         } else {
             interpolate(input, self.last, self.frac, from_rate, out)
@@ -261,15 +275,39 @@ impl LinearResampler {
     }
 }
 
-/// One-pole low-pass feedback coefficient for the anti-aliasing filter run at
-/// `from_rate`, with -3 dB point at the new Nyquist (`SAMPLE_RATE / 2`). The
-/// filter is `y[n] = (1-a)*x[n] + a*y[n-1]` (DC gain 1); `a` near 1 is heavy
-/// filtering, near 0 is near-transparent. A one-pole rolls off at only
-/// 6 dB/octave, so this is gentle anti-aliasing, far cheaper than a proper
-/// FIR and a large improvement over none.
-fn lp_coeff(from_rate: u32) -> f32 {
-    // a = exp(-2*pi*f_c/fs), with f_c = SAMPLE_RATE/2 and fs = from_rate.
-    (-std::f32::consts::PI * SAMPLE_RATE as f32 / from_rate as f32).exp()
+/// Normalized (a0 = 1) biquad section coefficients.
+#[derive(Clone, Copy)]
+struct Biquad {
+    b0: f32,
+    b1: f32,
+    b2: f32,
+    a1: f32,
+    a2: f32,
+}
+
+/// 4th-order Butterworth low-pass (two cascaded RBJ biquads) for the
+/// anti-aliasing filter run at `from_rate`. The -3 dB point sits at 0.4 x
+/// `SAMPLE_RATE` (19.2 kHz), a little under the new Nyquist, so the
+/// transition band finishes before the Nyquist instead of straddling it: a
+/// one-pole at the Nyquist is only 3 dB down there and barely touches
+/// content just above it. Voice sits far below the cutoff.
+fn lp_coeffs(from_rate: u32) -> [Biquad; 2] {
+    // Butterworth section Q values for order 4.
+    const QS: [f32; 2] = [0.541_196_1, 1.306_563];
+    let w0 = 2.0 * std::f32::consts::PI * (0.4 * SAMPLE_RATE as f32) / from_rate as f32;
+    let (sin, cos) = w0.sin_cos();
+    QS.map(|q| {
+        let alpha = sin / (2.0 * q);
+        let a0 = 1.0 + alpha;
+        let b = (1.0 - cos) / a0;
+        Biquad {
+            b0: b / 2.0,
+            b1: b,
+            b2: b / 2.0,
+            a1: -2.0 * cos / a0,
+            a2: (1.0 - alpha) / a0,
+        }
+    })
 }
 
 /// Linear-interpolate `src` (sampled at `from_rate`) into `out` at
@@ -483,7 +521,7 @@ fn find_output(host: &cpal::Host, name: Option<&str>) -> Option<cpal::Device> {
         Some(n) => host
             .output_devices()
             .ok()
-            .and_then(|mut it| it.find(|d| dev_name(&d).as_deref() == Some(n)))
+            .and_then(|mut it| it.find(|d| dev_name(d).as_deref() == Some(n)))
             .or_else(|| host.default_output_device()),
         None => host.default_output_device(),
     }
@@ -494,7 +532,7 @@ fn find_input(host: &cpal::Host, name: Option<&str>) -> Option<cpal::Device> {
         Some(n) => host
             .input_devices()
             .ok()
-            .and_then(|mut it| it.find(|d| dev_name(&d).as_deref() == Some(n)))
+            .and_then(|mut it| it.find(|d| dev_name(d).as_deref() == Some(n)))
             .or_else(|| host.default_input_device()),
         None => host.default_input_device(),
     }
@@ -520,8 +558,7 @@ impl AudioIo {
                 in_dev
                     .supported_input_configs()
                     .ok()?
-                    .filter(|r| r.sample_format() == cpal::SampleFormat::F32)
-                    .next()
+                    .find(|r| r.sample_format() == cpal::SampleFormat::F32)
                     .map(|r| r.with_max_sample_rate())
             })
             .ok_or("no f32 microphone format")?;
@@ -574,8 +611,7 @@ impl AudioIo {
                 out_dev
                     .supported_output_configs()
                     .ok()?
-                    .filter(|r| r.sample_format() == cpal::SampleFormat::F32)
-                    .next()
+                    .find(|r| r.sample_format() == cpal::SampleFormat::F32)
                     .map(|r| r.with_max_sample_rate())
             })
             .ok_or("no f32 speaker format")?;
@@ -882,8 +918,7 @@ mod tests {
         let mut r = LinearResampler::default();
         let mut hot_out = Vec::new();
         r.process_into(&hot, from, &mut hot_out);
-        let hot_rms =
-            (hot_out.iter().map(|s| s * s).sum::<f32>() / hot_out.len() as f32).sqrt();
+        let hot_rms = (hot_out.iter().map(|s| s * s).sum::<f32>() / hot_out.len() as f32).sqrt();
         assert!(
             hot_rms < control_rms * 0.5,
             "30 kHz tone should be attenuated below 1 kHz control: \
@@ -944,7 +979,7 @@ mod tests {
         let mut dec = PeerDecoder::new(sink.clone()).expect("decoder");
         dec.conceal();
         dec.conceal();
-        assert!(sink.ring.len() > 0);
+        assert!(!sink.ring.is_empty());
     }
 
     #[test]

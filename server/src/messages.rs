@@ -433,15 +433,15 @@ async fn delete_message(
     // The row is gone from the source of truth; object removal is
     // best-effort (an orphaned object sits behind an unguessable key) and
     // must not fail the already-committed delete.
-    if let Some(key) = s3_key.as_deref() {
-        if let Err(e) = s3::delete_object(&state, key).await {
-            tracing::warn!(
-                message_id,
-                key,
-                "message deleted but object removal failed: {}",
-                e.message
-            );
-        }
+    if let Some(key) = s3_key.as_deref()
+        && let Err(e) = s3::delete_object(&state, key).await
+    {
+        tracing::warn!(
+            message_id,
+            key,
+            "message deleted but object removal failed: {}",
+            e.message
+        );
     }
 
     // Same best-effort fan-out contract as send; a client that misses the

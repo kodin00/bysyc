@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 
-use crate::state::{guard, ClientState};
+use crate::state::{ClientState, guard};
 use crate::store::Store;
 
 /// Modal settings window. `open` is the caller's toggle (a gear button in
@@ -35,9 +35,7 @@ pub fn settings_window(
             ui.add_space(4.0);
 
             // ---- Output device ----
-            let current_out = guard(state)
-                .main()
-                .and_then(|m| m.audio_output_device());
+            let current_out = guard(state).main().and_then(|m| m.audio_output_device());
             let out_devices = crate::call::audio::output_devices();
             ui.horizontal(|ui| {
                 ui.label("Output:");
@@ -45,7 +43,10 @@ pub fn settings_window(
                 egui::ComboBox::from_label("output_device")
                     .selected_text(selected)
                     .show_ui(ui, |ui| {
-                        if ui.selectable_label(current_out.is_none(), "System default").clicked() {
+                        if ui
+                            .selectable_label(current_out.is_none(), "System default")
+                            .clicked()
+                        {
                             apply_output(state, store, None);
                         }
                         for (name, _) in &out_devices {
@@ -63,9 +64,7 @@ pub fn settings_window(
             });
 
             // ---- Input device ----
-            let current_in = guard(state)
-                .main()
-                .and_then(|m| m.audio_input_device());
+            let current_in = guard(state).main().and_then(|m| m.audio_input_device());
             let in_devices = crate::call::audio::input_devices();
             ui.horizontal(|ui| {
                 ui.label("Input:");
@@ -73,7 +72,10 @@ pub fn settings_window(
                 egui::ComboBox::from_label("input_device")
                     .selected_text(selected)
                     .show_ui(ui, |ui| {
-                        if ui.selectable_label(current_in.is_none(), "System default").clicked() {
+                        if ui
+                            .selectable_label(current_in.is_none(), "System default")
+                            .clicked()
+                        {
                             apply_input(state, store, None);
                         }
                         for (name, _) in &in_devices {
@@ -94,7 +96,7 @@ pub fn settings_window(
             ui.weak("Changes apply to the next call.");
 
             // ---- Invites (admin only) ----
-            let is_admin = guard(state).main().map_or(false, |m| m.account.is_admin);
+            let is_admin = guard(state).main().is_some_and(|m| m.account.is_admin);
             if is_admin {
                 ui.add_space(10.0);
                 ui.heading("Invites");
@@ -106,31 +108,32 @@ pub fn settings_window(
                         ui.monospace(code);
                         if ui.button("Copy").clicked() {
                             ui.ctx().output_mut(|o| {
-                                o.commands.push(egui::OutputCommand::CopyText(code.to_string()));
+                                o.commands
+                                    .push(egui::OutputCommand::CopyText(code.to_string()));
                             });
                         }
                     });
                 }
-                if ui.button("Create invite").clicked() {
-                    if let Some(h) = crate::views::main_view::net_handle(state) {
-                        let s = Arc::clone(state);
-                        let c = ctx.clone();
-                        rt.spawn(async move {
-                            match h.net.create_invite().await {
-                                Ok(code) => {
-                                    if let Some(m) = guard(&s).main_mut() {
-                                        m.reg_invite = Some(code);
-                                    }
-                                }
-                                Err(e) => {
-                                    if let Some(m) = guard(&s).main_mut() {
-                                        m.notice = Some(e);
-                                    }
+                if ui.button("Create invite").clicked()
+                    && let Some(h) = crate::views::main_view::net_handle(state)
+                {
+                    let s = Arc::clone(state);
+                    let c = ctx.clone();
+                    rt.spawn(async move {
+                        match h.net.create_invite().await {
+                            Ok(code) => {
+                                if let Some(m) = guard(&s).main_mut() {
+                                    m.reg_invite = Some(code);
                                 }
                             }
-                            c.request_repaint();
-                        });
-                    }
+                            Err(e) => {
+                                if let Some(m) = guard(&s).main_mut() {
+                                    m.notice = Some(e);
+                                }
+                            }
+                        }
+                        c.request_repaint();
+                    });
                 }
             }
         });
@@ -139,22 +142,14 @@ pub fn settings_window(
     }
 }
 
-fn apply_output(
-    state: &Arc<Mutex<ClientState>>,
-    store: &Arc<Mutex<Store>>,
-    name: Option<String>,
-) {
+fn apply_output(state: &Arc<Mutex<ClientState>>, store: &Arc<Mutex<Store>>, name: Option<String>) {
     if let Some(m) = guard(state).main_mut() {
         m.audio_output = name.clone();
     }
     let _ = guard(store).set_audio_output(name.as_deref());
 }
 
-fn apply_input(
-    state: &Arc<Mutex<ClientState>>,
-    store: &Arc<Mutex<Store>>,
-    name: Option<String>,
-) {
+fn apply_input(state: &Arc<Mutex<ClientState>>, store: &Arc<Mutex<Store>>, name: Option<String>) {
     if let Some(m) = guard(state).main_mut() {
         m.audio_input = name.clone();
     }
