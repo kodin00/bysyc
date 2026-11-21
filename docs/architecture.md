@@ -48,7 +48,10 @@ does not repeat them.
   session token in `Authorization: Bearer <token>`; the full route
   surface is in [api.md](api.md). Bodies are JSON, built from the
   shared types in `common/src/protocol.rs` (the single contract
-  between client and server).
+  between client and server). Sessions are one-per-account: a new
+  login deletes the account's prior token via the `sessacct:{id}`
+  pointer, so the old device gets 401 (see
+  [ADR-0007](adr/0007-one-device-session.md)).
 - **Realtime**: client -> Caddy -> `GET /ws?token=<token>&protocol=2`
   -> axum WebSocket upgrade. Since protocol v2 the gateway carries
   binary MessagePack frames (`encode_ws_server_msg` /
@@ -123,4 +126,5 @@ device per account, audio-only calls, no read receipts).
   hardening, Caddy and coturn config.
 - [docs/api.md](api.md): REST and WS route surface.
 - [docs/adr/](adr/): 0001 Olm/Megolm, 0002 mesh WebRTC + TURN,
-  0003 pure-Rust egui client, 0005 client secrets in a 0600 file.
+  0003 pure-Rust egui client, 0005 client secrets in a 0600 file,
+  0007 one-device session (per-account `sessacct` pointer).

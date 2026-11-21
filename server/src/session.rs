@@ -8,6 +8,12 @@
 //! Session format: token = 32 random bytes, hex-encoded (64 chars); Redis key
 //! `sess:{token}` holds the account_id, TTL 30 days, sliding — every
 //! successful [`validate`] refreshes the TTL back to 30 days.
+//!
+//! One session per account: the per-account pointer `sessacct:{account_id}`
+//! holds the account's current token. [`create`] reads the pointer and
+//! deletes any prior `sess:{token}` before minting the new token and
+//! repointing it, so a second login on the same account invalidates the
+//! first. This is a one-device model (see ADR-0007).
 
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
@@ -62,6 +68,11 @@ fn bearer_token(value: Option<&axum::http::HeaderValue>) -> Result<String, ApiEr
 /// from Redis without a Postgres hit. The cache is refreshed on identity-key
 /// upload (see `crate::keys::put_identity`); the short TTL bounds staleness if
 /// a refresh is missed.
+///
+/// One session per account: before minting, any prior token pointed to by
+/// `sessacct:{account_id}` is deleted (`DEL sess:{prior}`) and the pointer is
+/// repointed at the new token. A second login on the same account thus
+/// invalidates the first session — its token returns 401 on [`validate`].
 pub async fn create(
     redis: &redis::aio::ConnectionManager,
     account_id: i64,
@@ -73,8 +84,34 @@ pub async fn create(
     let token = hex::encode(rand::random::<[u8; 32]>());
     let info_json = serde_json::to_string(account_info)
         .map_err(|e| ApiError::internal(format!("account info serialize failed: {e}")))?;
+
+    // One-device model: read the per-account pointer to the prior token and
+    // delete that prior session *before* minting the new one, so there is never
+    // a window where two tokens for the same account are live. GETDEL returns
+    // the old value while atomically clearing the pointer; the SET below
+    // repoints it at the fresh token. A missing pointer (first login) yields
+    // None and the DEL is skipped.
     let mut conn = redis.clone();
+    let prior: Option<String> = redis::cmd("GETDEL")
+        .arg(format!("sessacct:{account_id}"))
+        .query_async(&mut conn)
+        .await?;
+    if let Some(prior_token) = prior {
+        redis::cmd("DEL")
+            .arg(format!("sess:{prior_token}"))
+            .query_async::<()>(&mut conn)
+            .await?;
+    }
+
+    // Mint the new session: point the per-account pointer at the new token
+    // (same TTL as the session, so a stale pointer cannot outlive its token),
+    // store the session itself, and refresh the AccountInfo cache.
     redis::Pipeline::new()
+        .cmd("SET")
+        .arg(format!("sessacct:{account_id}"))
+        .arg(&token)
+        .arg("EX")
+        .arg(SESSION_TTL_SECS)
         .cmd("SET")
         .arg(format!("sess:{token}"))
         .arg(account_id.to_string())
@@ -87,6 +124,7 @@ pub async fn create(
         .arg(ACCOUNT_INFO_TTL_SECS)
         .query_async::<()>(&mut conn)
         .await?;
+
     Ok(token)
 }
 
