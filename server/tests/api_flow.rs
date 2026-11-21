@@ -76,6 +76,62 @@ async fn auth_register_login_me_round_trip() {
 }
 
 // ---------------------------------------------------------------------------
+// One-device session: a second login invalidates the first token
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn second_login_invalidates_prior_session() {
+    let h = setup().await;
+    let invite = mint_invite(&h.state).await;
+    let name = unique_name("bob");
+
+    // First login.
+    let (token1, id) = register(&h.base_url, &name, "pw12345", &invite).await;
+
+    // Sanity: the first token works before the second login.
+    let status1 = http()
+        .get(format!("{}/auth/me", h.base_url))
+        .bearer_auth(&token1)
+        .send()
+        .await
+        .expect("me with token1")
+        .status();
+    assert!(status1.is_success(), "token1 works before second login");
+
+    // Second login on the same account mints a new token.
+    let (token2, id2) = login(&h.base_url, &name, "pw12345").await;
+    assert_eq!(id2, id, "login resolves the same account id");
+    assert_ne!(token2, token1, "each login mints a new session");
+
+    // The first token is now invalid: /auth/me returns 401.
+    let resp = http()
+        .get(format!("{}/auth/me", h.base_url))
+        .bearer_auth(&token1)
+        .send()
+        .await
+        .expect("me with old token1");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "old token1 should be invalid after a second login"
+    );
+    let err = err_body(resp).await;
+    assert_eq!(err.code, ErrorCode::Unauthorized);
+
+    // The fresh token still works.
+    let me: AccountInfo = http()
+        .get(format!("{}/auth/me", h.base_url))
+        .bearer_auth(&token2)
+        .send()
+        .await
+        .expect("me with token2")
+        .json()
+        .await
+        .expect("decode me with token2");
+    assert_eq!(me.id, id, "the second login's token resolves the account");
+}
+
+// ---------------------------------------------------------------------------
 // Invite gating + admin mint
 // ---------------------------------------------------------------------------
 
